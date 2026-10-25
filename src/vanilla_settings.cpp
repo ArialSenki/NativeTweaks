@@ -1145,6 +1145,12 @@ enum Id : std::size_t {
     world_journey, journey_keep_runes,
     // Map & travel: the mirror and rebirth screens anywhere (user request)
     open_mirror, open_rebirth,
+    // Enemies: boss health on its own (Nexus request)
+    boss_hp,
+    // Image: no stains on characters, no buff visuals on you (Nexus request)
+    clean_characters, hide_buff_effects,
+    // Image: weapon buff visuals too (Nexus request)
+    hide_weapon_buff_effects,
     count
 };
 
@@ -1257,6 +1263,9 @@ Option g_options[count]{
     slider(L"WorldDifficulty", 0, 0, 7, 1, L""),
     toggle(L"WorldDifficultyKeepRunes"),
     toggle(L"OpenMirror"), toggle(L"OpenRebirth"),
+    slider(L"BossHpPercent", 100, 10, 1285, 5),
+    toggle(L"KeepCharactersClean"), toggle(L"HideBuffEffects"),
+    toggle(L"HideWeaponBuffEffects"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1292,6 +1301,7 @@ Scale g_scales[]{
     {posture_taken, L"PostureDamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {status_buildup, L"StatusBuildupScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {enemy_hp, L"EnemyHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
+    {boss_hp, L"BossHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
     {enemy_poise, L"EnemyPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
     {runes_gained, L"RunesGainedScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {loot_drop, L"LootDropScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
@@ -1468,7 +1478,21 @@ struct ParamState {
     game::ParamTable table{};
     std::vector<double> original{};
     int applied_percent{100};
+    std::vector<bool> boss{};  // enemy_hp: rows that are bosses
+    int applied_boss_percent{100};
 };
+
+// Boss health (Nexus request): NpcParam rows are bosses when npcType
+// (u8 +0x132) is 1 (163 rows in 2.7.2.0: Margit, Rennala, Malenia...) or when
+// isSoulGetByBoss (bit 0 of +0x15D) is set (315 rows: every enemy that gives
+// the boss-defeated runes, field, dungeon and DLC bosses included). Their
+// health is Enemy health times Boss health.
+bool npc_row_is_boss(std::uintptr_t row) noexcept {
+    std::uint8_t type{}, flags{};
+    game::read(row + 0x132, type);
+    game::read(row + 0x15D, flags);
+    return type == 1 || (flags & 0x1);
+}
 
 // Infinite poise overrides the poise sliders with a value no hit can deplete.
 constexpr int kLockedPercent = -1;
@@ -1563,11 +1587,25 @@ void sync_params() noexcept {
             state.original.reserve(state.table.rows.size());
             for (const auto row : state.table.rows)
                 state.original.push_back(read_field(row + field.offset, field.type));
+            if (field.id == enemy_hp) {
+                state.boss.clear();
+                std::size_t bosses{};
+                for (const auto row : state.table.rows) {
+                    state.boss.push_back(npc_row_is_boss(row));
+                    if (state.boss.back()) ++bosses;
+                }
+                wchar_t message[120]{};
+                swprintf_s(message, L"Boss health: %zu of %zu NpcParam rows are bosses.", bosses,
+                    state.table.rows.size());
+                log(message);
+            }
             state.ready = true;
             state.applied_percent = 100;
+            state.applied_boss_percent = 100;
         }
         const int percent = target_percent(field);
-        if (percent == state.applied_percent) continue;
+        const int boss_percent = field.id == enemy_hp ? value_of(boss_hp) : 100;
+        if (percent == state.applied_percent && boss_percent == state.applied_boss_percent) continue;
         for (std::size_t r = 0; r < state.table.rows.size(); ++r) {
             double locked = field.lock != count ? field.lock_value : kLockedPoise;
             if (field.cap) locked = std::min<double>(state.original[r], locked);  // only lowers
@@ -1575,6 +1613,8 @@ void sync_params() noexcept {
                                                                 : state.original[r];
             // Negative values are markers (-1 = unused), never amounts: keep them.
             double scaled = state.original[r] < 0 ? state.original[r] : state.original[r] * percent / 100.0;
+            if (boss_percent != 100 && r < state.boss.size() && state.boss[r] && scaled > 0)
+                scaled = scaled * boss_percent / 100.0;
             // The game wraps poise damage past 32767 (x100 broke nothing in game), so
             // extended ranges stop at the strongest value that still counts.
             if (field.id == posture_dealt || field.id == posture_taken)
@@ -1583,6 +1623,7 @@ void sync_params() noexcept {
                 percent != kLockedPercent ? scaled : locked);
         }
         state.applied_percent = percent;
+        state.applied_boss_percent = boss_percent;
         if (field.id == posture_dealt || field.id == posture_taken || field.id == damage_taken ||
             field.id == status_buildup) {
             double original_max{};
@@ -3063,6 +3104,126 @@ void sync_journey() noexcept {
     log(message);
 }
 
+// Keep characters clean (Nexus request): DecalParam (row 0xF8) entries with
+// usePaintDecal (bit 12 of the u32 at +0x24) are painted onto the character
+// that is hit: blood, mud and scorch marks that pile up on bodies (154 of 488
+// rows in 2.7.2.0, 54 of them marked bloodTypeEnable). Clearing the bit keeps
+// the decals on the ground and walls (useDeferredDecal, bit 11) but no longer
+// on characters, enemies included.
+struct CleanState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> rows{};
+    bool applied{};
+};
+
+CleanState g_clean{};
+constexpr std::uint32_t kPaintDecalBit = 1u << 12;
+
+void sync_clean() noexcept {
+    auto& state = g_clean;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"DecalParam", 0xF8, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (const auto row : table.rows) {
+            std::uint32_t bits{};
+            if (game::read(row + 0x24, bits) && (bits & kPaintDecalBit)) state.rows.push_back(row);
+        }
+        wchar_t message[120]{};
+        swprintf_s(message, L"Clean characters: %zu of %zu DecalParam rows paint onto characters.",
+            state.rows.size(), table.rows.size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(clean_characters) != 0;
+    if (want == state.applied) return;
+    for (const auto row : state.rows) {
+        std::uint32_t bits{};
+        if (!game::read(row + 0x24, bits)) continue;
+        game::write<std::uint32_t>(row + 0x24, want ? bits & ~kPaintDecalBit : bits | kPaintDecalBit);
+    }
+    state.applied = want;
+}
+
+// Hide buff effects (Nexus request): the self buffs that Self buff duration
+// already sorts out (g_buffs.rows[1]: 247 SpEffects in 2.7.2.0) draw their
+// particles and body glow through SpEffectParam.vfxId..vfxId7 (s32 +0x170,
+// +0x18C..+0x1A4) -> SpEffectVfxParam (row 0xA4, 123 rows). Their particle
+// effects (midstSfxId +0x0, initSfxId +0x8, finishSfxId +0x10) and material
+// glow (materialParamId +0x84) go to -1; sounds, camouflage (Unseen Form) and
+// transformations stay, and the buffs keep working. Rows shared with other
+// effects lose their visuals too.
+struct BuffVfxState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> rows{};
+    std::vector<std::int32_t> original{};  // 4 per row
+    bool applied{};
+};
+
+BuffVfxState g_buff_vfx{};         // self buffs (g_buffs.rows[1])
+BuffVfxState g_weapon_buff_vfx{};  // weapon buffs (g_buffs.rows[0])
+constexpr std::ptrdiff_t kBuffVfxSlots[]{0x170, 0x18C, 0x190, 0x194, 0x198, 0x19C, 0x1A0, 0x1A4};
+constexpr std::ptrdiff_t kBuffVfxFields[]{0x0, 0x8, 0x10, 0x84};
+
+void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* what) noexcept {
+    if (state.attempted) return;
+    if (!state.ready) {
+        if (g_buffs.attempted) {
+            state.attempted = true;
+            return;
+        }
+        if (!g_buffs.ready) return;
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"SpEffectVfxParam", 0xA4, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        std::vector<std::int32_t> ids;
+        for (const auto effect : g_buffs.rows[category])
+            for (const auto slot : kBuffVfxSlots) {
+                std::int32_t id{};
+                if (game::read(effect + slot, id) && id > 0) ids.push_back(id);
+            }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (const auto id : ids) {
+            const std::uintptr_t row = param_row_by_id(table, static_cast<std::uint32_t>(id));
+            if (!row) continue;
+            state.rows.push_back(row);
+            for (const auto field : kBuffVfxFields) {
+                std::int32_t value{-1};
+                game::read(row + field, value);
+                state.original.push_back(value);
+            }
+        }
+        wchar_t message[140]{};
+        swprintf_s(message, L"Hide %s effects: %zu SpEffectVfxParam rows used by %zu of them.", what,
+            state.rows.size(), g_buffs.rows[category].size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(option) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        for (std::size_t f = 0; f < std::size(kBuffVfxFields); ++f)
+            game::write<std::int32_t>(state.rows[r] + kBuffVfxFields[f],
+                want ? -1 : state.original[r * std::size(kBuffVfxFields) + f]);
+    state.applied = want;
+}
+
 bool all_params_ready() noexcept {
     for (const auto& state : g_param_states)
         if (!state.ready && !state.attempted) return false;
@@ -3071,7 +3232,9 @@ bool all_params_ready() noexcept {
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
-        (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted);
+        (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
+        (g_clean.ready || g_clean.attempted) && (g_buff_vfx.ready || g_buff_vfx.attempted) &&
+        (g_weapon_buff_vfx.ready || g_weapon_buff_vfx.attempted);
 }
 
 DWORD WINAPI param_worker(void*) noexcept {
@@ -3092,6 +3255,9 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_lock_on();
         sync_charged_launch();
         sync_journey();
+        sync_clean();
+        sync_buff_vfx(g_buff_vfx, 1, hide_buff_effects, L"self buff");
+        sync_buff_vfx(g_weapon_buff_vfx, 0, hide_weapon_buff_effects, L"weapon buff");
         sync_flasks();
         sync_materials();
         sync_helmet();
@@ -4771,7 +4937,8 @@ void apply(Id id) noexcept {
     case spell_stamina_cost: case spell_one_slot: case spell_no_requirements: case carry_max:
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance:
-    case world_journey: case journey_keep_runes:
+    case world_journey: case journey_keep_runes: case boss_hp:
+    case clean_characters: case hide_buff_effects: case hide_weapon_buff_effects:
         if (g_param_event) SetEvent(g_param_event);
         break;
     case skill_fp_cost:
@@ -4832,8 +4999,13 @@ bool available(Id id) noexcept {
     case weapon_effects_enemies: case enemies_no_immunity: case enemies_no_lock_on: case flask_hp: case flask_fp:
     case spell_stamina_cost: case spell_one_slot: case spell_no_requirements: case skill_fp_cost: case carry_max:
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
-    case charged_launch: case launch_all: case launch_distance:
+    case charged_launch: case launch_all: case launch_distance: case boss_hp:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager;
+    case clean_characters: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_clean.attempted;
+    case hide_buff_effects:
+        return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_buff_vfx.attempted;
+    case hide_weapon_buff_effects:
+        return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_weapon_buff_vfx.attempted;
     // Also needs the save's cycle (GameDataMan) to add only what the save lacks.
     case world_journey: case journey_keep_runes:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_statics.game_data_man &&
@@ -4982,7 +5154,7 @@ SetRowDefaultExFn g_set_default_ex{};
 bool higher_is_worse(Id id) noexcept {
     switch (id) {
     case damage_taken: case posture_taken: case stamina_cost: case spell_fp_cost:
-    case equip_weight: case enemy_hp: case enemy_poise: case enemy_speed:
+    case equip_weight: case enemy_hp: case boss_hp: case enemy_poise: case enemy_speed:
     case ash_cost: case upgrade_cost: case weapon_weight: case knockback_taken: case spell_stamina_cost:
     case ash_extra_cost: case ash_damage_per_ash:
     case skill_fp_cost:
@@ -6085,6 +6257,10 @@ const Texts kEnglish{
         {L"Keep your runes", L"With World difficulty on, enemies give the runes of your save's own cycle instead of the harder cycle's."},
         {L"Open the mirror", L"Opens the appearance screen of the Roundtable Hold mirror. Use it out of combat."},
         {L"Rebirth", L"Opens Rennala's rebirth screen to reallocate your attributes. No Larval Tear needed. Use it out of combat."},
+        {L"Boss health (%)", L"Scales the health of bosses only: main, field, dungeon and DLC bosses. Multiplies Enemy health, so with Enemy health at 100% only bosses change. Applies to bosses loaded afterwards: rest at a grace."},
+        {L"Keep characters clean (beta)", L"BETA: for now it also applies to enemies; the aim is your character only. Blood, mud and scorch marks no longer stick to characters' bodies, yours and enemies'. Splatters still appear on the ground and walls. Applies to new hits; marks already on you wear off as usual."},
+        {L"Hide buff effects", L"Your own buffs (incantations, sorceries, boluses, talismans and similar) no longer show particles or a glow on your body. They work exactly the same, keep their sound, and invisibility still works. Weapon buffs keep their look (see the option below). Applies to the next buff you use."},
+        {L"Hide weapon buff effects", L"Greases and weapon enchantments no longer show their glow or particles on your weapon. They work exactly the same and keep their sound. Applies to the next grease or enchantment you use."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -6264,6 +6440,10 @@ const Texts kSpanish{
         {L"Mantener tus runas", L"Con Dificultad del mundo activa, los enemigos dan las runas del ciclo de tu partida en lugar de las del ciclo más difícil."},
         {L"Abrir el espejo", L"Abre la pantalla de apariencia del espejo de la Mesa Redonda. Úsalo fuera de combate."},
         {L"Renacer", L"Abre la pantalla de renacimiento de Rennala para redistribuir tus atributos. No necesita Lágrima larval. Úsalo fuera de combate."},
+        {L"Vida de los jefes (%)", L"Escala solo la vida de los jefes: principales, de campo, de mazmorra y del DLC. Se multiplica con «Vida de enemigos», así que con «Vida de enemigos» al 100 % solo cambian los jefes. Se aplica a los jefes que se carguen después: descansa en una gracia."},
+        {L"Personajes limpios (beta)", L"BETA: por ahora también se aplica a los enemigos; el objetivo es que sea solo tu personaje. La sangre, el barro y las quemaduras ya no se pegan al cuerpo de los personajes, ni al tuyo ni al de los enemigos. Las salpicaduras siguen saliendo en el suelo y las paredes. Se aplica a los golpes nuevos; las manchas que ya tienes se van como siempre."},
+        {L"Ocultar efectos de mejoras", L"Tus mejoras (encantamientos, hechizos, bolos, talismanes y similares) ya no muestran partículas ni brillo en tu cuerpo. Funcionan exactamente igual, mantienen su sonido y la invisibilidad sigue funcionando. Las mejoras del arma mantienen su aspecto (ver la opción de abajo). Se aplica a la siguiente mejora que uses."},
+        {L"Ocultar efectos de mejoras de arma", L"Las grasas y los encantamientos de arma ya no muestran su brillo ni partículas en el arma. Funcionan exactamente igual y mantienen su sonido. Se aplica a la siguiente grasa o encantamiento que uses."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -6443,6 +6623,10 @@ const Texts kChinese{
         {L"保留你的卢恩", L"开启世界难度时，敌人给予你存档所在周目的卢恩，而不是更高难度周目的卢恩。"},
         {L"打开镜子", L"打开圆桌厅堂镜子的外观界面。请在战斗外使用。"},
         {L"重生", L"打开菈妮的重生界面以重新分配属性点。不需要幼虫之泪。请在战斗外使用。"},
+        {L"头目血量 (%)", L"仅缩放头目的血量：主要头目、野外头目、地下城头目和 DLC 头目。与“敌人血量”相乘，因此“敌人血量”为 100% 时只改变头目。对之后加载的头目生效：在赐福处休息。"},
+        {L"保持角色干净（测试版）", L"测试版：目前也会作用于敌人，目标是只作用于你的角色。血迹、泥污和焦痕不再附着在角色身上，包括你和敌人。地面和墙壁上仍会出现飞溅痕迹。对新的攻击生效；已有的痕迹会照常消失。"},
+        {L"隐藏增益效果", L"你自身的增益（祷告、魔法、丸药、护符等）不再在身上显示粒子或光芒。效果完全相同，保留音效，隐身仍然有效。武器增益保持原样（见下方选项）。对你使用的下一个增益生效。"},
+        {L"隐藏武器增益效果", L"油脂和武器附魔不再在武器上显示光芒或粒子。效果完全相同，保留音效。对你使用的下一个油脂或附魔生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -6472,7 +6656,7 @@ const Layout kLayout[]{
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, buff_enemy}},
-    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, enemy_speed, enemies_no_attack, enemies_no_move,
+    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemies_no_attack, enemies_no_move,
         enemies_no_ai, enemies_no_respawn, enemies_downed_vulnerable, enemies_no_lock_on}},
     {cat_spirits, {ash_cost, ash_multiple, ash_max_active, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
@@ -6480,7 +6664,8 @@ const Layout kLayout[]{
     {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off}},
-    {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance}},
+    {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance,
+        clean_characters, hide_buff_effects, hide_weapon_buff_effects}},
     {cat_display, {fps_unlock, fps_limit, refresh_rate, ultrawide}},
     {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default}},
 };
