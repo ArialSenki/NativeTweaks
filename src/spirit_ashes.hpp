@@ -33,4 +33,12 @@ void update(const Settings& settings) noexcept;
 // Dismisses every summoned ash with the short fade (next game frame).
 void dismiss_all() noexcept;
 
+// Not spirit ashes, but in the same Rust library (msa\src\game_menus.rs):
+// opens a game screen on the next frame, as an NPC's talk script would.
+// 1 = mirror (appearance), 3 = rebirth.
+// False when the game version or its task scheduler isn't supported.
+bool open_game_menu(int kind) noexcept;
+// 0 none yet, 1 opened, 2 no character loaded, 3 refused by the game.
+int game_menu_last_result() noexcept;
+
 } // namespace spirit_ashes

@@ -1141,6 +1141,10 @@ enum Id : std::size_t {
     charged_launch,
     // Every attack launches and how far (with charged_launch)
     launch_all, launch_distance,
+    // Enemies: New Game+ difficulty in any cycle (user request)
+    world_journey, journey_keep_runes,
+    // Map & travel: the mirror and rebirth screens anywhere (user request)
+    open_mirror, open_rebirth,
     count
 };
 
@@ -1250,6 +1254,9 @@ Option g_options[count]{
     slider(L"ChargedAttacksLaunch", 0, 0, 3, 1, L""),
     toggle(L"EveryAttackLaunches"),
     slider(L"LaunchDistancePercent", 100, 100, 5000, 25),
+    slider(L"WorldDifficulty", 0, 0, 7, 1, L""),
+    toggle(L"WorldDifficultyKeepRunes"),
+    toggle(L"OpenMirror"), toggle(L"OpenRebirth"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -2856,6 +2863,206 @@ void sync_helmet() noexcept {
     log(message);
 }
 
+// World difficulty (user request): the enemy scaling of a New Game+ cycle in
+// any cycle, without touching the save's real one. New Game+ adds two things
+// on top of the area scaling every enemy has (NpcParam.spEffectID3, SpEffect
+// 7000-7200):
+//  - its own area effect, NpcParam.GameClearSpEffectID (s32 +0x6C; SpEffect
+//    7400-7600, 2000744x in the DLC), e.g. Limgrave HP x3.4 and runes x5;
+//  - from NG+2 on, ClearCountCorrectParam row <cycle> (row size 0x80, 31 f32),
+//    up to NG+7: HP x1.4, attack x1.45, defence x1.3 (2.7.2.0 regulation).
+// In a first playthrough the NG+ effect goes into a free resident slot
+// (spEffectID4-7, +0x5C..+0x68: 0 in 4259 of the 4343 rows that have one) and
+// its rates are multiplied by the ClearCountCorrectParam row. Past NG+ the game
+// applies the effect itself, so only the ratio between the two rows is added;
+// a target at or below the save's cycle changes nothing. Keep runes holds
+// haveSoulRate at what the save's own cycle gives. Characters read their
+// params when they appear: rest at a grace.
+struct JourneyRate { std::size_t correct; std::size_t effect; };
+constexpr JourneyRate kJourneyRates[]{
+    {0x0, 0x10},    // MaxHpRate -> maxHpRate
+    {0x8, 0x18},    // MaxStaminaRate -> maxStaminaRate
+    {0xC, 0x48},    // PhysicsAttackRate -> physicsAttackPowerRate
+    {0x20, 0x4C},   // MagicAttackRate
+    {0x24, 0x50},   // FireAttackRate
+    {0x28, 0x54},   // ThunderAttackRate
+    {0x2C, 0x1E0},  // DarkAttackRate
+    {0x30, 0x68},   // PhysicsDefenseRate -> physicsDiffenceRate
+    {0x34, 0x6C},   // MagicDefenseRate
+    {0x38, 0x70},   // FireDefenseRate
+    {0x3C, 0x74},   // ThunderDefenseRate
+    {0x40, 0x1D4},  // DarkDefenseRate
+    {0x44, 0xC8},   // StaminaAttackRate
+    {0x48, 0xF4},   // SoulRate -> haveSoulRate
+    {0x4C, 0x108},  // PoisionResistRate -> registPoizonChangeRate
+    {0x50, 0x10C},  // DiseaseResistRate (scarlet rot)
+    {0x54, 0x110},  // BloodResistRate
+    {0x58, 0x114},  // CurseResistRate (death blight)
+    {0x5C, 0x2B4},  // FreezeResistRate
+    {0x6C, 0x340},  // SleepResistRate
+    {0x70, 0x344},  // MadnessResistRate
+};
+constexpr std::size_t kJourneyRateCount = std::size(kJourneyRates);
+constexpr std::size_t kJourneySoulRate = 13;  // index of SoulRate above
+constexpr std::ptrdiff_t kJourneySlots[]{0x5C, 0x60, 0x64, 0x68};
+// SpEffectParam.bGameClearBonus (u8 +0x160, bit 6) is set on every NG+ effect
+// and makes the game skip it in a save that has not been cleared yet (first
+// in-game test: runes stayed at 64 with the effect in the slot). Cleared while
+// the slots are filled.
+constexpr std::ptrdiff_t kJourneyFlagsOffset = 0x160;
+constexpr std::uint8_t kJourneyClearBonusBit = 0x40;
+constexpr int kJourneyMax = 7;
+
+struct JourneyState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> npc_slots{};    // free slot of each NpcParam row with an NG+ effect
+    std::vector<std::int32_t> npc_effects{};    // that row's GameClearSpEffectID
+    std::vector<std::int32_t> npc_original{};   // the slot's own value (0 or -1)
+    std::size_t npc_without_slot{};
+    std::vector<std::uintptr_t> effect_rows{};  // SpEffectParam rows of those effects
+    std::vector<float> original{};              // kJourneyRateCount rates per effect row
+    std::vector<std::uint8_t> flags{};          // each effect row's byte +0x160
+    float correct[kJourneyMax + 1][kJourneyRateCount]{};  // ClearCountCorrectParam rows 0-7
+    int applied_target{};
+    int applied_cycle{};
+    bool applied_keep{};
+    bool slots_filled{};
+    int cycle{-1};  // save's own cycle, -1 until a save is loaded
+};
+
+JourneyState g_journey{};
+
+std::uintptr_t param_row_by_id(const game::ParamTable& table, std::uint32_t id) noexcept {
+    for (std::size_t i = 0; i < table.rows.size(); ++i) {
+        std::uint32_t row_id{};
+        if (game::read(table.file + 0x40 + i * 0x18, row_id) && row_id == id) return table.rows[i];
+    }
+    return 0;
+}
+
+bool journey_wanted() noexcept { return value_of(world_journey) != 0; }
+
+void sync_journey() noexcept {
+    auto& state = g_journey;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable npcs, effects, correct;
+        if (!game::find_param(g_statics, L"NpcParam", 0x2E0, npcs, g_log)) {
+            if (npcs.file) state.attempted = true;
+            return;
+        }
+        if (!game::find_param(g_statics, L"SpEffectParam", 0x390, effects, g_log) ||
+            !game::find_param(g_statics, L"ClearCountCorrectParam", 0x80, correct, g_log)) {
+            if (effects.file || correct.file) state.attempted = true;
+            return;
+        }
+        for (int cycle = 0; cycle <= kJourneyMax; ++cycle) {
+            const std::uintptr_t row = param_row_by_id(correct, static_cast<std::uint32_t>(cycle));
+            for (std::size_t f = 0; f < kJourneyRateCount; ++f) {
+                float rate = 1.0f;
+                if (row) game::read(row + kJourneyRates[f].correct, rate);
+                // Row 0 (no New Game+) is all zeros: it means no correction.
+                state.correct[cycle][f] = rate > 0.0f ? rate : 1.0f;
+            }
+        }
+        std::vector<std::int32_t> ids;
+        for (const auto row : npcs.rows) {
+            std::int32_t effect{};
+            if (!game::read(row + 0x6C, effect) || effect <= 0) continue;
+            std::uintptr_t slot{};
+            for (const auto offset : kJourneySlots) {
+                std::int32_t current{};
+                if (game::read(row + offset, current) && current <= 0) {
+                    slot = row + offset;
+                    break;
+                }
+            }
+            if (!slot) {
+                ++state.npc_without_slot;
+                continue;
+            }
+            std::int32_t original{};
+            game::read(slot, original);
+            state.npc_slots.push_back(slot);
+            state.npc_effects.push_back(effect);
+            state.npc_original.push_back(original);
+            ids.push_back(effect);
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        for (const auto id : ids) {
+            const std::uintptr_t row = param_row_by_id(effects, static_cast<std::uint32_t>(id));
+            if (!row) continue;
+            state.effect_rows.push_back(row);
+            std::uint8_t flags{};
+            game::read(row + kJourneyFlagsOffset, flags);
+            state.flags.push_back(flags);
+            for (const auto& rate : kJourneyRates) {
+                float value{};
+                game::read(row + rate.effect, value);
+                state.original.push_back(value);
+            }
+        }
+        wchar_t message[240]{};
+        swprintf_s(message,
+            L"World difficulty: %zu NpcParam rows with a New Game+ effect (%zu without a free slot), "
+            L"%zu effects, NG+7 HP x%.2f.",
+            state.npc_slots.size(), state.npc_without_slot, state.effect_rows.size(),
+            state.correct[kJourneyMax][0]);
+        log(message);
+        if (state.npc_slots.empty() || state.effect_rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+
+    // The save's own cycle; kept from the last loaded save on the title screen.
+    game::SaveIdentity id{};
+    if (game::save_identity(g_statics, id)) state.cycle = static_cast<int>(id.cycle);
+    const int target = std::clamp(static_cast<int>(value_of(world_journey)), 0, kJourneyMax);
+    const bool keep = value_of(journey_keep_runes) != 0;
+    const int cycle = std::clamp(state.cycle, 0, kJourneyMax);
+    // Until a save is loaded the first playthrough is assumed; the next pass
+    // (every 2 s while the option is on) corrects it.
+    const bool active = target > cycle;
+    const bool fill = active && cycle == 0;
+    if (target == state.applied_target && cycle == state.applied_cycle && keep == state.applied_keep &&
+        fill == state.slots_filled) return;
+
+    if (fill != state.slots_filled) {
+        for (std::size_t r = 0; r < state.npc_slots.size(); ++r)
+            game::write<std::int32_t>(state.npc_slots[r], fill ? state.npc_effects[r] : state.npc_original[r]);
+        state.slots_filled = fill;
+    }
+    for (std::size_t e = 0; e < state.effect_rows.size(); ++e) {
+        const std::uint8_t flags = state.flags[e];
+        game::write<std::uint8_t>(state.effect_rows[e] + kJourneyFlagsOffset,
+            fill ? static_cast<std::uint8_t>(flags & ~kJourneyClearBonusBit) : flags);
+        for (std::size_t f = 0; f < kJourneyRateCount; ++f) {
+            const float original = state.original[e * kJourneyRateCount + f];
+            float factor = active ? state.correct[target][f] / state.correct[cycle][f] : 1.0f;
+            float value = original * factor;
+            if (active && keep && f == kJourneySoulRate)
+                value = cycle == 0 ? 1.0f : original;  // the runes of the save's own cycle
+            game::write(state.effect_rows[e] + kJourneyRates[f].effect, value);
+        }
+    }
+    state.applied_target = target;
+    state.applied_cycle = cycle;
+    state.applied_keep = keep;
+    wchar_t message[200]{};
+    if (active)
+        swprintf_s(message, L"World difficulty: NG+%d on a save in NG+%d (0 = first playthrough)%s, HP x%.2f "
+            L"on top of the NG+ effects.", target, cycle, keep ? L", runes kept" : L"",
+            state.correct[target][0] / state.correct[cycle][0]);
+    else
+        swprintf_s(message, L"World difficulty: off (target %d, save in cycle %d); params restored.",
+            target, cycle);
+    log(message);
+}
+
 bool all_params_ready() noexcept {
     for (const auto& state : g_param_states)
         if (!state.ready && !state.attempted) return false;
@@ -2864,14 +3071,15 @@ bool all_params_ready() noexcept {
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
-        (g_charged_launch.ready || g_charged_launch.attempted);
+        (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted);
 }
 
 DWORD WINAPI param_worker(void*) noexcept {
     perf::Loop loop(L"param");
     for (;;) {
         loop.pause();
-        WaitForSingleObject(g_param_event, all_params_ready() ? INFINITE : 2000);
+        // World difficulty follows the loaded save's cycle, so it polls while on.
+        WaitForSingleObject(g_param_event, all_params_ready() && !journey_wanted() ? INFINITE : 2000);
         loop.resume();
         // First, so it classifies SpEffects before any buildup slider rescales them.
         sync_weapon_effects();
@@ -2883,6 +3091,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_immunity();
         sync_lock_on();
         sync_charged_launch();
+        sync_journey();
         sync_flasks();
         sync_materials();
         sync_helmet();
@@ -4504,6 +4713,19 @@ void apply(Id id) noexcept {
         if (on(id) && on(ash_multiple)) spirit_ashes::dismiss_all();
         g_options[id].value = 0;
         break;
+    case open_mirror: case open_rebirth:
+        // Buttons like Dismiss all: the screen opens on the next game frame
+        // (talk-script commands, msa\src\game_menus.rs).
+        if (on(id)) {
+            const int kind = id == open_mirror ? 1 : 3;
+            const bool queued = spirit_ashes::open_game_menu(kind);
+            wchar_t message[120]{};
+            swprintf_s(message, L"Game menu %d: %s (last result %d).", kind,
+                queued ? L"requested" : L"not available", spirit_ashes::game_menu_last_result());
+            log(message);
+        }
+        g_options[id].value = 0;
+        break;
     case skip_intro: set_site(g_intro, on(id)); break;
     case dialog_yes_default: set_site(g_dialog_yes, on(id)); break;
     case enemies_downed_vulnerable:
@@ -4549,6 +4771,7 @@ void apply(Id id) noexcept {
     case spell_stamina_cost: case spell_one_slot: case spell_no_requirements: case carry_max:
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance:
+    case world_journey: case journey_keep_runes:
         if (g_param_event) SetEvent(g_param_event);
         break;
     case skill_fp_cost:
@@ -4580,6 +4803,8 @@ bool available(Id id) noexcept {
         return g_spirit_ashes_started;
     case refresh_rate: return g_fullscreen_cap.ready;
     case skip_intro: return g_intro.ready;
+    case open_mirror: case open_rebirth:
+        return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case dialog_yes_default: return g_dialog_yes.ready;
     case enemies_downed_vulnerable:
         return (g_downed != nullptr || g_downed_site != nullptr) && g_statics.layout_2_7_1 &&
@@ -4609,6 +4834,10 @@ bool available(Id id) noexcept {
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager;
+    // Also needs the save's cycle (GameDataMan) to add only what the save lacks.
+    case world_journey: case journey_keep_runes:
+        return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_statics.game_data_man &&
+            !g_journey.attempted;
     case max_hp: case max_fp: case max_stamina:
     case hp_regen_points: case fp_regen_points: case stamina_regen_points:
     case speed_global: case speed_attack: case speed_spell: case speed_roll: case speed_move:
@@ -4735,7 +4964,7 @@ void ERUI_CALL named_slider_changed(void* target, const ERUI_CustomSliderChangeC
     request_save();
 }
 
-bool is_named(Id i) noexcept { return i == weather_type || i == charged_launch; }
+bool is_named(Id i) noexcept { return i == weather_type || i == charged_launch || i == world_journey; }
 
 // Fork export (r115) that colours labels away from their default; null when
 // ERNativeUI lacks it or the highlight is off.
@@ -5700,7 +5929,7 @@ const Texts kEnglish{
         {L"Enemies", L"Enemy health, speed, behaviour, respawns and lock-on."},
         {L"Spirit Ashes", L"Summoning cost, several spirits at once, and where and when they can be called."},
         {L"Runes, Shops & Upgrades", L"Runes, item drops, shop prices, upgrades and crafting."},
-        {L"Map & Travel", L"Graces, map reveal and fast travel."},
+        {L"Map & Travel", L"Graces, map reveal, fast travel, and the mirror and rebirth anywhere."},
         {L"World", L"Time of day and weather."},
         {L"Camera", L"Field of view and camera behaviour."},
         {L"Image", L"Post-processing and level of detail."},
@@ -5852,6 +6081,10 @@ const Texts kEnglish{
         {L"Charged attacks launch enemies", L"Your charged heavy attacks throw enemies through the air instead of staggering them: back, far back or upward. It works with their poise intact. Enemies already on the ground, large enemies and bosses have no throw and keep their own reaction. Far back throws best; Launch distance below sets how far. Applies from your next hit."},
         {L"Every attack launches", L"With the option above on, every attack of yours that makes enemies react throws them the same way, not only charged heavy attacks: light and heavy attacks, skills, spells and thrown items."},
         {L"Launch distance (%) (beta)", L"BETA, still in progress: meant to make launched enemies fly farther. For now it only makes enemies lighter while the launch option above is on (at 200% they weigh half as much, taken when they appear: rest at a grace), and in tests that has not changed how far they fly yet. Leave it at 100% unless you want to experiment."},
+        {L"World difficulty", L"Enemies get the strength of a New Game+ cycle, up to NG+7, area by area as in the real New Game+: more health, damage, defence and status resistance, and more runes. Your save stays in its own cycle: bosses, items and endings don't change. In New Game+ it only adds what your cycle lacks. Applies to enemies that appear afterwards: rest at a grace."},
+        {L"Keep your runes", L"With World difficulty on, enemies give the runes of your save's own cycle instead of the harder cycle's."},
+        {L"Open the mirror", L"Opens the appearance screen of the Roundtable Hold mirror. Use it out of combat."},
+        {L"Rebirth", L"Opens Rennala's rebirth screen to reallocate your attributes. No Larval Tear needed. Use it out of combat."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -5875,7 +6108,7 @@ const Texts kSpanish{
         {L"Enemigos", L"Vida, velocidad, comportamiento, reaparición y fijado de los enemigos."},
         {L"Cenizas espirituales", L"Coste de invocación, varias cenizas a la vez y dónde y cuándo puedes llamar a los espíritus."},
         {L"Runas, tiendas y mejoras", L"Runas, objetos que sueltan los enemigos, precios de tiendas, mejoras y fabricación."},
-        {L"Mapa y viaje", L"Gracias, mapa revelado y viaje rápido."},
+        {L"Mapa y viaje", L"Gracias, mapa revelado, viaje rápido, y el espejo y el renacimiento en cualquier lugar."},
         {L"Mundo", L"Hora del día y clima."},
         {L"Cámara", L"Campo de visión y comportamiento de la cámara."},
         {L"Imagen", L"Posprocesado y nivel de detalle."},
@@ -6027,6 +6260,10 @@ const Texts kSpanish{
         {L"Los ataques cargados lanzan a los enemigos", L"Tus ataques fuertes cargados lanzan a los enemigos por los aires en vez de hacerlos tambalear: hacia atrás, lejos o hacia arriba. Funciona aunque no pierdan el equilibrio. Los enemigos que ya están en el suelo, los grandes y los jefes no tienen esa animación y mantienen su reacción. «Lejos» es la que mejor lanza; «Distancia del lanzamiento», más abajo, decide lo lejos que vuelan. Se aplica desde tu siguiente golpe."},
         {L"Todos tus ataques lanzan", L"Con la opción de arriba activada, todos tus ataques que hacen reaccionar al enemigo lo lanzan igual, no solo los fuertes cargados: ataques ligeros y fuertes, habilidades, hechizos y objetos arrojadizos."},
         {L"Distancia del lanzamiento (%) (beta)", L"BETA, en desarrollo: su objetivo es que los enemigos lanzados vuelen más lejos. Por ahora solo los hace más ligeros mientras la opción de lanzar de arriba está activa (al 200 % pesan la mitad; lo toman al aparecer, así que descansa en una gracia), y en las pruebas aún no ha cambiado lo lejos que vuelan. Déjala al 100 % salvo que quieras experimentar."},
+        {L"Dificultad del mundo", L"Los enemigos tienen la fuerza de un ciclo de Nueva Partida+, hasta NG+7, zona por zona como en la Nueva Partida+ de verdad: más vida, daño, defensa y resistencia a estados, y más runas. Tu partida sigue en su propio ciclo: jefes, objetos y finales no cambian. En Nueva Partida+ solo añade lo que le falta a tu ciclo. Se aplica a los enemigos que aparecen después: descansa en una gracia."},
+        {L"Mantener tus runas", L"Con Dificultad del mundo activa, los enemigos dan las runas del ciclo de tu partida en lugar de las del ciclo más difícil."},
+        {L"Abrir el espejo", L"Abre la pantalla de apariencia del espejo de la Mesa Redonda. Úsalo fuera de combate."},
+        {L"Renacer", L"Abre la pantalla de renacimiento de Rennala para redistribuir tus atributos. No necesita Lágrima larval. Úsalo fuera de combate."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -6050,7 +6287,7 @@ const Texts kChinese{
         {L"敌人", L"敌人的血量、速度、行为、重生与锁定。"},
         {L"骨灰", L"召唤消耗、同时召唤多个骨灰，以及何时何地可以召唤骨灰。"},
         {L"卢恩、商店与强化", L"卢恩、道具掉落、商店价格、强化与制作。"},
-        {L"地图与传送", L"赐福、地图显示与传送。"},
+        {L"地图与传送", L"赐福、地图显示、传送，以及随时使用镜子与重生。"},
         {L"世界", L"时间与天气。"},
         {L"镜头", L"视野与镜头行为。"},
         {L"画面", L"后期处理与细节层次。"},
@@ -6202,6 +6439,10 @@ const Texts kChinese{
         {L"蓄力攻击击飞敌人", L"你的蓄力重攻击会将敌人击飞，而不是使其踉跄：向后、远距或向上。即使敌人韧性未被击破也有效。已倒地的敌人、大型敌人和头目没有击飞动作，保持自身的反应。“远距击飞”效果最好；下方的“击飞距离 (%)”决定距离。从下一次攻击起生效。"},
         {L"所有攻击都会击飞", L"开启上方选项时，你所有会让敌人产生反应的攻击都会以相同方式击飞敌人，而不只是蓄力重攻击：轻攻击、重攻击、战技、法术和投掷物品。"},
         {L"击飞距离 (%)（测试版）", L"测试版，开发中：目标是让被击飞的敌人飞得更远。目前它只会在开启上方击飞选项时减轻敌人重量（200% 时重量减半；敌人出现时读取，请在赐福处休息），测试中尚未改变击飞距离。除非想要试验，请保持 100%。"},
+        {L"世界难度", L"敌人获得新游戏+周目的强度，最高至 NG+7，并像真正的新游戏+一样按区域计算：更多生命、伤害、防御和异常状态抗性，以及更多卢恩。你的存档保持原有周目：头目、物品和结局不变。在新游戏+中只补足你的周目所缺少的部分。对之后出现的敌人生效：请在赐福处休息。"},
+        {L"保留你的卢恩", L"开启世界难度时，敌人给予你存档所在周目的卢恩，而不是更高难度周目的卢恩。"},
+        {L"打开镜子", L"打开圆桌厅堂镜子的外观界面。请在战斗外使用。"},
+        {L"重生", L"打开菈妮的重生界面以重新分配属性点。不需要幼虫之泪。请在战斗外使用。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -6231,12 +6472,12 @@ const Layout kLayout[]{
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, buff_enemy}},
-    {cat_enemies, {enemy_hp, enemy_speed, enemies_no_attack, enemies_no_move, enemies_no_ai,
-        enemies_no_respawn, enemies_downed_vulnerable, enemies_no_lock_on}},
+    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, enemy_speed, enemies_no_attack, enemies_no_move,
+        enemies_no_ai, enemies_no_respawn, enemies_downed_vulnerable, enemies_no_lock_on}},
     {cat_spirits, {ash_cost, ash_multiple, ash_max_active, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
-    {cat_map, {all_graces, reveal_map, fast_travel_anywhere}},
+    {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off}},
     {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance}},
@@ -6797,6 +7038,14 @@ constexpr std::size_t kLaunchCount = 4;
 constexpr const wchar_t* kLaunchEnglish[kLaunchCount]{L"Off", L"Launch back", L"Far back", L"Upward"};
 constexpr const wchar_t* kLaunchSpanish[kLaunchCount]{L"Desactivado", L"Hacia atrás", L"Lejos", L"Hacia arriba"};
 constexpr const wchar_t* kLaunchChinese[kLaunchCount]{L"关闭", L"击飞", L"远距击飞", L"向上击飞"};
+// WorldDifficulty values: the game's own cycle, then NG+1 to NG+7.
+constexpr std::size_t kJourneyCount = 8;
+constexpr const wchar_t* kJourneyEnglish[kJourneyCount]{
+    L"Your save", L"NG+1", L"NG+2", L"NG+3", L"NG+4", L"NG+5", L"NG+6", L"NG+7"};
+constexpr const wchar_t* kJourneySpanish[kJourneyCount]{
+    L"Tu partida", L"NG+1", L"NG+2", L"NG+3", L"NG+4", L"NG+5", L"NG+6", L"NG+7"};
+constexpr const wchar_t* kJourneyChinese[kJourneyCount]{
+    L"存档周目", L"NG+1", L"NG+2", L"NG+3", L"NG+4", L"NG+5", L"NG+6", L"NG+7"};
 constexpr const wchar_t* kWeatherChinese[kWeatherCount]{
     L"晴天", L"晴朗", L"少云", L"多云", L"雨", L"雨云", L"风雨", L"风雾", L"雪",
     L"大雪", L"雾", L"浓雾", L"大风多云", L"雨雾", L"雪雾", L"阵雨"};
@@ -6825,12 +7074,20 @@ std::vector<std::wstring> scale_names() {
 
 std::vector<std::wstring> value_names(std::string_view lang, Id i) {
     if (!is_named(i)) return {};
-    const bool launch = i == charged_launch;
-    const wchar_t* const* english = launch ? kLaunchEnglish : kWeatherEnglish;
-    const std::size_t count = launch ? kLaunchCount : kWeatherCount;
+    const wchar_t* const* english = kWeatherEnglish;
+    const wchar_t* const* spanish = kWeatherSpanish;
+    const wchar_t* const* chinese = kWeatherChinese;
+    std::size_t count = kWeatherCount;
+    if (i == charged_launch) {
+        english = kLaunchEnglish, spanish = kLaunchSpanish, chinese = kLaunchChinese;
+        count = kLaunchCount;
+    } else if (i == world_journey) {
+        english = kJourneyEnglish, spanish = kJourneySpanish, chinese = kJourneyChinese;
+        count = kJourneyCount;
+    }
     const wchar_t* const* names = english;
-    if (lang == "es") names = launch ? kLaunchSpanish : kWeatherSpanish;
-    else if (lang == "zh" || lang == "zht") names = launch ? kLaunchChinese : kWeatherChinese;
+    if (lang == "es") names = spanish;
+    else if (lang == "zh" || lang == "zht") names = chinese;
     std::vector<std::wstring> result;
     result.reserve(count);
     for (std::size_t n = 0; n < count; ++n)

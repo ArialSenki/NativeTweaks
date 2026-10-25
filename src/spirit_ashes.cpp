@@ -31,6 +31,8 @@ NtMsaSettings to_rust(const spirit_ashes::Settings& settings) noexcept {
 extern "C" std::uint8_t nt_msa_start(void* module, const NtMsaSettings* settings);
 extern "C" void nt_msa_set(const NtMsaSettings* settings);
 extern "C" void nt_msa_dismiss_all();
+extern "C" std::uint8_t nt_open_game_menu(int kind);
+extern "C" int nt_game_menu_last_result();
 
 namespace spirit_ashes {
 
@@ -46,6 +48,14 @@ void update(const Settings& settings) noexcept {
 
 void dismiss_all() noexcept {
     nt_msa_dismiss_all();
+}
+
+bool open_game_menu(int kind) noexcept {
+    return nt_open_game_menu(kind) != 0;
+}
+
+int game_menu_last_result() noexcept {
+    return nt_game_menu_last_result();
 }
 
 } // namespace spirit_ashes

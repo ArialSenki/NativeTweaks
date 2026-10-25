@@ -6,5 +6,7 @@ namespace spirit_ashes {
 bool start(HMODULE, const Settings&) noexcept { return false; }
 void update(const Settings&) noexcept {}
 void dismiss_all() noexcept {}
+bool open_game_menu(int) noexcept { return false; }
+int game_menu_last_result() noexcept { return 0; }
 
 } // namespace spirit_ashes
