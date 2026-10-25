@@ -232,21 +232,8 @@ Site g_enemy_respawn{L"enemy respawn",
     "83 b9 ? ? ? ? 00 75 0a c7 81 ? ? ? ? 01 00 00 00 c3",
     0, "83 b9", {0xC3}};
 
-// Message boxes (CS::MessageBoxDialog; every Yes/No question goes through the
-// same builder). Adding a button, the builder (eldenring.exe+0x7B2BC0 on
-// 2.7.1.0) compares its text with GR_Dialogues text 4 ("No") and, on a match,
-// stores that button's index as the initial cursor (builder +0x10F4, -1 = not
-// set). The patch stores r14d instead, which the function keeps at zero, so
-// the cursor starts on the first button (Yes). Other dialogs are unchanged.
-Site g_dialog_yes{L"Yes/No dialog cursor",
-    "ff 87 f0 10 00 00 48 8d 4d ? e8 ? ? ? ? 90 48 8b 55 ? 48 85 d2 75 ? 48 8d 55 ? 48 83 7d ? 08 "
-    "48 0f 43 55 ? 48 8b 0e 48 85 c9 75 ? 48 8d 4e 10 48 83 79 18 08 72 ? 48 8b 09 e8 ? ? ? ? "
-    "85 c0 75 ? 44 89 bf f4 10 00 00",
-    0x46, "44 89 bf f4 10 00 00", {0x44, 0x89, 0xB7, 0xF4, 0x10, 0x00, 0x00}};
-
 Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic,
-    &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
-    &g_dialog_yes};
+    &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn};
 
 void resolve(Site& site) noexcept {
     try {
@@ -950,6 +937,342 @@ std::uint8_t* alloc_near(const std::uint8_t* target) noexcept {
     return nullptr;
 }
 
+// Yes/No questions start on Yes. A message box takes its first selected button
+// from its builder (+0x10F4, -1 = not set; +0x10F0 = number of buttons; +0x18 =
+// movie name, set with the layout at +0x10). Six functions read it when they
+// create the box, one per kind of box (0x7B22F6..0x7B2AEE in 2.7.2.0), each
+// with "mov reg,[base+10F4h]". Each read jumps to a trampoline that, while the
+// option is on, records the box (buttons, first button, movie name) and, for
+// a two-button question box (01_010/01_011) not on its first button, gives 0
+// (Yes) and counts it; dialog_pointer_worker then
+// moves a visible mouse pointer onto Yes. The builder only stores a button
+// index for a "No" text that matches GR_Dialogues exactly, which the game's own
+// questions (quit, travel) never do: in game (r138) the old one-byte patch at
+// that store never ran.
+struct DialogYesData {
+    volatile std::uint32_t on;
+    volatile std::uint32_t built;
+    volatile std::uint64_t movie;
+    volatile std::uint32_t reads;    // boxes created while the option is on
+    volatile std::uint32_t buttons;  // the last one's button count
+    volatile std::uint32_t value;    // and first button (-1 = not set)
+    std::uint64_t question_box;        // movie names of the question boxes
+    std::uint64_t small_question_box;  // (other two-button windows are left alone)
+};
+
+// The game's own copy of a movie name (UTF-16 with its terminator), which the
+// builders point to; nullptr when absent or ambiguous.
+const wchar_t* find_movie_name(const wchar_t* name) noexcept {
+    auto* base = reinterpret_cast<std::uint8_t*>(game::image());
+    if (!base) return nullptr;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const auto* section = IMAGE_FIRST_SECTION(nt);
+    const std::size_t bytes = (std::wcslen(name) + 1) * sizeof(wchar_t);
+    const wchar_t* found{};
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+        if (section->Characteristics & (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE)) continue;
+        std::uint8_t* p = base + section->VirtualAddress;
+        std::uint8_t* const end = p + section->Misc.VirtualSize - bytes;
+        for (; p <= end; p += 2) {
+            p = static_cast<std::uint8_t*>(std::memchr(p, name[0], static_cast<std::size_t>(end - p) + 1));
+            if (!p) break;
+            if ((reinterpret_cast<std::uintptr_t>(p) & 1) || std::memcmp(p, name, bytes) != 0) {
+                p -= reinterpret_cast<std::uintptr_t>(p) & 1;
+                continue;
+            }
+            if (found) return nullptr;
+            found = reinterpret_cast<const wchar_t*>(p);
+        }
+    }
+    return found;
+}
+
+DialogYesData* g_dialog_yes_data{};
+std::vector<std::uint8_t*> g_dialog_yes_reads;
+
+// The 32-bit reads of +0x10F4 with a 32-bit displacement and no SIB byte; all
+// close together (one group of functions), or none.
+void resolve_dialog_yes_reads(bool quiet) noexcept {
+    try {
+        g_dialog_yes_reads.clear();
+        auto* base = reinterpret_cast<std::uint8_t*>(game::image());
+        if (!base) return;
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        const auto* section = IMAGE_FIRST_SECTION(nt);
+        const std::uint8_t tail[]{0xF4, 0x10, 0x00, 0x00};
+        std::vector<std::uint8_t*> found;
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+            if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+            std::uint8_t* const begin = base + section->VirtualAddress;
+            std::uint8_t* const end = begin + section->Misc.VirtualSize - 6;
+            for (std::uint8_t* p = begin + 1; p <= end; ++p) {
+                p = static_cast<std::uint8_t*>(std::memchr(p, 0x8B, static_cast<std::size_t>(end - p) + 1));
+                if (!p) break;
+                const std::uint8_t modrm = p[1];
+                if ((modrm >> 6) != 2 || (modrm & 7) == 4 || std::memcmp(p + 2, tail, 4) != 0) continue;
+                const std::uint8_t rex = p[-1];
+                if ((rex & 0xF0) == 0x40 && (rex & 0x08)) continue;  // 64-bit read: not this field
+                found.push_back(p);
+            }
+        }
+        wchar_t message[200]{};
+        if (found.empty() || found.size() > 8 || found.back() - found.front() > 0x10000) {
+            swprintf_s(message, L"Vanilla site 'Yes/No dialog cursor' not found (%zu reads); option disabled.",
+                found.size());
+            log(message);
+            g_dialog_yes_reads.clear();
+            return;
+        }
+        g_dialog_yes_reads = std::move(found);
+        if (quiet) return;
+        swprintf_s(message, L"Vanilla site 'Yes/No dialog cursor' found: %zu reads from eldenring.exe+0x%llX.",
+            g_dialog_yes_reads.size(),
+            static_cast<unsigned long long>(g_dialog_yes_reads.front() - base));
+        log(message);
+    } catch (...) {
+        g_dialog_yes_reads.clear();
+    }
+}
+
+void install_dialog_yes_hooks() noexcept {
+    resolve_dialog_yes_reads(false);
+    if (g_dialog_yes_reads.empty()) return;
+    std::uint8_t* code = alloc_near(g_dialog_yes_reads.front());
+    if (!code) {
+        log(L"Yes/No dialog cursor: no memory near the game code; option disabled.");
+        return;
+    }
+    auto* data = reinterpret_cast<DialogYesData*>(code + 2048);
+    data->on = 0;
+    data->built = 0;
+    data->movie = 0;
+    data->reads = 0;
+    data->buttons = 0;
+    data->value = 0;
+    data->question_box = reinterpret_cast<std::uint64_t>(find_movie_name(L"01_010_MessageBox"));
+    data->small_question_box = reinterpret_cast<std::uint64_t>(find_movie_name(L"01_011_MessageBox_Small"));
+    if (!data->question_box || !data->small_question_box) {
+        log(L"Yes/No dialog cursor: a question box name was not found; those boxes keep their first button.");
+        if (!data->question_box) data->question_box = 1;  // no movie name lives there
+        if (!data->small_question_box) data->small_question_box = 1;
+    }
+
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_rel = [&](const volatile void* target, std::size_t instruction_tail) {
+        const auto next = reinterpret_cast<std::intptr_t>(p) + 4 + instruction_tail;
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(target) - next);
+        std::memcpy(p, &disp, 4);
+        p += 4;
+    };
+    std::size_t installed = 0;
+    for (std::uint8_t* read : g_dialog_yes_reads) {
+        const std::uint8_t rex = ((read[-1] & 0xF0) == 0x40) ? read[-1] : 0;
+        std::uint8_t* const start = rex ? read - 1 : read;
+        const std::size_t length = rex ? 7 : 6;
+        const unsigned reg = ((read[1] >> 3) & 7) | ((rex & 0x04) ? 8u : 0u);
+        const unsigned rm = (read[1] & 7) | ((rex & 0x01) ? 8u : 0u);
+        if (p + 160 > code + 2048) break;
+        std::uint8_t* const entry = p;
+
+        std::memcpy(p, start, length); p += length;                            // the original read
+        put({0x9C});                                                            // pushfq
+        put({0x83, 0x3D}); put_rel(&data->on, 1); put({0x00});                  // cmp dword [on],0
+        put({0x74, 0x00}); std::uint8_t* const skip_off = p;                    // je done
+        if (reg & 8) put({0x44});
+        put({0x89, static_cast<std::uint8_t>(0x05 | ((reg & 7) << 3))});
+        put_rel(&data->value, 0);                                               // mov [value],reg32
+        put({0x50});                                                            // push rax
+        if (rm & 8) put({0x41});
+        put({0x8B, static_cast<std::uint8_t>(0x80 | (rm & 7)), 0xF0, 0x10, 0x00, 0x00});  // mov eax,[base+10F0h]
+        put({0x89, 0x05}); put_rel(&data->buttons, 0);                          // mov [buttons],eax
+        put({static_cast<std::uint8_t>((rm & 8) ? 0x49 : 0x48), 0x8B,
+            static_cast<std::uint8_t>(0x40 | (rm & 7)), 0x18});                 // mov rax,[base+18h]
+        put({0x48, 0x89, 0x05}); put_rel(&data->movie, 0);                      // mov [movie],rax
+        put({0xF0, 0xFF, 0x05}); put_rel(&data->reads, 0);                      // lock inc [reads]
+        put({0x48, 0x3B, 0x05}); put_rel(&data->question_box, 0);               // cmp rax,[question_box]
+        put({0x74, 0x00}); std::uint8_t* const is_box = p;                      // je question
+        put({0x48, 0x3B, 0x05}); put_rel(&data->small_question_box, 0);         // cmp rax,[small_question_box]
+        put({0x74, 0x00}); std::uint8_t* const is_small_box = p;                // je question
+        put({0x58});                                                            // pop rax
+        put({0xEB, 0x00}); std::uint8_t* const skip_other = p;                  // jmp done (other window)
+        std::uint8_t* const question = p;
+        put({0x58});                                                            // question: pop rax
+        if (rm & 8) put({0x41});
+        put({0x83, static_cast<std::uint8_t>(0xB8 | (rm & 7)), 0xF0, 0x10, 0x00, 0x00, 0x02});  // cmp dword [base+10F0h],2
+        put({0x75, 0x00}); std::uint8_t* const skip_count = p;                  // jne done
+        if (reg & 8) put({0x45});
+        put({0x85, static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (reg & 7))});  // test reg32,reg32
+        put({0x74, 0x00}); std::uint8_t* const skip_set = p;                    // je done (already Yes)
+        if (reg & 8) put({0x45});
+        put({0x31, static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (reg & 7))});  // xor reg32,reg32 (Yes)
+        put({0xF0, 0xFF, 0x05}); put_rel(&data->built, 0);                      // lock inc [built]
+        std::uint8_t* const done = p;
+        put({0x9D});                                                            // popfq
+        put({0xE9}); put_rel(start + length, 0);                                // jmp back
+        for (std::uint8_t* jump_end : {skip_off, skip_other, skip_count, skip_set})
+            jump_end[-1] = static_cast<std::uint8_t>(done - jump_end);
+        for (std::uint8_t* jump_end : {is_box, is_small_box})
+            jump_end[-1] = static_cast<std::uint8_t>(question - jump_end);
+        FlushInstructionCache(GetCurrentProcess(), entry, static_cast<SIZE_T>(p - entry));
+
+        std::uint8_t jump[7]{0xE9, 0, 0, 0, 0, 0x90, 0x90};
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(entry) -
+            reinterpret_cast<std::intptr_t>(start + 5));
+        std::memcpy(jump + 1, &disp, 4);
+        if (write_code(start, jump, length)) ++installed;
+    }
+    wchar_t message[160]{};
+    if (installed != g_dialog_yes_reads.size()) {
+        // The reads left as they were still work as the game's own.
+        swprintf_s(message, L"Yes/No dialog cursor: only %zu of %zu reads hooked.", installed,
+            g_dialog_yes_reads.size());
+        log(message);
+        if (!installed) return;
+    }
+    g_dialog_yes_data = data;
+    swprintf_s(message, L"Yes/No dialog cursor: %zu reads hooked (the mouse pointer is moved onto Yes too).",
+        installed);
+    log(message);
+}
+
+// Dodge invincibility and parry window. Rolls, backsteps and dodge skills mark
+// their dodge frames with ChrActionFlag 8 in their TAE (c0000 roll 027100:
+// frames 0-13, heavy roll 027120: 0-12, backstep 027000: 0-7; a second 3-frame
+// window for the Crucible Feather); parries (skills a692-a699, a02/a03 040392)
+// mark theirs with flags 18 (frames 4-11) and 119 (4-10). The TAE flag handler
+// (switch at eldenring.exe+0x427C31 in 2.7.2.0, table entry = flag - 1) turns
+// them into bits of the action flag module (ChrIns modules +0x8, flags at
+// +0x40) every frame while the event runs: flag 8 "or qword [rbx+40h],2"
+// (+0x427E40), flag 18 "or qword [rbx+40h],80h" (+0x4280A3), flag 119 bit 37
+// (+0x427E20). The module clears the flags at the start of each frame
+// (+0x406183, "mov [rcx+40h],r12" with r12 = 0). Hooks: the flag 8 and flag 18
+// cases count the frames they run for the player, and the clear puts the bits
+// back for the player while window_worker says so (and, for the whole of a
+// knockdown or an item animation, bit 1 or flag 24's bit 8, super armour, when
+// those options are on). window_worker measures the
+// game's own window and holds it on for that length times (percent - 100) %
+// more.
+struct WindowData {
+    volatile std::uint32_t extend;  // dodge
+    volatile std::uint32_t seen;    // flag 8 frames for the player
+    volatile std::uint64_t player_module;
+    volatile std::uint32_t clears;    // frame starts seen for the player (diagnostics)
+    volatile std::uint32_t injected;  // of those, with the dodge bit put back
+    volatile std::uint32_t parry_extend;
+    volatile std::uint32_t parry_seen;      // flag 18 frames for the player
+    volatile std::uint32_t parry_injected;  // frame starts with the parry bits put back
+    volatile std::uint64_t held_bits;       // put back on every frame (knocked down, using an item)
+};
+
+WindowData* g_windows{};
+
+void install_window_hooks() noexcept {
+    std::uint8_t* dodge_hit = find_unique(parse_pattern("48 81 4b 40 00 80 00 00 e9 ? ? ? ? 48 83 4b 40 02 e9"));
+    std::uint8_t* parry_site = find_unique(parse_pattern(
+        "48 81 4b 40 80 00 00 00 e9 ? ? ? ? 48 8d 55 48 48 8b ce e8"));
+    std::uint8_t* clear_hit = find_unique(parse_pattern(
+        "48 8b 51 40 48 8b c2 48 89 5c 24 ? 48 c1 e8 2d 83 e0 01 48 c1 ea 1e 03 c0 4c 89 64 24 ? 45 33 e4 "
+        "4c 89 74 24 ? 4c 89 61 10 83 e2 01 44 89 61 18 0b c2 4c 89 61 40 c1 e0 05"));
+    if (!dodge_hit || !parry_site || !clear_hit) {
+        log(L"Vanilla site 'dodge and parry frames' not found (or ambiguous); options disabled.");
+        return;
+    }
+    std::uint8_t* const dodge_site = dodge_hit + 13;    // or qword [rbx+40h],2 (5 bytes), then jmp
+    std::uint8_t* const clear_site = clear_hit + 0x33;  // mov [rcx+40h],r12; shl eax,5 (7 bytes)
+    std::uint8_t* code = alloc_near(dodge_site);
+    if (!code) {
+        log(L"Vanilla dodge and parry hooks: no memory near the game code; options disabled.");
+        return;
+    }
+    auto* data = reinterpret_cast<WindowData*>(code + 512);
+    std::memset(code + 512, 0, sizeof(WindowData));
+
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_rel = [&](const volatile void* target, std::size_t instruction_tail) {
+        const auto next = reinterpret_cast<std::intptr_t>(p) + 4 + instruction_tail;
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(target) - next);
+        std::memcpy(p, &disp, 4);
+        p += 4;
+    };
+    // A flag case: the original or, then count the player's frames.
+    const auto counting_case = [&](std::initializer_list<std::uint8_t> original, std::uint8_t* site,
+                                   volatile std::uint32_t* counter) {
+        std::uint8_t* const entry = p;
+        put(original);
+        put({0x9C});                                                        // pushfq
+        put({0x48, 0x3B, 0x1D}); put_rel(&data->player_module, 0);         // cmp rbx,[player_module]
+        put({0x75, 0x07});                                                  // jne done
+        put({0xF0, 0xFF, 0x05}); put_rel(counter, 0);                       // lock inc [counter]
+        put({0x9D});                                                        // done: popfq
+        put({0xE9}); put_rel(site + original.size(), 0);                    // jmp back (to the case's jmp)
+        return entry;
+    };
+    std::uint8_t* const dodge_code = counting_case({0x48, 0x83, 0x4B, 0x40, 0x02}, dodge_site, &data->seen);
+    std::uint8_t* const parry_code =
+        counting_case({0x48, 0x81, 0x4B, 0x40, 0x80, 0x00, 0x00, 0x00}, parry_site, &data->parry_seen);
+
+    // Frame start: the original clear, then the bits again while extending.
+    std::uint8_t* const clear_code = p;
+    put({0x4C, 0x89, 0x61, 0x40});                                          // mov [rcx+40h],r12
+    put({0xC1, 0xE0, 0x05});                                                // shl eax,5
+    put({0x9C});                                                            // pushfq
+    put({0x48, 0x3B, 0x0D}); put_rel(&data->player_module, 0);             // cmp rcx,[player_module]
+    put({0x75, 0x00}); std::uint8_t* const skip_other = p;                  // jne done
+    put({0xF0, 0xFF, 0x05}); put_rel(&data->clears, 0);                     // lock inc [clears]
+    put({0x83, 0x3D}); put_rel(&data->extend, 1); put({0x00});              // cmp dword [extend],0
+    put({0x74, 0x00}); std::uint8_t* const skip_dodge = p;                  // je parry
+    put({0x48, 0x83, 0x49, 0x40, 0x02});                                   // or qword [rcx+40h],2 (flag 8)
+    put({0xF0, 0xFF, 0x05}); put_rel(&data->injected, 0);                   // lock inc [injected]
+    std::uint8_t* const parry = p;
+    put({0x83, 0x3D}); put_rel(&data->parry_extend, 1); put({0x00});        // parry: cmp dword [parry_extend],0
+    put({0x74, 0x00}); std::uint8_t* const skip_parry = p;                  // je held
+    put({0x48, 0x81, 0x49, 0x40, 0x80, 0x00, 0x00, 0x00});                 // or qword [rcx+40h],80h (flag 18)
+    put({0x48, 0x0F, 0xBA, 0x69, 0x40, 0x25});                             // bts qword [rcx+40h],37 (flag 119)
+    put({0xF0, 0xFF, 0x05}); put_rel(&data->parry_injected, 0);             // lock inc [parry_injected]
+    std::uint8_t* const held = p;
+    put({0x50});                                                            // held: push rax
+    put({0x48, 0x8B, 0x05}); put_rel(&data->held_bits, 0);                 // mov rax,[held_bits]
+    put({0x48, 0x09, 0x41, 0x40});                                         // or [rcx+40h],rax
+    put({0x58});                                                            // pop rax
+    std::uint8_t* const done = p;
+    put({0x9D});                                                            // done: popfq
+    put({0xE9}); put_rel(clear_site + 7, 0);                                // jmp back
+    skip_other[-1] = static_cast<std::uint8_t>(done - skip_other);
+    skip_dodge[-1] = static_cast<std::uint8_t>(parry - skip_dodge);
+    skip_parry[-1] = static_cast<std::uint8_t>(held - skip_parry);
+    FlushInstructionCache(GetCurrentProcess(), code, static_cast<SIZE_T>(p - code));
+
+    const auto jump_to = [](std::uint8_t* site, std::uint8_t* target, std::size_t length) {
+        std::uint8_t jump[8]{0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(target) -
+            reinterpret_cast<std::intptr_t>(site + 5));
+        std::memcpy(jump + 1, &disp, 4);
+        return write_code(site, jump, length);
+    };
+    // The clear first: without the flag hooks counting, it never adds anything.
+    if (!jump_to(clear_site, clear_code, 7) || !jump_to(dodge_site, dodge_code, 5) ||
+        !jump_to(parry_site, parry_code, 8)) {
+        log(L"Vanilla dodge and parry hooks could not be written; options disabled.");
+        return;
+    }
+    g_windows = data;
+    const auto rva = [](std::uint8_t* at) {
+        return static_cast<unsigned long long>(at - reinterpret_cast<std::uint8_t*>(game::image()));
+    };
+    wchar_t message[200]{};
+    swprintf_s(message, L"Vanilla dodge and parry hooks installed at eldenring.exe+0x%llX, +0x%llX and +0x%llX.",
+        rva(dodge_site), rva(parry_site), rva(clear_site));
+    log(message);
+}
+
 bool write_jump(std::uint8_t* site, const std::uint8_t* target) noexcept {
     std::uint8_t jump[5]{0xE9};
     const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(target) -
@@ -1151,6 +1474,12 @@ enum Id : std::size_t {
     clean_characters, hide_buff_effects,
     // Image: weapon buff visuals too (Nexus request)
     hide_weapon_buff_effects,
+    // Movement: longer dodge invincibility (Nexus request)
+    dodge_frames,
+    // Damage taken: longer parry window (Nexus request)
+    parry_frames,
+    // Movement: invincible while knocked down, super armour while using items
+    knockdown_invincible, item_super_armor,
     count
 };
 
@@ -1178,34 +1507,34 @@ constexpr Option slider(const wchar_t* key, std::int16_t fallback, std::int16_t 
 }
 
 Option g_options[count]{
-    toggle(L"FovEnabled"), slider(L"FovPercent", 100, 25, 1300, 5),
+    toggle(L"FovEnabled"), slider(L"FovPercent", 100, 25, 200, 5),
     toggle(L"DisableCameraAutoRotate"), toggle(L"DisableCameraReset"),
-    slider(L"CameraDistancePercent", 100, 25, 1300, 5),
+    slider(L"CameraDistancePercent", 100, 25, 500, 5),
     toggle(L"RemoveVignette"), toggle(L"RemoveChromaticAberration"), toggle(L"FullAnimationDistance"),
     toggle(L"DisableAntiAliasing"), toggle(L"DisableMotionBlur"), toggle(L"DisableDepthOfField"),
     toggle(L"GodMode"), toggle(L"NoDeath"), toggle(L"InfiniteStamina"), toggle(L"InfiniteFp"),
     toggle(L"InfiniteItems"), toggle(L"InfiniteArrows"),
-    slider(L"EquipWeightPercent", 100, 0, 1275, 5),
+    slider(L"EquipWeightPercent", 100, 0, 200, 5),
     // Sliders with a scale selector use all 256 positions in steps of 5.
-    slider(L"PlayerPoisePercent", 100, 0, 1275, 5), toggle(L"PlayerInfinitePoise"),
+    slider(L"PlayerPoisePercent", 100, 0, 500, 10), toggle(L"PlayerInfinitePoise"),
     toggle(L"NoFallDamage"), toggle(L"StatusImmunity"),
-    slider(L"DamageDealtPercent", 100, 10, 1285, 5), slider(L"DamageTakenPercent", 100, 0, 1275, 5),
-    slider(L"PostureDamageDealtPercent", 100, 0, 1275, 5), slider(L"PostureDamageTakenPercent", 100, 0, 1275, 5),
-    slider(L"StaminaCostPercent", 100, 0, 1275, 5), slider(L"SpellFpCostPercent", 100, 0, 1275, 5),
-    slider(L"StatusBuildupPercent", 100, 0, 1275, 5), toggle(L"OneHitKill"),
-    slider(L"BuffDurationWeaponPercent", 100, 25, 1300, 5), slider(L"BuffDurationSelfPercent", 100, 25, 1300, 5),
-    slider(L"BuffDurationEnemyPercent", 100, 25, 1300, 5),
-    slider(L"SpeedGlobalPercent", 100, 25, 1300, 5), slider(L"SpeedAttackPercent", 100, 25, 1300, 5),
-    slider(L"SpeedSpellPercent", 100, 25, 1300, 5), slider(L"SpeedRollPercent", 100, 25, 1300, 5),
-    slider(L"SpeedMovePercent", 100, 25, 1300, 5), slider(L"SpeedJumpPercent", 100, 25, 1300, 5),
-    slider(L"EnemyHpPercent", 100, 10, 1285, 5), slider(L"EnemyPoisePercent", 100, 0, 1275, 5),
-    toggle(L"EnemyInfinitePoise"), slider(L"EnemySpeedPercent", 100, 25, 1300, 5),
+    slider(L"DamageDealtPercent", 100, 10, 1000, 10), slider(L"DamageTakenPercent", 100, 0, 1000, 10),
+    slider(L"PostureDamageDealtPercent", 100, 0, 1000, 10), slider(L"PostureDamageTakenPercent", 100, 0, 1000, 10),
+    slider(L"StaminaCostPercent", 100, 0, 300, 5), slider(L"SpellFpCostPercent", 100, 0, 300, 5),
+    slider(L"StatusBuildupPercent", 100, 0, 1000, 10), toggle(L"OneHitKill"),
+    slider(L"BuffDurationWeaponPercent", 100, 25, 500, 25), slider(L"BuffDurationSelfPercent", 100, 25, 500, 25),
+    slider(L"BuffDurationEnemyPercent", 100, 25, 500, 25),
+    slider(L"SpeedGlobalPercent", 100, 25, 300, 5), slider(L"SpeedAttackPercent", 100, 25, 300, 5),
+    slider(L"SpeedSpellPercent", 100, 25, 300, 5), slider(L"SpeedRollPercent", 100, 25, 300, 5),
+    slider(L"SpeedMovePercent", 100, 25, 300, 5), slider(L"SpeedJumpPercent", 100, 25, 300, 5),
+    slider(L"EnemyHpPercent", 100, 10, 1000, 10), slider(L"EnemyPoisePercent", 100, 0, 500, 10),
+    toggle(L"EnemyInfinitePoise"), slider(L"EnemySpeedPercent", 100, 25, 300, 5),
     toggle(L"EnemiesNoAttack"),
     toggle(L"EnemiesNoMove"), toggle(L"EnemiesNoAi"), toggle(L"TorrentNoDeath"),
-    slider(L"TorrentSpeedPercent", 100, 25, 1300, 5),
-    toggle(L"DisableRuneLoss"), slider(L"RunesGainedPercent", 100, 0, 1275, 5),
-    slider(L"LootDropPercent", 100, 0, 1275, 5),
-    slider(L"SpiritAshCostPercent", 100, 0, 1275, 5), slider(L"UpgradeCostPercent", 100, 0, 1275, 5),
+    slider(L"TorrentSpeedPercent", 100, 25, 300, 5),
+    toggle(L"DisableRuneLoss"), slider(L"RunesGainedPercent", 100, 0, 1000, 10),
+    slider(L"LootDropPercent", 100, 0, 1000, 10),
+    slider(L"SpiritAshCostPercent", 100, 0, 300, 10), slider(L"UpgradeCostPercent", 100, 0, 300, 10),
     toggle(L"PauseKey"),
     toggle(L"SetTimeOfDay"), slider(L"TimeOfDayHour", 12, 0, 23, 1, L":00"), toggle(L"FreezeTime"),
     toggle(L"SetWeather"), slider(L"WeatherType", 4, 0, 15, 1, L""),
@@ -1237,7 +1566,7 @@ Option g_options[count]{
     slider(L"CrimsonFlaskPercent", 100, 0, 500, 10), slider(L"CeruleanFlaskPercent", 100, 0, 500, 10),
     slider(L"SpellStaminaCostPercent", 100, 0, 500, 10), toggle(L"SpellsUseOneSlot"), toggle(L"IgnoreSpellRequirements"),
     slider(L"SkillFpCostPercent", 100, 0, 500, 10), toggle(L"Carry999Items"),
-    slider(L"SpeedItemPercent", 100, 25, 1300, 5),
+    slider(L"SpeedItemPercent", 100, 25, 300, 5),
     slider(L"ShopPricePercent", 100, 0, 500, 10), toggle(L"CraftWithoutMaterials"),
     slider(L"WeaponRequirementsPercent", 100, 0, 100, 5), toggle(L"UpgradeWithoutMaterials"),
     toggle(L"HideHelmet"),
@@ -1251,7 +1580,7 @@ Option g_options[count]{
     toggle(L"EnemiesDoNotRespawn"),
     toggle(L"DialogsDefaultToYes"),
     toggle(L"HitDownedEnemies"),
-    slider(L"TorrentJumpSpeedPercent", 100, 25, 1300, 5),
+    slider(L"TorrentJumpSpeedPercent", 100, 25, 300, 5),
     slider(L"JumpHeightPercent", 100, 25, 500, 5), slider(L"JumpDistancePercent", 100, 25, 500, 5),
     slider(L"TorrentJumpHeightPercent", 100, 25, 500, 5), slider(L"TorrentJumpDistancePercent", 100, 25, 500, 5),
     toggle(L"DisableLockOn"),
@@ -1263,9 +1592,12 @@ Option g_options[count]{
     slider(L"WorldDifficulty", 0, 0, 7, 1, L""),
     toggle(L"WorldDifficultyKeepRunes"),
     toggle(L"OpenMirror"), toggle(L"OpenRebirth"),
-    slider(L"BossHpPercent", 100, 10, 1285, 5),
+    slider(L"BossHpPercent", 100, 10, 1000, 10),
     toggle(L"KeepCharactersClean"), toggle(L"HideBuffEffects"),
     toggle(L"HideWeaponBuffEffects"),
+    slider(L"DodgeFramesPercent", 100, 100, 500, 10),
+    slider(L"ParryWindowPercent", 100, 100, 500, 10),
+    toggle(L"KnockdownInvincible"), toggle(L"ItemSuperArmor"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1275,69 +1607,8 @@ std::int16_t clamp_value(const Option& option, int value) noexcept {
     return static_cast<std::int16_t>(value);
 }
 
-// Optional extended ranges ([General] ExtendedRanges = 1, or the optional
-// package's marker NativeTweaks.ExtendedRanges.ini beside NativeTweaks.ini):
-// the sliders below use all 256 positions and get a scale row that multiplies
-// their value. Without it they keep the classic range and step listed here.
-constexpr int kScaleFactors[]{1, 2, 5, 10, 100};
-constexpr std::size_t kScaleCount = std::size(kScaleFactors);
-bool g_extended{};
-
-struct Scale {
-    Id id;
-    const wchar_t* key;
-    std::int16_t classic_minimum;
-    std::int16_t classic_maximum;
-    std::int16_t classic_step;
-    std::uint8_t index;
-    erui::RowHandle row;
-};
-
-Scale g_scales[]{
-    {player_poise, L"PlayerPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
-    {damage_dealt, L"DamageDealtScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
-    {damage_taken, L"DamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {posture_dealt, L"PostureDamageDealtScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {posture_taken, L"PostureDamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {status_buildup, L"StatusBuildupScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {enemy_hp, L"EnemyHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
-    {boss_hp, L"BossHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
-    {enemy_poise, L"EnemyPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
-    {runes_gained, L"RunesGainedScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {loot_drop, L"LootDropScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
-    {equip_weight, L"EquipWeightScale", 0, 200, 5, 0, ERUI_INVALID_ROW},
-    {stamina_cost, L"StaminaCostScale", 0, 300, 5, 0, ERUI_INVALID_ROW},
-    {spell_fp_cost, L"SpellFpCostScale", 0, 300, 5, 0, ERUI_INVALID_ROW},
-    {buff_weapon, L"BuffDurationWeaponScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
-    {buff_self, L"BuffDurationSelfScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
-    {buff_enemy, L"BuffDurationEnemyScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
-    {ash_cost, L"SpiritAshCostScale", 0, 300, 10, 0, ERUI_INVALID_ROW},
-    {upgrade_cost, L"UpgradeCostScale", 0, 300, 10, 0, ERUI_INVALID_ROW},
-    {fov_percent, L"FovScale", 25, 200, 5, 0, ERUI_INVALID_ROW},
-    {camera_distance, L"CameraDistanceScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
-    {speed_global, L"SpeedGlobalScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_attack, L"SpeedAttackScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_spell, L"SpeedSpellScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_roll, L"SpeedRollScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_move, L"SpeedMoveScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_jump, L"SpeedJumpScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {speed_item, L"SpeedItemScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {enemy_speed, L"EnemySpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {torrent_speed, L"TorrentSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-    {torrent_jump_speed, L"TorrentJumpSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
-};
-
-Scale* scale_of(Id id) noexcept {
-    if (!g_extended) return nullptr;
-    for (Scale& scale : g_scales)
-        if (scale.id == id) return &scale;
-    return nullptr;
-}
-// Effective value: the slider times its scale.
 int value_of(Id id) noexcept {
-    const int value = g_options[id].value;
-    const Scale* scale = scale_of(id);
-    return scale ? value * kScaleFactors[scale->index] : value;
+    return g_options[id].value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,7 +1887,7 @@ void sync_params() noexcept {
             if (boss_percent != 100 && r < state.boss.size() && state.boss[r] && scaled > 0)
                 scaled = scaled * boss_percent / 100.0;
             // The game wraps poise damage past 32767 (x100 broke nothing in game), so
-            // extended ranges stop at the strongest value that still counts.
+            // large percentages stop at the strongest value that still counts.
             if (field.id == posture_dealt || field.id == posture_taken)
                 scaled = std::min(scaled, kMaxPoiseDamage);
             write_field(state.table.rows[r] + field.offset, field.type,
@@ -4893,7 +5164,7 @@ void apply(Id id) noexcept {
         g_options[id].value = 0;
         break;
     case skip_intro: set_site(g_intro, on(id)); break;
-    case dialog_yes_default: set_site(g_dialog_yes, on(id)); break;
+    case dialog_yes_default: g_dialog_yes_data->on = on(id) ? 1 : 0; break;
     case enemies_downed_vulnerable:
         if (on(id)) install_downed_hook(g_statics.world_chr_man);
         if (g_downed) g_downed->enabled = on(id) ? 1u : 0u;
@@ -4908,6 +5179,9 @@ void apply(Id id) noexcept {
     case set_time: case time_hour: case freeze_time: break;  // time_worker
     case set_weather: case weather_type: break;  // weather_worker
     case torrent_speed: case torrent_jump_speed: break;  // jump_worker
+    case dodge_frames: case parry_frames: case knockdown_invincible: case item_super_armor:
+        if (g_windows) wake_workers();
+        break;  // window_worker
     case jump_height: case jump_distance: case torrent_jump_height: case torrent_jump_distance:
         if (value_of(id) != 100) install_jump_hook();
         break;  // jump_worker
@@ -4972,7 +5246,7 @@ bool available(Id id) noexcept {
     case skip_intro: return g_intro.ready;
     case open_mirror: case open_rebirth:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
-    case dialog_yes_default: return g_dialog_yes.ready;
+    case dialog_yes_default: return g_dialog_yes_data != nullptr;
     case enemies_downed_vulnerable:
         return (g_downed != nullptr || g_downed_site != nullptr) && g_statics.layout_2_7_1 &&
             g_statics.world_chr_man;
@@ -5020,6 +5294,8 @@ bool available(Id id) noexcept {
     case set_weather: case weather_type:
         return g_statics.layout_2_7_1;
     case torrent_speed: case torrent_jump_speed: return g_statics.layout_2_7_1 && g_statics.world_chr_man;
+    case dodge_frames: case parry_frames: case knockdown_invincible: case item_super_armor:
+        return g_windows != nullptr && g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case jump_height: case jump_distance: case torrent_jump_height: case torrent_jump_distance:
         return (g_jump != nullptr || g_jump_site != nullptr) && g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case all_graces: case reveal_map: return g_map_flags != nullptr;
@@ -5042,14 +5318,6 @@ bool optional_feature(const wchar_t* key, const wchar_t* marker_name) noexcept {
 }
 
 void load_settings() noexcept {
-    g_extended = optional_feature(L"ExtendedRanges", L"NativeTweaks.ExtendedRanges.ini");
-    if (!g_extended) {
-        for (const Scale& scale : g_scales) {
-            g_options[scale.id].minimum = scale.classic_minimum;
-            g_options[scale.id].maximum = scale.classic_maximum;
-            g_options[scale.id].step = scale.classic_step;
-        }
-    }
     for (auto& option : g_options) {
         const int stored = g_config_path.empty() ? option.fallback :
             static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key, option.fallback,
@@ -5067,30 +5335,22 @@ void load_settings() noexcept {
         }
         WritePrivateProfileStringW(L"Vanilla", L"SkillsWithoutFp", nullptr, g_config_path.c_str());
     }
-    for (auto& scale : g_scales) {
-        if (!g_extended) break;
-        const UINT stored = g_config_path.empty() ? 0 :
-            GetPrivateProfileIntW(L"Vanilla", scale.key, 0, g_config_path.c_str());
-        scale.index = static_cast<std::uint8_t>(stored < kScaleCount ? stored : 0);
-    }
 }
 
 DWORD WINAPI save_worker(void*) noexcept {
     // Each WritePrivateProfileStringW rewrites the whole INI, so only the
     // options that changed since the last save are written.
-    const std::size_t total = g_extended ? count + std::size(g_scales) : count;
-    int written[count + std::size(g_scales)]{};
-    bool known[count + std::size(g_scales)]{};
+    int written[count]{};
+    bool known[count]{};
     perf::Loop loop(L"save");
     for (;;) {
         loop.pause();
         WaitForSingleObject(g_save_event, INFINITE);
         Sleep(400);  // Coalesce slider drags into one write.
         loop.resume();
-        for (std::size_t i = 0; i < total; ++i) {
-            const bool is_scale = i >= count;
-            const wchar_t* const key = is_scale ? g_scales[i - count].key : g_options[i].key;
-            const int current = is_scale ? g_scales[i - count].index : static_cast<int>(g_options[i].value);
+        for (std::size_t i = 0; i < count; ++i) {
+            const wchar_t* const key = g_options[i].key;
+            const int current = g_options[i].value;
             if (known[i] && written[i] == current) continue;
             wchar_t value[12]{};
             swprintf_s(value, L"%d", current);
@@ -5173,64 +5433,9 @@ void set_row_default(Id id, erui::RowHandle row, std::int64_t value) noexcept {
         (void)g_set_default(g_registration->provider_handle(), row, value);
 }
 
-// The slider position that gives the game default under the current scale,
-// so the label colour follows the effective value.
-void sync_scaled_default(const Scale& scale) noexcept {
-    const auto& option = g_options[scale.id];
-    if (!g_set_default || !g_registration || option.row == ERUI_INVALID_ROW) return;
-    const int factor = kScaleFactors[scale.index];
-    const int value = clamp_value(option, (option.fallback + factor / 2) / factor);
-    set_row_default(scale.id, option.row, value);
-}
-
-// Fork export (r108; numeric sliders accepted since r119): relabels every
-// position so a scaled slider shows the value it applies (250% at x10 reads
-// 2500%). An older fork rejects numeric rows and keeps the base value.
-using SetSliderTextsFn = ERUI_Result (ERUI_CALL*)(ERUI_ProviderHandle, ERUI_RowHandle,
-    const ERUI_Utf16View*, std::uint32_t);
-SetSliderTextsFn g_set_slider_texts{};
-
-void sync_scaled_texts(const Scale& scale) noexcept {
-    const auto& option = g_options[scale.id];
-    if (!g_set_slider_texts || !g_registration || option.row == ERUI_INVALID_ROW) return;
-    try {
-        const int factor = kScaleFactors[scale.index];
-        std::vector<std::wstring> texts;
-        for (int value = option.minimum; value <= option.maximum; value += option.step)
-            texts.push_back(std::to_wstring(value * factor) + option.suffix);
-        std::vector<ERUI_Utf16View> views(texts.size());
-        for (std::size_t k = 0; k < texts.size(); ++k) {
-            views[k].data = reinterpret_cast<const std::uint16_t*>(texts[k].c_str());
-            views[k].length = static_cast<std::uint32_t>(texts[k].size());
-        }
-        (void)g_set_slider_texts(g_registration->provider_handle(), option.row, views.data(),
-            static_cast<std::uint32_t>(views.size()));
-    } catch (...) {
-    }
-}
-
-void ERUI_CALL scale_changed(void* target, const ERUI_CustomSliderChangeContext* context) noexcept {
-    auto* scale = static_cast<Scale*>(target);
-    if (!scale || !context || context->index >= kScaleCount) return;
-    scale->index = static_cast<std::uint8_t>(context->index);
-    sync_scaled_default(*scale);
-    sync_scaled_texts(*scale);
-    apply(scale->id);
-    request_save();
-}
-
 void restore_option(Id i) noexcept {
     auto& option = g_options[i];
     option.value = option.fallback;
-    Scale* const scale = scale_of(i);
-    if (scale) {
-        const bool was_scaled = scale->index != 0;
-        scale->index = 0;
-        sync_scaled_default(*scale);
-        if (was_scaled) sync_scaled_texts(*scale);
-        if (g_registration && scale->row != ERUI_INVALID_ROW)
-            (void)g_registration->set_custom_slider_index(scale->row, 0);
-    }
     apply(i);
     if (!g_registration || option.row == ERUI_INVALID_ROW) return;
     if (option.kind == Kind::toggle)
@@ -6055,6 +6260,256 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
     }
 }
 
+// Puts a visible mouse pointer on Yes once a Yes/No box opens. The boxes are
+// 1920x1080 movies centred in the window: 01_010_MessageBox (centre) and
+// 01_011_MessageBox_Small (bottom). Yes is Item_0_0, 220 px left of the
+// centre, about 400 x 34 px; its height moves with the number of text lines in
+// 01_010 (frames 0-10), and the point used is on it for one to three lines.
+// With a controller the pointer is hidden and left alone.
+void put_pointer_on_yes(std::uint64_t movie) noexcept {
+    const auto skip = [](const wchar_t* why, const wchar_t* box) {
+        if (!g_diagnostics) return;
+        wchar_t message[200]{};
+        swprintf_s(message, L"Yes/No box (%ls): mouse pointer not moved: %ls.", box, why);
+        log(message);
+    };
+    wchar_t name[24]{};
+    if (!movie || !game::safe_read(static_cast<std::uintptr_t>(movie), name, sizeof(name) - sizeof(wchar_t))) {
+        wchar_t address[40]{};
+        swprintf_s(address, L"movie %llX", static_cast<unsigned long long>(movie));
+        skip(L"movie name not readable", address);
+        return;
+    }
+    for (wchar_t& c : name)
+        if (c && (c < 0x20 || c > 0x7E)) c = L'?';
+    double stage_y{};
+    if (std::wcsncmp(name, L"01_010_", 7) == 0) stage_y = 585.0;
+    else if (std::wcsncmp(name, L"01_011_", 7) == 0) stage_y = 872.0;
+    else return skip(L"unknown box layout", name);
+    HWND window = GetForegroundWindow();
+    DWORD pid{};
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != GetCurrentProcessId()) return skip(L"game window not in front", name);
+    CURSORINFO cursor{sizeof(cursor)};
+    if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING))
+        return skip(L"Windows pointer hidden (controller, or the game draws its own)", name);
+    RECT client{};
+    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
+        return skip(L"no window size", name);
+    const double scale = (std::min)(client.right / 1920.0, client.bottom / 1080.0);
+    POINT point{static_cast<LONG>(client.right / 2.0 + (740.0 - 960.0) * scale),
+        static_cast<LONG>(client.bottom / 2.0 + (stage_y - 540.0) * scale)};
+    if (!ClientToScreen(window, &point) || !SetCursorPos(point.x, point.y))
+        return skip(L"SetCursorPos failed", name);
+    if (g_diagnostics) {
+        wchar_t message[200]{};
+        swprintf_s(message, L"Yes/No box (%ls): mouse pointer moved onto Yes at %ld,%ld (window %ldx%ld).",
+            name, point.x, point.y, client.right, client.bottom);
+        log(message);
+    }
+}
+
+DWORD WINAPI dialog_pointer_worker(void*) noexcept {
+    std::uint32_t seen = g_dialog_yes_data->built;
+    std::uint32_t seen_reads = g_dialog_yes_data->reads;
+    perf::Loop loop(L"dialog_pointer");
+    for (;;) {
+        if (!value_of(dialog_yes_default)) {
+            seen = g_dialog_yes_data->built;
+            seen_reads = g_dialog_yes_data->reads;
+            idle_wait(loop);
+            continue;
+        }
+        loop.sleep(50);
+        const std::uint32_t reads = g_dialog_yes_data->reads;
+        if (reads != seen_reads) {
+            seen_reads = reads;
+            if (g_diagnostics) {
+                wchar_t name[24]{};
+                game::safe_read(static_cast<std::uintptr_t>(g_dialog_yes_data->movie), name,
+                    sizeof(name) - sizeof(wchar_t));
+                for (wchar_t& c : name)
+                    if (c && (c < 0x20 || c > 0x7E)) c = L'?';
+                wchar_t message[200]{};
+                swprintf_s(message, L"Message box created (%ls): %u buttons, first button %d.", name,
+                    g_dialog_yes_data->buttons, static_cast<int>(g_dialog_yes_data->value));
+                log(message);
+            }
+        }
+        const std::uint32_t built = g_dialog_yes_data->built;
+        if (built == seen) continue;
+        seen = built;
+        if (g_diagnostics) log(L"Yes/No box opened: first button set to Yes.");
+        loop.sleep(150);  // the box opens on the next frames
+        try {
+            put_pointer_on_yes(g_dialog_yes_data->movie);
+        } catch (...) {
+        }
+    }
+}
+
+// Holds the dodge and parry frames on past their end (see
+// install_window_hooks). The game's window is measured in the animation's own
+// time, from its first to its last flagged frame (the start estimated back
+// from the first one seen: the flag hooks do not run on every frame, r138
+// test). The extra time, that length times (percent - 100) %, then runs in
+// real time and is kept even if the next animation starts (a roll ends about
+// 0.1 s after its own frames, r138 test), until the character changes (death,
+// loading). Polled every 4 ms while either option is above 100 %.
+constexpr float kMaxWindowSeconds = 1.0f;
+
+struct WindowTrack {
+    const wchar_t* name;
+    const wchar_t* kind;
+    Id option;
+    volatile std::uint32_t* seen;
+    volatile std::uint32_t* extend;
+    volatile std::uint32_t* injected;
+    std::uint32_t last_seen{};
+    bool natural{}, extending{};
+    std::int32_t window_anim{};
+    std::uint32_t window_start{}, observed_seen{};  // flagged frames before the window, at the first look
+    float observed_time{}, last_natural_time{};
+    std::uint32_t clears_at{}, injected_at{};
+    std::uintptr_t window_module{};
+    ULONGLONG last_natural_tick{}, extend_until{};
+
+    void finish() noexcept {
+        if (extending && g_diagnostics) {
+            wchar_t message[160]{};
+            swprintf_s(message, L"%ls frames: animation %d done; %u frames, %u of them held on.", name, window_anim,
+                g_windows->clears - clears_at, *injected - injected_at);
+            log(message);
+        }
+        *extend = 0;
+        natural = extending = false;
+    }
+
+    void step(std::uintptr_t module, ULONGLONG now) noexcept {
+        const int percent = value_of(option);
+        if (percent <= 100) {
+            finish();
+            last_seen = *seen;
+            return;
+        }
+        if ((natural || extending) && module != window_module) {  // died or reloaded
+            finish();
+            return;
+        }
+        const std::uint32_t current = *seen;
+        if (current != last_seen) {
+            const std::uintptr_t anim = game::player_anim_id(g_statics);
+            std::int32_t id{};
+            float time{};
+            if (!anim || !game::read(anim, id) || !game::read(anim + 4, time)) {
+                last_seen = current;
+                return;
+            }
+            if (!natural || id != window_anim || time < last_natural_time) {  // a new window
+                finish();
+                natural = true;
+                window_anim = id;
+                window_module = module;
+                window_start = last_seen;
+                observed_seen = current;
+                observed_time = time;
+                clears_at = g_windows->clears;
+                injected_at = *injected;
+            }
+            last_seen = current;
+            last_natural_time = time;
+            last_natural_tick = now;
+            *extend = 1;  // already on: no gap when the game's window ends
+            return;
+        }
+        if (natural && now - last_natural_tick >= 50) {  // the game's window is over
+            natural = false;
+            extending = true;
+            const std::uint32_t before = observed_seen - window_start;  // flagged frames before the first look
+            const std::uint32_t timed = last_seen - observed_seen;
+            const float per_frame = timed && last_natural_time > observed_time
+                ? (last_natural_time - observed_time) / timed : 1.0f / 60.0f;
+            const float start = (std::max)(0.0f, observed_time - before * per_frame);
+            const float length = last_natural_time - start + per_frame;
+            // Dodges and parries are short (a roll 0.45 s, a parry 0.25 s); longer
+            // windows of the same flags belong to other actions (r138 test: 2 s in
+            // c0000 063000, which became 8 s more at 500 %) and are left alone.
+            if (length > kMaxWindowSeconds) {
+                if (g_diagnostics) {
+                    wchar_t message[160]{};
+                    swprintf_s(message, L"%ls frames: animation %d, game window %.3f s: not a %ls, left as it is.",
+                        name, window_anim, length, kind);
+                    log(message);
+                }
+                *extend = 0;
+                extending = false;
+                return;
+            }
+            const auto extra_ms =
+                static_cast<ULONGLONG>(length * 1000.0f * static_cast<float>(percent - 100) / 100.0f);
+            extend_until = last_natural_tick + extra_ms;
+            if (g_diagnostics) {
+                wchar_t message[200]{};
+                swprintf_s(message,
+                    L"%ls frames: animation %d, game window %.3f-%.3f s (%.3f s), held %llu ms more (%d%%).", name,
+                    window_anim, start, last_natural_time, length, extra_ms, percent);
+                log(message);
+            }
+        }
+        if (extending && now >= extend_until) finish();
+    }
+};
+
+// Bits held for the whole animation: knockdowns (c0000 017000-017999, getting
+// up included: their own flag 95 has no bit in the action flag module) get the
+// dodge bit, item use (050000-050999: flasks, consumables) super armour.
+std::uint64_t held_bits_for(std::int32_t anim) noexcept {
+    const std::int32_t local = anim % 1000000;
+    std::uint64_t bits = 0;
+    if (value_of(knockdown_invincible) && local >= 17000 && local < 18000) bits |= 0x2;
+    if (value_of(item_super_armor) && local >= 50000 && local < 51000) bits |= 0x100;
+    return bits;
+}
+
+DWORD WINAPI window_worker(void*) noexcept {
+    perf::Loop loop(L"dodge_parry");
+    WindowTrack tracks[]{
+        {L"Dodge", L"dodge", dodge_frames, &g_windows->seen, &g_windows->extend, &g_windows->injected},
+        {L"Parry", L"parry", parry_frames, &g_windows->parry_seen, &g_windows->parry_extend, &g_windows->parry_injected},
+    };
+    for (WindowTrack& track : tracks) track.last_seen = *track.seen;
+    for (;;) {
+        if (value_of(dodge_frames) <= 100 && value_of(parry_frames) <= 100 && !value_of(knockdown_invincible) &&
+            !value_of(item_super_armor)) {
+            for (WindowTrack& track : tracks) track.step(0, 0);  // ends any extension, follows the counters
+            g_windows->held_bits = 0;
+            g_windows->player_module = 0;
+            idle_wait(loop);
+            continue;
+        }
+        loop.sleep(4);
+        try {
+            std::uintptr_t module{};
+            if (!game::read(game::chain(g_statics.world_chr_man, {game::kPlayerIns, game::kModules, 0x8}), module) ||
+                !module) {
+                for (WindowTrack& track : tracks) track.finish();
+                g_windows->held_bits = 0;
+                g_windows->player_module = 0;
+                continue;
+            }
+            g_windows->player_module = module;
+            const ULONGLONG now = GetTickCount64();
+            for (WindowTrack& track : tracks) track.step(module, now);
+            const std::uintptr_t anim = game::player_anim_id(g_statics);
+            std::int32_t id{};
+            g_windows->held_bits = anim && game::read(anim, id) ? held_bits_for(id) : 0;
+        } catch (...) {
+            for (WindowTrack& track : tracks) track.finish();
+            g_windows->held_bits = 0;
+        }
+    }
+}
+
 void start_thread(LPTHREAD_START_ROUTINE routine, const wchar_t* name) noexcept {
     if (HANDLE thread = CreateThread(nullptr, 0, routine, nullptr, 0, nullptr)) {
         perf::thread_started(name, thread);
@@ -6090,7 +6545,7 @@ const Texts kEnglish{
         {L"Survival", L"Invincibility, no death, fall damage, maximum HP, FP and stamina, regeneration and flasks."},
         {L"Equipment", L"Equipment and weapon weight, stat requirements, spell slots, carry limits and helmet."},
         {L"Resources & Costs", L"Infinite stamina, FP, items and ammunition, and what actions cost."},
-        {L"Movement & Speed", L"Your animation speed, overall and per action, and how high and far you jump."},
+        {L"Movement & Speed", L"Your animation speed, overall and per action, dodge invincibility, the parry window, and how high and far you jump."},
         {L"Torrent", L"Torrent's survival, running and jumping."},
         {L"Damage Dealt", L"Your damage, per element, stat scaling, knockback and one-hit kills."},
         {L"Damage Taken", L"Enemy damage to you, per element, knockback, guarding and one-hit deaths."},
@@ -6238,7 +6693,7 @@ const Texts kEnglish{
         {L"HUD scale (%)", L"Resizes the gauges, equipment, compass, boss bars, runes and other corner elements, each one from its own corner. Restart the game to apply: it loads the HUD once at startup."},
         {L"Menus to screen edges", L"On screens wider than 16:9, moves the pause menu and the other menus (equipment, inventory, status, shops, level up, spells, storage, options, loading and title screens) to the screen edges and widens their backgrounds. Restart the game to apply: it loads the menus once at startup. Turn it off if another mod replaces these menus."},
         {L"Enemies stay dead", L"Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turn it off and the next rest brings everyone back; turning it on again brings the list back too. Delete the save's file to start over."},
-        {L"Yes/No questions start on Yes", L"Yes/No questions open with the cursor on Yes instead of No: travel, quit, use an item and the like. It applies to every Yes/No question, risky ones too, so check before confirming. OK/Cancel windows do not change."},
+        {L"Yes/No questions start on Yes (beta)", L"BETA: Yes/No questions open with the cursor on Yes instead of No: travel, quit, use an item and the like; with the mouse, the pointer is moved onto Yes too. It applies to every Yes/No question, risky ones too, so check before confirming. Other windows, such as item quantities, do not change."},
         {L"Hit downed enemies", L"Like Nightreign, enemies knocked to the ground by a critical hit or a riposte take damage while they lie there and get up. They get super armour instead, so your hits do not stagger them again, but they still take posture damage. Spirit ashes can also hit them during the critical hit. You keep your own protection when an enemy grabs you."},
         {L"Torrent jump speed (%)", L"Scales Torrent's animation speed during jumps and double jumps, spiritspring jumps included. At 100% the double jump is as easy to get as in the base game, even with a faster run speed. Applies instantly."},
         {L"Jump height (%)", L"Scales how high you jump on foot. 100% is the game's height (about 1.1 m). The animation plays at its normal speed and a higher jump stays longer in the air, as with gravity (400% doubles the time), and falls without slowing down to the ground, so landings and fall damage work as usual. A jumping attack high up falls from there."},
@@ -6261,6 +6716,10 @@ const Texts kEnglish{
         {L"Keep characters clean (beta)", L"BETA: for now it also applies to enemies; the aim is your character only. Blood, mud and scorch marks no longer stick to characters' bodies, yours and enemies'. Splatters still appear on the ground and walls. Applies to new hits; marks already on you wear off as usual."},
         {L"Hide buff effects", L"Your own buffs (incantations, sorceries, boluses, talismans and similar) no longer show particles or a glow on your body. They work exactly the same, keep their sound, and invisibility still works. Weapon buffs keep their look (see the option below). Applies to the next buff you use."},
         {L"Hide weapon buff effects", L"Greases and weapon enchantments no longer show their glow or particles on your weapon. They work exactly the same and keep their sound. Applies to the next grease or enchantment you use."},
+        {L"Dodge invincibility (%) (beta)", L"BETA: makes the invincibility of rolls, backsteps and dodge skills last longer. 100% is the game's (14 frames for a light or medium roll, 13 for a heavy one); 200% doubles it. The extra time follows the dodge's own invincibility and lasts even if you act right after. Your character only."},
+        {L"Parry window (%) (beta)", L"BETA: makes the parry window of shields and parry skills last longer. 100% is the game's; 200% doubles it. The extra time follows the parry's own window. Your character only."},
+        {L"Invincible while knocked down (beta)", L"BETA: hits do not hurt you while a big hit has you on the ground, getting up included, as during a roll. Big knockdowns only, not grabs. Your character only."},
+        {L"Super armour while using items (beta)", L"BETA: the game's super armour while you drink a flask or use an item: weaker hits no longer interrupt you, very strong ones still can, and you still take the damage. Your character only."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -6273,7 +6732,7 @@ const Texts kSpanish{
         {L"Supervivencia", L"Invencibilidad, no morir, daño por caída, vida, PC y aguante máximos, regeneración y frascos."},
         {L"Equipo", L"Peso del equipo y de las armas, requisitos de atributos, ranuras de hechizos, límite de objetos y casco."},
         {L"Recursos y costes", L"Aguante, PC, objetos y munición infinitos, y lo que cuestan las acciones."},
-        {L"Movimiento y velocidad", L"Tu velocidad de animación, general y por acción, y la altura y distancia de tus saltos."},
+        {L"Movimiento y velocidad", L"Tu velocidad de animación, general y por acción, la invencibilidad al esquivar, la ventana de parada y la altura y distancia de tus saltos."},
         {L"Torrent", L"Supervivencia, carrera y saltos de Torrent."},
         {L"Daño infligido", L"Tu daño, por elemento, escalado de atributos, retroceso y matar de un golpe."},
         {L"Daño recibido", L"El daño enemigo que recibes, por elemento, retroceso, bloqueo y morir de un golpe."},
@@ -6421,7 +6880,7 @@ const Texts kSpanish{
         {L"Escala del HUD (%)", L"Cambia el tamaño de las barras, el equipo, la brújula, las barras de jefe, las runas y los demás elementos de las esquinas, cada uno desde su esquina. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar."},
         {L"Menús hasta los bordes", L"En pantallas más anchas que 16:9, lleva el menú de pausa y los demás menús (equipo, inventario, estado, tiendas, subir de nivel, hechizos, cofre, opciones, pantallas de carga y de título) hasta los bordes y ensancha sus fondos. Reinicia el juego para aplicarlo: carga los menús una sola vez al arrancar. Desactívalo si otro mod sustituye estos menús."},
         {L"Los enemigos no reaparecen", L"Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos; al reactivarla vuelve a aplicarse la lista. Borra el archivo de la partida para empezar de cero."},
-        {L"Preguntas Sí/No empiezan en Sí", L"Las preguntas Sí/No se abren con el cursor en Sí en vez de en No: viajar, salir, usar un objeto, etc. Afecta a todas las preguntas Sí/No, también a las arriesgadas, así que comprueba antes de confirmar. Las ventanas Aceptar/Cancelar no cambian."},
+        {L"Preguntas Sí/No empiezan en Sí (beta)", L"BETA: las preguntas Sí/No se abren con el cursor en Sí en vez de en No: viajar, salir, usar un objeto, etc.; con el ratón, el puntero también se coloca sobre Sí. Afecta a todas las preguntas Sí/No, también a las arriesgadas, así que comprueba antes de confirmar. Las demás ventanas, como las de cantidad de objetos, no cambian."},
         {L"Golpear enemigos derribados", L"Como en Nightreign, los enemigos que caen al suelo por un golpe crítico o un contraataque reciben daño mientras están tendidos y al levantarse. A cambio tienen superarmadura, así que tus golpes no los vuelven a aturdir, pero sí dañan su postura. Las cenizas espirituales también pueden golpearlos durante el crítico. Tú sigues protegido cuando un enemigo te agarra."},
         {L"Velocidad de salto de Torrent (%)", L"Escala la velocidad de animación de Torrent en los saltos y dobles saltos, también en los de los manantiales espirituales. Al 100 % el doble salto sale tan fácil como en el juego base, aunque la carrera vaya más rápida. Se aplica al momento."},
         {L"Altura del salto (%)", L"Escala la altura de tus saltos a pie. El 100 % es la del juego (aprox. 1,1 m). La animación va a su velocidad normal y un salto más alto dura más en el aire, como con gravedad (400 % duplica el tiempo), y cae sin frenar hasta el suelo, así que el aterrizaje y el daño por caída funcionan como siempre. Un ataque en salto en lo alto cae desde ahí."},
@@ -6444,6 +6903,10 @@ const Texts kSpanish{
         {L"Personajes limpios (beta)", L"BETA: por ahora también se aplica a los enemigos; el objetivo es que sea solo tu personaje. La sangre, el barro y las quemaduras ya no se pegan al cuerpo de los personajes, ni al tuyo ni al de los enemigos. Las salpicaduras siguen saliendo en el suelo y las paredes. Se aplica a los golpes nuevos; las manchas que ya tienes se van como siempre."},
         {L"Ocultar efectos de mejoras", L"Tus mejoras (encantamientos, hechizos, bolos, talismanes y similares) ya no muestran partículas ni brillo en tu cuerpo. Funcionan exactamente igual, mantienen su sonido y la invisibilidad sigue funcionando. Las mejoras del arma mantienen su aspecto (ver la opción de abajo). Se aplica a la siguiente mejora que uses."},
         {L"Ocultar efectos de mejoras de arma", L"Las grasas y los encantamientos de arma ya no muestran su brillo ni partículas en el arma. Funcionan exactamente igual y mantienen su sonido. Se aplica a la siguiente grasa o encantamiento que uses."},
+        {L"Invencibilidad al esquivar (%) (beta)", L"BETA: alarga la invencibilidad de las volteretas, los pasos atrás y las habilidades de esquiva. El 100 % es la del juego (14 fotogramas en una voltereta ligera o media, 13 en una pesada); el 200 % la duplica. El tiempo extra sigue a la invencibilidad de la propia esquiva y dura aunque hagas otra acción justo después. Solo para tu personaje."},
+        {L"Ventana de parada (%) (beta)", L"BETA: alarga la ventana de parada de los escudos y las habilidades de parada. El 100 % es la del juego; el 200 % la duplica. El tiempo extra sigue a la ventana de la propia parada. Solo para tu personaje."},
+        {L"Invencible mientras estás derribado (beta)", L"BETA: los golpes no te hacen daño mientras un golpe fuerte te tiene en el suelo, incluido el levantarte, como durante una voltereta. Solo los derribos fuertes, no los agarres. Solo para tu personaje."},
+        {L"Superarmadura al usar objetos (beta)", L"BETA: la superarmadura del juego mientras bebes un frasco o usas un objeto: los golpes más débiles ya no te interrumpen, los muy fuertes sí pueden, y el daño lo recibes igual. Solo para tu personaje."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -6456,7 +6919,7 @@ const Texts kChinese{
         {L"生存", L"无敌、不会死亡、坠落伤害、最大血量、FP 与精力、回复和圣杯瓶。"},
         {L"装备", L"装备与武器重量、能力值需求、法术栏位、携带上限和头盔。"},
         {L"资源与消耗", L"无限精力、FP、道具与弹药，以及各种行动的消耗。"},
-        {L"移动与速度", L"你的动作速度（整体和各类动作），以及跳跃高度与距离。"},
+        {L"移动与速度", L"你的动作速度（整体和各类动作）、闪避无敌时间、弹反判定时间，以及跳跃高度与距离。"},
         {L"灵马", L"灵马的生存、奔跑与跳跃。"},
         {L"造成伤害", L"你的伤害、各属性伤害、能力补正、击退和一击必杀。"},
         {L"受到伤害", L"你受到的敌人伤害、各属性伤害、击退、格挡和一击即死。"},
@@ -6604,7 +7067,7 @@ const Texts kChinese{
         {L"HUD 缩放 (%)", L"调整血条、装备、指南针、头目血条、卢恩和其他角落元素的大小，每个元素以其所在角落为基准缩放。需重启游戏才能生效：游戏只在启动时加载一次 HUD。"},
         {L"菜单延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将暂停菜单和其他菜单（装备、物品栏、状态、商店、升级、法术、仓库、选项、读取画面和标题画面）移到屏幕边缘，并加宽其背景。需重启游戏才能生效：游戏只在启动时加载一次菜单。如果其他模组替换了这些菜单，请关闭此项。"},
         {L"敌人不再复活", L"被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活；重新开启后名单会再次生效。删除该存档的文件即可重新开始。"},
-        {L"是/否询问默认选“是”", L"是/否询问打开时光标位于“是”而不是“否”：传送、退出、使用物品等。对所有是/否询问生效，包括有风险的操作，确认前请看清楚。“确定/取消”窗口不变。"},
+        {L"是/否询问默认选“是”（测试版）", L"测试版：是/否询问打开时光标位于“是”而不是“否”：传送、退出、使用物品等；使用鼠标时，指针也会移到“是”上。对所有是/否询问生效，包括有风险的操作，确认前请看清楚。其他窗口（如物品数量）不变。"},
         {L"可攻击倒地敌人", L"与《艾尔登法环 黑夜君临》相同，被致命一击或弹反后处决击倒在地的敌人，在倒地和起身期间会受到伤害。作为代价，敌人获得霸体，你的攻击不会再次使其硬直，但仍会削减其架势。致命一击期间，骨灰也能攻击它们。敌人抓住你时，你仍受保护。"},
         {L"灵马跳跃速度 (%)", L"缩放灵马跳跃和二段跳时的动作速度，包括借助上升气流的大跳跃。保持 100% 时，即使奔跑速度更快，二段跳也和原版一样容易。立即生效。"},
         {L"跳跃高度 (%)", L"缩放你步行时的跳跃高度。100% 为游戏原本的高度（约 1.1 米）。动作以正常速度播放，跳得越高滞空越久，与重力一致（400% 时间加倍），下落时不减速直到地面，因此落地和坠落伤害照常。在高处发动跳跃攻击会从该处落下。"},
@@ -6627,6 +7090,10 @@ const Texts kChinese{
         {L"保持角色干净（测试版）", L"测试版：目前也会作用于敌人，目标是只作用于你的角色。血迹、泥污和焦痕不再附着在角色身上，包括你和敌人。地面和墙壁上仍会出现飞溅痕迹。对新的攻击生效；已有的痕迹会照常消失。"},
         {L"隐藏增益效果", L"你自身的增益（祷告、魔法、丸药、护符等）不再在身上显示粒子或光芒。效果完全相同，保留音效，隐身仍然有效。武器增益保持原样（见下方选项）。对你使用的下一个增益生效。"},
         {L"隐藏武器增益效果", L"油脂和武器附魔不再在武器上显示光芒或粒子。效果完全相同，保留音效。对你使用的下一个油脂或附魔生效。"},
+        {L"闪避无敌时间 (%)（测试版）", L"测试版：延长翻滚、后撤步和闪避类战技的无敌时间。100% 为游戏原本的时间（轻、中翻滚 14 帧，重翻滚 13 帧）；200% 为两倍。额外时间紧接闪避本身的无敌时间，即使随后进行其他动作也会持续。仅对你的角色生效。"},
+        {L"弹反判定时间 (%)（测试版）", L"测试版：延长盾牌和弹反类战技的弹反判定时间。100% 为游戏原本的时间；200% 为两倍。额外时间紧接弹反本身的判定时间。仅对你的角色生效。"},
+        {L"倒地时无敌（测试版）", L"测试版：被重击击倒在地时（包括起身）不会受到伤害，与翻滚时相同。仅限重击倒地，不含抓取。仅对你的角色生效。"},
+        {L"使用道具时霸体（测试版）", L"测试版：喝圣杯瓶或使用道具时获得游戏的霸体：较弱的攻击不再打断你，极强的攻击仍可能打断，伤害照常承受。仅对你的角色生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -6642,7 +7109,7 @@ const Layout kLayout[]{
         carry_max, hide_helmet}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
-    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_jump, speed_item,
+    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, dodge_frames, parry_frames, knockdown_invincible, item_super_armor, speed_move, speed_jump, speed_item,
         jump_height, jump_distance}},
     {cat_torrent, {torrent_no_death, torrent_speed, torrent_jump_speed, torrent_jump_height,
         torrent_jump_distance}},
@@ -6695,13 +7162,6 @@ Id find_option(std::wstring_view key) noexcept {
     return count;
 }
 
-Scale* find_scale(std::wstring_view key) noexcept {
-    if (!g_extended) return nullptr;
-    for (Scale& scale : g_scales)
-        if (same_key(scale.key, key)) return &scale;
-    return nullptr;
-}
-
 // Pushes an option's current value to its menu row (when the menu exists).
 void refresh_row(Id i) noexcept {
     const auto& option = g_options[i];
@@ -6714,16 +7174,7 @@ void refresh_row(Id i) noexcept {
         (void)g_registration->set_numeric_slider_value(option.row, option.value);
 }
 
-void set_scale_index(Scale& scale, std::uint8_t index) noexcept {
-    if (index >= kScaleCount || scale.index == index) return;
-    scale.index = index;
-    sync_scaled_default(scale);
-    sync_scaled_texts(scale);
-    if (g_registration && scale.row != ERUI_INVALID_ROW)
-        (void)g_registration->set_custom_slider_index(scale.row, index);
-}
-
-// Sets an option's raw slider/toggle value (not multiplied by its scale).
+// Sets an option's slider/toggle value.
 bool set_option_raw(Id i, int value) noexcept {
     if (i >= count || !available(i)) return false;
     auto& option = g_options[i];
@@ -6747,12 +7198,9 @@ bool hotkey_get(std::wstring_view key, int& value) noexcept {
     return true;
 }
 
-// Hotkey values are effective values: a scaled slider goes back to x1 first
-// so "> 200" always means 200 %.
 bool hotkey_set(std::wstring_view key, int value, int& applied) noexcept {
     const Id i = find_option(key);
     if (i >= count || !available(i)) return false;
-    if (Scale* const scale = scale_of(i)) set_scale_index(*scale, 0);
     if (!set_option_raw(i, value)) return false;
     request_save();
     applied = value_of(i);
@@ -6805,9 +7253,6 @@ bool write_profile(int slot) {
         L"; are not changed when the profile is loaded.\r\n[Profile]\r\nName=" + name + L"\r\n[Vanilla]\r\n";
     for (std::size_t i = 0; i < count; ++i)
         text += std::wstring(g_options[i].key) + L"=" + std::to_wstring(g_options[i].value) + L"\r\n";
-    if (g_extended)
-        for (const Scale& scale : g_scales)
-            text += std::wstring(scale.key) + L"=" + std::to_wstring(scale.index) + L"\r\n";
     const std::wstring path = profile_path(slot);
     const std::wstring temporary = path + L".tmp";
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -6840,24 +7285,18 @@ bool load_profile_slot(int slot) noexcept {
         std::vector<wchar_t> section(65536);
         const DWORD length = GetPrivateProfileSectionW(L"Vanilla", section.data(),
             static_cast<DWORD>(section.size()), path.c_str());
-        // Scales first, so the slider values that follow are read at x1..x100.
-        for (int pass = 0; pass < 2; ++pass) {
-            for (const wchar_t* line = section.data(); line < section.data() + length && *line;
-                 line += std::wcslen(line) + 1) {
-                const std::wstring_view entry(line);
-                const std::size_t equals = entry.find(L'=');
-                if (equals == entry.npos) continue;
-                const std::wstring key(entry.substr(0, equals));
-                const std::wstring value_text(entry.substr(equals + 1));
-                int value{};
-                if (!parse_profile_int(value_text.c_str(), value)) continue;
-                if (Scale* const scale = find_scale(key)) {
-                    if (pass == 0 && value >= 0 && value < static_cast<int>(kScaleCount))
-                        set_scale_index(*scale, static_cast<std::uint8_t>(value));
-                    continue;
-                }
-                if (pass == 1) (void)set_option_raw(find_option(key), value);
-            }
+        // Profiles saved with the old extended ranges also hold "...Scale" keys:
+        // they match no option and are skipped.
+        for (const wchar_t* line = section.data(); line < section.data() + length && *line;
+             line += std::wcslen(line) + 1) {
+            const std::wstring_view entry(line);
+            const std::size_t equals = entry.find(L'=');
+            if (equals == entry.npos) continue;
+            const std::wstring key(entry.substr(0, equals));
+            const std::wstring value_text(entry.substr(equals + 1));
+            int value{};
+            if (!parse_profile_int(value_text.c_str(), value)) continue;
+            (void)set_option_raw(find_option(key), value);
         }
         request_save();
         log((L"Vanilla settings: profile slot " + std::to_wstring(slot) + L" loaded.").c_str());
@@ -7002,6 +7441,7 @@ void add_profile_page(erui::Page& root, std::string_view lang, const wchar_t* pa
 int audit(LogFn log_fn) noexcept {
     g_log = log_fn;
     for (Site* site : kSites) resolve(*site);
+    resolve_dialog_yes_reads(false);
     resolve(g_intro);
     resolve_window();
     resolve_map_flags();
@@ -7070,6 +7510,8 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     g_perf_downed_hook = perf::timer(L"hook_downed");
     g_perf_downed_lock = perf::timer(L"hook_downed_lock_wait");
     for (Site* site : kSites) resolve(*site);
+    install_dialog_yes_hooks();
+    install_window_hooks();
     resolve(g_intro);
     resolve_window();
     resolve_map_flags();
@@ -7097,6 +7539,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         if (g_save_event) start_thread(&save_worker, L"save");
     }
     if (g_pause.ready) start_thread(&pause_worker, L"pause");
+    if (g_dialog_yes_data) start_thread(&dialog_pointer_worker, L"dialog_pointer");
     if (g_window_slot) start_thread(&window_option_worker, L"window_option");
     if (g_param_event && g_statics.layout_2_7_1 && g_statics.regulation_manager) start_thread(&param_worker, L"param");
     if (g_statics.layout_2_7_1 && g_statics.world_chr_man) {
@@ -7107,6 +7550,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         start_thread(&jump_worker, L"jump");
         start_thread(&dead_enemy_worker, L"dead_enemy");
         start_thread(&status_worker, L"status");
+        if (g_windows) start_thread(&window_worker, L"dodge_parry");
     }
     if (g_statics.layout_2_7_1) start_thread(&time_worker, L"time");
     if (g_statics.layout_2_7_1) start_thread(&weather_worker, L"weather");
@@ -7135,12 +7579,6 @@ void attach_registration(const erui::Registration* registration) noexcept {
     const HMODULE host = GetModuleHandleW(L"ERNativeUI.dll");
     const auto set_default = host
         ? reinterpret_cast<SetRowDefaultFn>(GetProcAddress(host, "ERNativeUIFork_SetRowDefault")) : nullptr;
-    // Scaled sliders show the applied value whether or not labels are coloured.
-    g_set_slider_texts = host
-        ? reinterpret_cast<SetSliderTextsFn>(GetProcAddress(host, "ERNativeUIFork_SetCustomSliderValues")) : nullptr;
-    if (registration)
-        for (const Scale& scale : g_scales)
-            if (scale.index != 0) sync_scaled_texts(scale);
     // Optional (off by default): [General] HighlightChangedOptions = 1, or the
     // optional package's marker file NativeTweaks.HighlightChanged.ini beside
     // NativeTweaks.ini (so installing it never replaces the user's INI).
@@ -7162,11 +7600,6 @@ void attach_registration(const erui::Registration* registration) noexcept {
     }
     g_set_default = set_default;
     g_set_default_ex = set_default_ex;
-    for (const Scale& scale : g_scales) {
-        if (scale.row == ERUI_INVALID_ROW) continue;
-        if (set_default(registration->provider_handle(), scale.row, 0) != ERUI_OK) ++failures;
-        sync_scaled_default(scale);
-    }
     if (failures) log(L"Vanilla settings: some default values were not accepted by ERNativeUI.");
 }
 
@@ -7234,28 +7667,6 @@ constexpr const wchar_t* kJourneyChinese[kJourneyCount]{
 constexpr const wchar_t* kWeatherChinese[kWeatherCount]{
     L"晴天", L"晴朗", L"少云", L"多云", L"雨", L"雨云", L"风雨", L"风雾", L"雪",
     L"大雪", L"雾", L"浓雾", L"大风多云", L"雨雾", L"雪雾", L"阵雨"};
-
-// Row under a scaled slider.
-Text builtin_scale_text(std::string_view lang) noexcept {
-    if (lang == "es")
-        return {L"    Escala", L"Multiplica el valor del control de arriba. Por ejemplo, 250% con ×10 aplica 2500%."};
-    if (lang == "zh") return {L"    倍率", L"将上方数值乘以此倍率。例如 250% ×10 即为 2500%。"};
-    if (lang == "zht") return {L"    倍率", L"將上方數值乘以此倍率。例如 250% ×10 即為 2500%。"};
-    return {L"    Scale", L"Multiplies the value above. For example, 250% at ×10 applies 2500%."};
-}
-
-Text scale_text(std::string_view lang) noexcept {
-    const Text english = builtin_scale_text("en");
-    const Text text = builtin_scale_text(lang);
-    return {translate_text(lang, english.label, text.label),
-        translate_text(lang, english.help, text.help)};
-}
-
-std::vector<std::wstring> scale_names() {
-    std::vector<std::wstring> names;
-    for (const int factor : kScaleFactors) names.push_back(L"×" + std::to_wstring(factor));
-    return names;
-}
 
 std::vector<std::wstring> value_names(std::string_view lang, Id i) {
     if (!is_named(i)) return {};
@@ -7401,22 +7812,6 @@ void add_pages(erui::Page& parent, const char* language) noexcept {
                 const char* const code = complete ? l : "en";                return live_text::Texts{texts_for(code).options[i].label, option_help(code, i), {}, {},
                     value_names(l, i)};
             });
-            if (Scale* const scale = scale_of(i)) {
-                const std::vector<std::wstring> names = scale_names();
-                const Text text = scale_text(lang);
-                erui::CustomSliderOptions slider{};
-                slider.value_count = static_cast<std::uint32_t>(names.size());
-                slider.initial_index = scale->index;
-                slider.enabled = ok;
-                slider.format_value = [&names](std::uint32_t index, std::uint32_t) {
-                    return names[index];
-                };
-                scale->row = page.add_custom_slider(text.label, text.help, slider, &scale_changed, scale);
-                live_text::track_row(scale->row, [](const char* l) {
-                    const Text x = scale_text(l);
-                    return live_text::Texts{x.label, x.help, {}, {}, scale_names()};
-                });
-            }
         }
         const auto page_restore = page.add_button(t.restore_page.label, t.restore_page.help,
             &restore_page_defaults, const_cast<Layout*>(&layout));
