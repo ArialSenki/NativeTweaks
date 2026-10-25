@@ -1,0 +1,7 @@
+# Diagnóstico de cierre de ERModSettingsHub — r5/r6
+
+El log r5 contiene ERNativeUI diagnóstico r13 y confirma que la instalación terminó. Después de textResolver[8] no hay entrada a gameOptions[n] ni a subHandler[n]. r5 ya omitía los observadores sin filas de Keyboard/Mouse y Graphics que r4 había instalado.
+
+El volcado que coincide con el proceso 17812 confirma la excepción 0xC00000FD en RVA 0x11F094D. La pila llega a 64 frames y repite el ciclo `0x7FF6AC73BE91 → 0x7FF6AC82EF3C → 0x7FF6AC8330C8 → 0x7FF6AC833030 → 0x7FF6AC73C567 → 0x7FF6AC736557 → 0x7FF6AC73BE91`, haciendo crecer la pila en cada vuelta. El depurador asigna nombres Scaleform cercanos; sin sus símbolos privados, el ciclo de direcciones es la evidencia más sólida. Esto sitúa la recursión en la ruta nativa de interfaz/renderizado y apunta con fuerza a la película de ajustes modificada o a su árbol de objetos en ejecución; no identifica el objeto GFX exacto. El cierre ocurre antes de que entre el handler instrumentado de Game Options.
+
+El log adjunto declara host r13, corresponde al conjunto de DLL de r5/r6 y es anterior a r6. El GFX r5 tiene 13 filas visuales para Game Options y Camera; r6 restaura las 8 y 7 filas originales. El evento y el volcado de las 10:08 ocurrieron antes de que se empaquetara r6 a las 10:19:50. No hay un evento de cierre posterior a esa hora en el registro local revisado. El resultado de r6 sigue pendiente; la siguiente comprobación útil es repetir la misma apertura offline con ese ZIP.

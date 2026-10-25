@@ -1,0 +1,4 @@
+build*/
+tests/out/
+tools/audit/out/
+*.log

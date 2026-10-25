@@ -1,0 +1,370 @@
+=====================================================================
+  NativeTweaks - 面向模组作者的 INI 模板指南
+  （真实示例：TarnishedHUD）
+=====================================================================
+
+本文件用两种方式讲解同一件事：
+
+  第一部分 - 完整指南   -> 包含所有细节，适合想了解全部原理的人。
+  第二部分 - 简易指南   -> 只讲最基本的内容，分步骤，可直接复制粘贴。
+
+任选其一即可，两者的结果相同。
+
+
+#####################################################################
+#                                                                   #
+#                       第一部分 - 完整指南                          #
+#                                                                   #
+#####################################################################
+
+1. 它是什么、有什么用
+---------------------------------------------------------------------
+NativeTweaks 会在游戏内菜单中显示每个已加载 DLL 模组的 INI
+（与 .dll 同目录的 .ini 文件）。
+
+没有模板时，NativeTweaks 只能猜测。它只显示明显是开关的键
+（true/false、on/off、yes/no，或位于 bEnabled 这类键下的 0/1）。
+其他键都不会出现在菜单中。
+
+有了模板，就由你来决定：
+  - 每个选项的名称（及其翻译），
+  - 它是开关、列表、滑块还是数值，
+  - 允许的数值范围，
+  - 它显示在哪个子菜单中，
+  - 哪些键需要隐藏。
+
+模板写在你自己的 INI 内部，位于以 [NativeTweaks] 开头的段落中。
+你的 DLL 无需修改：其他所有程序都会忽略这些段落。
+
+
+2. 结构
+---------------------------------------------------------------------
+共有两种段落：
+
+  [NativeTweaks]
+      模组页面的信息：Name（标题）和 Description（说明）。
+
+  [NativeTweaks.<段名>.<键名>]
+      描述你 INI 中 [<段名>] 段里的 <键名>。
+
+      示例：[NativeTweaks.BarSize.HPWidth] 描述 [BarSize] 段中的
+      HPWidth 键。
+
+      键名取“最后一个”点之后的文字，因此段名中可以包含点。
+
+
+3. 可用字段
+---------------------------------------------------------------------
+  Type          bool、int、float 或 enum。
+  Label         行名称（最多 64 个字符）。
+  Description   显示在菜单底部的说明文字。
+  Category      将各行归入以此命名的子菜单。
+  Min, Max      int/float 的范围。
+  Step          相邻数值的间隔（默认 1）。
+  Options       enum 的取值：值:文字|值:文字（最多 32 项）。
+  Hidden        1 = 不在菜单中显示该键。
+
+翻译：在任何文字字段后加上 .en、.es、.zh 或 .zht：
+  Label.zh、Description.zh、Category.zh、Options.zh、Name.zh
+.zh 为简体中文，.zht 为繁体中文（没有 .zht 时使用 .zh）。
+中文版 NativeTweaks 会优先使用这些翻译。
+中文文字请以 UTF-8 编码保存 INI。
+没有翻译时使用不带后缀的字段。
+
+
+4. 各类型的显示方式
+---------------------------------------------------------------------
+  bool   -> 开/关开关。保存时保留你原来的写法
+            （0/1、true/false、on/off、yes/no，包括大小写）。
+
+  enum   -> 显示你的 Options 列表。INI 中写入冒号前面的值。
+
+  Min >= 0 且 Max <= 255 的 int
+         -> 显示真实数值的原生滑块。
+
+  其他范围的 int/float
+         -> 列出每一步的数值，最多 32 项。
+            小数位数取决于 Step/Min/Max。
+
+  超过 32 步的范围
+         -> 显示约 30 个取整的数值 + 当前值。
+            如需特定数值，请自行设置 Step。
+
+
+5. 重要限制
+---------------------------------------------------------------------
+  - 不支持自由文本。菜单（ERNativeUI）目前还无法显示可编辑的
+    文本框，因此名称、路径或按键列表无法在游戏内编辑。
+    请为它们设置 Hidden=1，并在注释中说明需要手动编辑。
+
+  - 如果当前值“不符合”模板，该行就不会显示。例如：Step=0.05
+    而 INI 中为 0.33 -> 该行消失。解决方法：使用能覆盖所需数值
+    的 Step，或修正 INI 中的数值。
+
+  - 模板文字中不要在空格后使用 ";" 或 "#"：INI 会把它们当作
+    注释并截断文字。
+
+  - 被跳过的键及原因会写入 NativeTweaks.log
+    （需 EnableLog=1）。没有任何可显示内容的模组不会生成页面。
+
+
+6. 保存与生效
+---------------------------------------------------------------------
+  - 只写入你修改过的行。
+  - 写入前会先创建 INI 的 .bak 备份。
+  - 文件中的注释和顺序都会保留。
+  - 修改在重启游戏后生效，“除非”你的 DLL 导出了实时重载 API
+    （参见 LIVE_RELOAD_API_V1.md）。TarnishedHUD 导出了该 API，
+    因此它的宽度会立即改变。
+  - 如果你的某个选项即使支持实时重载也仍需重启，请在 Label 或
+    Description 中注明，例如“（需重启）”。
+
+
+7. 完整示例：TarnishedHUD.ini
+---------------------------------------------------------------------
+模组原有的设置放在前面，保持不变。模板块添加在其后。
+
+[General]
+Enabled=1
+
+[BarSize]
+Enabled=1
+FitScreen=1
+FixedWidth=0
+HPEnabled=1
+HPWidth=0.50
+FPEnabled=1
+FPWidth=1.00
+StaminaEnabled=1
+StaminaWidth=1.00
+
+; ---------- NativeTweaks 菜单模板（可选） ----------
+[NativeTweaks]
+Name=Tarnished HUD
+Description=Visual length of the HP, FP and stamina bars. Visual only.
+Description.zh=HP、FP 和精力条的显示长度。仅影响外观。
+
+[NativeTweaks.General.Enabled]
+Type=bool
+Label=Enable mod (restart)
+Label.zh=启用模组（需重启）
+Description=Requires restarting the game.
+Description.zh=需要重启游戏。
+
+[NativeTweaks.BarSize.Enabled]
+Type=bool
+Label=Custom bar size
+Label.zh=自定义血条长度
+
+[NativeTweaks.BarSize.FitScreen]
+Type=bool
+Label=Fit screen (restart)
+Label.zh=适应屏幕（需重启）
+Description=Width values become a fraction of the calibrated length. Requires restart.
+Description.zh=宽度数值改为校准长度的比例。需要重启。
+
+[NativeTweaks.BarSize.FixedWidth]
+Hidden=1
+
+[NativeTweaks.BarSize.HPEnabled]
+Type=bool
+Label=HP bar
+Label.zh=HP 条
+Category=HP
+Category.zh=HP
+
+[NativeTweaks.BarSize.HPWidth]
+Type=float
+Label=HP width
+Label.zh=HP 宽度
+Description=1.00 = near the right edge. 0.50 = about half.
+Description.zh=1.00 = 接近右边缘。0.50 = 大约一半。
+Min=0.05
+Max=1.00
+Step=0.05
+Category=HP
+Category.zh=HP
+
+[NativeTweaks.BarSize.FPEnabled]
+Type=bool
+Label=FP bar
+Label.zh=FP 条
+Category=FP
+Category.zh=FP
+
+[NativeTweaks.BarSize.FPWidth]
+Type=float
+Label=FP width
+Label.zh=FP 宽度
+Min=0.05
+Max=1.00
+Step=0.05
+Category=FP
+Category.zh=FP
+
+[NativeTweaks.BarSize.StaminaEnabled]
+Type=bool
+Label=Stamina bar
+Label.zh=精力条
+Category=Stamina
+Category.zh=精力
+
+[NativeTweaks.BarSize.StaminaWidth]
+Type=float
+Label=Stamina width
+Label.zh=精力宽度
+Min=0.05
+Max=1.00
+Step=0.05
+Category=Stamina
+Category.zh=精力
+
+游戏内效果（中文）：
+  页面“Tarnished HUD”
+    - 启用模组（需重启）     [开/关]
+    - 自定义血条长度         [开/关]
+    - 适应屏幕（需重启）     [开/关]
+    > HP     -> HP 条 [开/关]，   HP 宽度 [0.05 ... 1.00]
+    > FP     -> FP 条 [开/关]，   FP 宽度 [0.05 ... 1.00]
+    > 精力   -> 精力条 [开/关]，  精力宽度 [0.05 ... 1.00]
+  FixedWidth 不显示（Hidden=1）。
+
+为什么选择这些数值：
+  - Step=0.05 得到 20 个数值（0.05、0.10 ... 1.00）：可以完整列出，
+    并覆盖该模组的所有预设。
+  - Step=0.01 会得到 100 个数值；NativeTweaks 只会显示约 30 个
+    取整值，对玩家来说更不方便。
+  - Min=0.05 而不是 0.00，因为该模组不接受 0.00。
+
+
+#####################################################################
+#                                                                   #
+#                       第二部分 - 简易指南                          #
+#                                                                   #
+#####################################################################
+
+这有什么用？
+  让你的模组选项以友好的名称、开关和列表出现在游戏内菜单中。
+
+写在哪里？
+  写在你的 .ini 文件“末尾”，放在原有内容的下面。
+  不要改动原有的内容。
+
+
+第 1 步 - 给你的模组起个名字
+---------------------------------------------------------------------
+复制以下内容并修改文字：
+
+[NativeTweaks]
+Name=My mod name
+Name.zh=我的模组名称
+Description=What my mod does.
+Description.zh=我的模组的功能。
+
+
+第 2 步 - 每个选项一个段落
+---------------------------------------------------------------------
+段落名称“始终”是这样的格式：
+
+  [NativeTweaks.段名.键名]
+
+其中段名和键名就是你 INI 中的名称。例如，你的 INI 中有：
+
+  [BarSize]
+  HPWidth=0.50
+
+那么段落就是：
+
+  [NativeTweaks.BarSize.HPWidth]
+
+
+第 3 步 - 选择选项类型（复制你需要的那个）
+---------------------------------------------------------------------
+
+  >> 开 / 关（0 或 1）：
+
+     [NativeTweaks.General.Enabled]
+     Type=bool
+     Label=Enable mod
+     Label.zh=启用模组
+
+  >> 带小数的数值（例如 0.50）：
+
+     [NativeTweaks.BarSize.HPWidth]
+     Type=float
+     Label=HP width
+     Label.zh=HP 宽度
+     Min=0.05
+     Max=1.00
+     Step=0.05
+
+     Min = 最小值，Max = 最大值，
+     Step = 每次增加的量。
+
+  >> 整数（例如 80）：
+
+     [NativeTweaks.Settings.iOpacity]
+     Type=int
+     Label=Opacity
+     Label.zh=不透明度
+     Min=0
+     Max=100
+     Step=5
+
+  >> 选项列表：
+
+     [NativeTweaks.Settings.iMode]
+     Type=enum
+     Label=Mode
+     Label.zh=模式
+     Options=0:Off|1:Soft|2:Normal
+     Options.zh=0:关闭|1:轻度|2:普通
+
+  >> 不想让它出现在菜单中：
+
+     [NativeTweaks.BarSize.FixedWidth]
+     Hidden=1
+
+
+第 4 步（可选）- 附加项
+---------------------------------------------------------------------
+  Category=HP          -> 把选项放进名为“HP”的子菜单。
+  Label.zh=...         -> 简体中文名称（繁体中文用 Label.zht）。
+  Description=...      -> 说明文字。
+
+
+黄金规则（如果某项没有显示，请检查这里）
+---------------------------------------------------------------------
+  1. INI 中的数值必须符合 Min/Max/Step。
+     Step=0.05 而 INI 中为 0.33 时，该选项“不会”显示。
+  2. 文字中不要写 ";" 或 "#"。
+  3. 文本类数值（名称、路径）无法在游戏内编辑：
+     请为它们设置 Hidden=1。
+  4. 小数请使用点：0.50，而不是 0,50。
+  5. 还是没有显示？在 NativeTweaks.ini 中设置 EnableLog=1，然后
+     查看 NativeTweaks.log：其中会写明哪个选项被跳过以及原因。
+
+
+现成的最小示例（TarnishedHUD，仅 HP 条）
+---------------------------------------------------------------------
+
+[NativeTweaks]
+Name=Tarnished HUD
+
+[NativeTweaks.BarSize.HPEnabled]
+Type=bool
+Label=HP bar
+Label.zh=HP 条
+
+[NativeTweaks.BarSize.HPWidth]
+Type=float
+Label=HP width
+Label.zh=HP 宽度
+Min=0.05
+Max=1.00
+Step=0.05
+
+只需这些，就能在游戏内为 HP 条获得一个开关和一个宽度列表。
+对 FP 和精力重复同样的步骤即可。
+
+=====================================================================

@@ -1,0 +1,371 @@
+=====================================================================
+  NativeTweaks - INI template guide for mod authors
+  (Real example: TarnishedHUD)
+=====================================================================
+
+This file explains the same thing in TWO ways:
+
+  PART 1 - FULL GUIDE   -> every detail, for those who want to
+                           understand how everything works.
+  PART 2 - EASY GUIDE   -> the bare minimum, step by step, ready to
+                           copy and paste.
+
+Use whichever you prefer. Both lead to the same result.
+
+
+#####################################################################
+#                                                                   #
+#                       PART 1 - FULL GUIDE                         #
+#                                                                   #
+#####################################################################
+
+1. WHAT IT IS AND WHAT IT DOES
+---------------------------------------------------------------------
+NativeTweaks shows the INI of every loaded DLL mod (the .ini file
+next to the .dll) in the in-game menu.
+
+Without a template, NativeTweaks can only guess. It only shows keys
+that are clearly switches (true/false, on/off, yes/no, or 0/1 under
+keys such as bEnabled). Everything else is left out of the menu.
+
+With a template, you decide:
+  - the name of each option (and its translation),
+  - whether it is a switch, a list, a slider or a number,
+  - the allowed range of values,
+  - which submenu it appears in,
+  - which keys are hidden.
+
+The template goes INSIDE your own INI, in sections starting with
+[NativeTweaks]. Your DLL does not need to change: every other program
+ignores those sections.
+
+
+2. STRUCTURE
+---------------------------------------------------------------------
+There are two kinds of section:
+
+  [NativeTweaks]
+      Data for the mod's page: Name (title) and Description.
+
+  [NativeTweaks.<Section>.<Key>]
+      Describes the key <Key> found in the section [<Section>]
+      of your INI.
+
+      Example: [NativeTweaks.BarSize.HPWidth] describes the key
+      HPWidth in the section [BarSize].
+
+      The key is the text after the LAST dot, so section names may
+      contain dots.
+
+
+3. AVAILABLE FIELDS
+---------------------------------------------------------------------
+  Type          bool, int, float or enum.
+  Label         Row name (max. 64 characters).
+  Description   Help text shown at the bottom of the menu.
+  Category      Groups rows into a submenu with this name.
+  Min, Max      Range for int/float.
+  Step          Increment between values (default 1).
+  Options       enum values: value:Text|value:Text (max. 32).
+  Hidden        1 = do not show this key in the menu.
+
+Translations: add .en, .es or .zh to any text field:
+  Label.es, Description.zh, Category.es, Options.zh, Name.zh
+.zh (Chinese) is used by the Chinese edition of NativeTweaks when the
+game is in Chinese. Save the INI as UTF-8 for Chinese text.
+Without a translation, the plain field is used.
+
+
+4. HOW EACH TYPE IS SHOWN
+---------------------------------------------------------------------
+  bool   -> On/Off switch. When saving, your spelling is kept
+            (0/1, true/false, on/off, yes/no, including capitals).
+
+  enum   -> a list with your Options. The INI receives the value
+            before the colon.
+
+  int with Min >= 0 and Max <= 255
+         -> native slider showing the real value.
+
+  int/float with other ranges
+         -> a list of every step, up to 32 entries.
+            The number of decimals follows Step/Min/Max.
+
+  Ranges with more than 32 steps
+         -> a list of about 30 round values + the current value.
+            Pick a Step yourself if you want specific values.
+
+
+5. IMPORTANT LIMITATIONS
+---------------------------------------------------------------------
+  - No free text. The menu (ERNativeUI) cannot show editable text
+    fields yet, so names, paths or key lists cannot be edited
+    in-game. Set Hidden=1 on them and explain in comments that they
+    are edited by hand.
+
+  - If the current value does NOT fit the template, the row is not
+    shown. Example: Step=0.05 and the INI says 0.33 -> the row
+    disappears. Fix: use a Step that covers the values you need, or
+    correct the value in the INI.
+
+  - Do not use ";" or "#" after a space in template texts: the INI
+    treats them as a comment and cuts the text.
+
+  - Skipped keys and the reason are written to NativeTweaks.log
+    (with EnableLog=1). A mod with nothing to show gets no page.
+
+
+6. SAVING AND APPLYING
+---------------------------------------------------------------------
+  - Only the rows you changed are written.
+  - A .bak copy of the INI is made first.
+  - Comments and order of the file are preserved.
+  - Changes apply after restarting the game, UNLESS your DLL exports
+    the live-reload API (see LIVE_RELOAD_API_V1.md). TarnishedHUD
+    exports it, which is why its widths change instantly.
+  - If an option of your mod still needs a restart even with live
+    reload, say so in its Label or Description, e.g. "(restart)".
+
+
+7. FULL EXAMPLE: TarnishedHUD.ini
+---------------------------------------------------------------------
+The mod's normal settings come first, unchanged. The template block
+is added after them.
+
+[General]
+Enabled=1
+
+[BarSize]
+Enabled=1
+FitScreen=1
+FixedWidth=0
+HPEnabled=1
+HPWidth=0.50
+FPEnabled=1
+FPWidth=1.00
+StaminaEnabled=1
+StaminaWidth=1.00
+
+; ---------- NativeTweaks menu template (optional) ----------
+[NativeTweaks]
+Name=Tarnished HUD
+Description=Visual length of the HP, FP and stamina bars. Visual only.
+Description.es=Longitud visual de las barras de vida, PM y aguante. Solo visual.
+
+[NativeTweaks.General.Enabled]
+Type=bool
+Label=Enable mod (restart)
+Label.es=Activar mod (reinicio)
+Description=Requires restarting the game.
+Description.es=Requiere reiniciar el juego.
+
+[NativeTweaks.BarSize.Enabled]
+Type=bool
+Label=Custom bar size
+Label.es=Tamano de barras personalizado
+
+[NativeTweaks.BarSize.FitScreen]
+Type=bool
+Label=Fit screen (restart)
+Label.es=Ajustar a pantalla (reinicio)
+Description=Width values become a fraction of the calibrated length. Requires restart.
+Description.es=Los anchos pasan a ser una fraccion de la longitud calibrada. Requiere reinicio.
+
+[NativeTweaks.BarSize.FixedWidth]
+Hidden=1
+
+[NativeTweaks.BarSize.HPEnabled]
+Type=bool
+Label=HP bar
+Label.es=Barra de vida
+Category=HP
+Category.es=Vida
+
+[NativeTweaks.BarSize.HPWidth]
+Type=float
+Label=HP width
+Label.es=Ancho de vida
+Description=1.00 = near the right edge. 0.50 = about half.
+Description.es=1.00 = casi hasta el borde derecho. 0.50 = la mitad aprox.
+Min=0.05
+Max=1.00
+Step=0.05
+Category=HP
+Category.es=Vida
+
+[NativeTweaks.BarSize.FPEnabled]
+Type=bool
+Label=FP bar
+Label.es=Barra de PM
+Category=FP
+Category.es=PM
+
+[NativeTweaks.BarSize.FPWidth]
+Type=float
+Label=FP width
+Label.es=Ancho de PM
+Min=0.05
+Max=1.00
+Step=0.05
+Category=FP
+Category.es=PM
+
+[NativeTweaks.BarSize.StaminaEnabled]
+Type=bool
+Label=Stamina bar
+Label.es=Barra de aguante
+Category=Stamina
+Category.es=Aguante
+
+[NativeTweaks.BarSize.StaminaWidth]
+Type=float
+Label=Stamina width
+Label.es=Ancho de aguante
+Min=0.05
+Max=1.00
+Step=0.05
+Category=Stamina
+Category.es=Aguante
+
+Result in-game (English):
+  Page "Tarnished HUD"
+    - Enable mod (restart)      [On/Off]
+    - Custom bar size           [On/Off]
+    - Fit screen (restart)      [On/Off]
+    > HP        -> HP bar [On/Off],      HP width [0.05 ... 1.00]
+    > FP        -> FP bar [On/Off],      FP width [0.05 ... 1.00]
+    > Stamina   -> Stamina bar [On/Off], Stamina width [0.05 ... 1.00]
+  FixedWidth is not shown (Hidden=1).
+
+Why these values were chosen:
+  - Step=0.05 gives 20 values (0.05, 0.10 ... 1.00): fits in a full
+    list and covers every preset of the mod.
+  - Step=0.01 would give 100 values; NativeTweaks would show only
+    about 30 rounded ones. Worse for the user.
+  - Min=0.05 and not 0.00 because the mod does not accept 0.00.
+
+
+#####################################################################
+#                                                                   #
+#                        PART 2 - EASY GUIDE                        #
+#                                                                   #
+#####################################################################
+
+What does this do?
+  It makes your mod's options appear in the in-game menu with nice
+  names, switches and lists.
+
+Where does it go?
+  At the END of your .ini file, below everything already there.
+  Do not touch what was already there.
+
+
+STEP 1 - Give your mod a name
+---------------------------------------------------------------------
+Copy this and change the text:
+
+[NativeTweaks]
+Name=My mod name
+Description=What my mod does.
+
+
+STEP 2 - One section per option
+---------------------------------------------------------------------
+The section name is ALWAYS like this:
+
+  [NativeTweaks.SECTION.KEY]
+
+where SECTION and KEY are the ones from your INI. For example, if
+your INI has:
+
+  [BarSize]
+  HPWidth=0.50
+
+the section is:
+
+  [NativeTweaks.BarSize.HPWidth]
+
+
+STEP 3 - Pick the option type (copy the one you need)
+---------------------------------------------------------------------
+
+  >> ON / OFF (0 or 1):
+
+     [NativeTweaks.General.Enabled]
+     Type=bool
+     Label=Enable mod
+
+  >> NUMBER WITH DECIMALS (e.g. 0.50):
+
+     [NativeTweaks.BarSize.HPWidth]
+     Type=float
+     Label=HP width
+     Min=0.05
+     Max=1.00
+     Step=0.05
+
+     Min = smallest, Max = largest,
+     Step = how much it goes up each time.
+
+  >> WHOLE NUMBER (e.g. 80):
+
+     [NativeTweaks.Settings.iOpacity]
+     Type=int
+     Label=Opacity
+     Min=0
+     Max=100
+     Step=5
+
+  >> LIST OF CHOICES:
+
+     [NativeTweaks.Settings.iMode]
+     Type=enum
+     Label=Mode
+     Options=0:Off|1:Soft|2:Normal
+
+  >> You do NOT want it in the menu:
+
+     [NativeTweaks.BarSize.FixedWidth]
+     Hidden=1
+
+
+STEP 4 (optional) - Extras
+---------------------------------------------------------------------
+  Category=HP          -> puts the option in a submenu called "HP".
+  Label.es=...         -> Spanish name.
+  Description=...      -> help text.
+
+
+GOLDEN RULES (if something does not show up, check here)
+---------------------------------------------------------------------
+  1. The value in your INI must fit Min/Max/Step.
+     With Step=0.05 and 0.33 in the INI, the option does NOT show.
+  2. Do not write ";" or "#" in texts.
+  3. Text values (names, paths) cannot be edited in-game:
+     give them Hidden=1.
+  4. Use a dot for decimals: 0.50, not 0,50.
+  5. Still missing? Set EnableLog=1 in NativeTweaks and read
+     NativeTweaks.log: it says which option was skipped and why.
+
+
+READY-MADE MINIMAL EXAMPLE (TarnishedHUD, HP bar only)
+---------------------------------------------------------------------
+
+[NativeTweaks]
+Name=Tarnished HUD
+
+[NativeTweaks.BarSize.HPEnabled]
+Type=bool
+Label=HP bar
+
+[NativeTweaks.BarSize.HPWidth]
+Type=float
+Label=HP width
+Min=0.05
+Max=1.00
+Step=0.05
+
+With just this you get a switch and a list of widths for the HP bar
+in-game. Repeat the same for FP and Stamina.
+
+=====================================================================
