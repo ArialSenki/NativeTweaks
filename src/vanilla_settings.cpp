@@ -1216,7 +1216,7 @@ Option g_options[count]{
     slider(L"PhysicalDamagePercent", 100, 0, 500, 10), slider(L"MagicDamagePercent", 100, 0, 500, 10),
     slider(L"FireDamagePercent", 100, 0, 500, 10), slider(L"LightningDamagePercent", 100, 0, 500, 10),
     slider(L"HolyDamagePercent", 100, 0, 500, 10),
-    slider(L"WeaponScalingPercent", 100, 0, 500, 10), slider(L"WeaponWeightPercent", 100, 0, 500, 10),
+    slider(L"WeaponScalingPercent", 100, 0, 1000, 10), slider(L"WeaponWeightPercent", 100, 0, 500, 10),
     slider(L"PhysicalDamageTakenPercent", 100, 0, 500, 10), slider(L"MagicDamageTakenPercent", 100, 0, 500, 10),
     slider(L"FireDamageTakenPercent", 100, 0, 500, 10), slider(L"LightningDamageTakenPercent", 100, 0, 500, 10),
     slider(L"HolyDamageTakenPercent", 100, 0, 500, 10),

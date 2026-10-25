@@ -34,7 +34,7 @@ namespace {
 HMODULE g_own_module{};
 erui::Registration g_registration{};
 // Build tag shown in the log and, with ERUI 1.3, on the title screen.
-constexpr wchar_t kBuildTag[] = L"r136";
+constexpr wchar_t kBuildTag[] = L"r137";
 SRWLOCK g_settings_lock = SRWLOCK_INIT;
 SRWLOCK g_save_lock = SRWLOCK_INIT;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
