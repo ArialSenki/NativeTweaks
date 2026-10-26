@@ -11,10 +11,11 @@ What's in the tab:
   its options can be changed from inside the game. Mod authors can describe
   their options with a template ([docs/INI_TEMPLATE_FOR_MODDERS.md](docs/INI_TEMPLATE_FOR_MODDERS.md))
   and pick changes up live ([docs/LIVE_RELOAD_GUIDE.md](docs/LIVE_RELOAD_GUIDE.md)).
-- **Vanilla Settings.** More than 100 options for the game itself (camera,
-  HUD, combat, Torrent, weather, spirit ashes and more), applied at once, with
-  hotkeys and profiles.
-- **Multiple Spirit Ashes**, built in (see below).
+- **Vanilla Settings.** More than 150 options for the game itself on 21 pages
+  (camera, HUD, combat, dodging, Torrent, weather, spirit ashes and more),
+  applied at once, with hotkeys and profiles.
+- **[Multiple Spirit Ashes](https://github.com/ArialSenki/MultipleSpiritAshes)**,
+  built in: several spirit ashes at once, up to 500 spirits.
 
 Supported game versions: Elden Ring 2.7.2.0, 2.7.1.0 and 2.7.1.1, PC. Options
 whose game data isn't found on another version are greyed out. Offline only,
