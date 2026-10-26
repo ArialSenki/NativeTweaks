@@ -232,8 +232,75 @@ Site g_enemy_respawn{L"enemy respawn",
     "83 b9 ? ? ? ? 00 75 0a c7 81 ? ? ? ? 01 00 00 00 c3",
     0, "83 b9", {0xC3}};
 
+// Summon anywhere: the game's summon state (GetBuddyState, eldenring.exe+0x4B73D0
+// in 2.7.2.0) only lets a spirit ash be used while the player has SpEffect
+// state 0x175, which the game gives inside a summoning monument's area, and a
+// monument in SummonBuddyManager +0x38. Outside the monument's own map tile
+// the state is missing (r140 test, Caelid and Radahn's battlefield): skipping
+// that check leaves the monument, which Multiple Spirit Ashes keeps from the
+// last one found (apply_stone_fallback).
+Site g_summon_area{L"summoning area",
+    "ba 75 01 00 00 48 8b 88 78 01 00 00 e8 ? ? ? ? 84 c0 74 ? 8b 43 38 85 c0 74 ? 3b 43 3c",
+    17, "84 c0 74 ?", {0x84, 0xC0, 0x90, 0x90}};  // the jz alone straddles a 16-byte line: write_code refused it
+
+// The item side of the same rule: a small function (eldenring.exe+0x4B76F0 in
+// 2.7.2.0) answers "is the player in a summoning area" with that state alone
+// and refused the spirit ash item away from monuments even with the check above
+// skipped (r140 test). With Summon anywhere it returns true.
+Site g_summon_area_item{L"summoning area (items)",
+    "48 8b 80 08 e5 01 00 ba 75 01 00 00 48 8b 88 78 01 00 00 48 83 c4 28 e9",
+    7, "ba 75 01 00 00 48 8b 88 78 01 00 00 48 83 c4 28 e9 ? ? ? ?",
+    {0xB0, 0x01, 0x48, 0x83, 0xC4, 0x28, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90}};
+
+// Spirit bodies get a slot in WorldChrMan's summon_buddy ChrSet: 80 entries,
+// slots 0-19 for other characters (Torrent among them) and a block of 10 per
+// player from 20. The slot search (2.7.2.0 +0x493460) starts at
+// (player + 2) * 10 and makes 10 tries round that block from a hint; no free
+// slot means no body, with the FP already spent (r140 test: Lone Wolf Ashes
+// gave 1 wolf of 3 with 9 bodies out, Black Knife Tiche none with 10).
+// With several ashes at once:
+// - the set is created with 520 entries (+0x495590 allocates 80 * 16 bytes
+//   through the game's allocator and builds 80 entries): patched when the Hub
+//   starts, before the game creates it, so the game allocates and frees the
+//   larger array itself (moving the array to one of our own corrupted the
+//   heap on the next map load, c0000374);
+// - the search starts at 20 for everyone and runs over every slot from 20 to
+//   the set's real capacity (a code cave reads it, so a set created before the
+//   patch keeps to its 80): up to 500 bodies.
+// The only code deriving anything from a slot number is the next-search hint,
+// (slot - 19) % 10, which stays a valid start.
+constexpr std::uint32_t kBuddySetCapacity = 520;
+Site g_buddy_slot_start{L"spirit slots (start)",
+    "0f b6 c2 83 c0 02 8d 04 80 44 8d 14 00 b8 67 66 66 66 41 f7 e9",
+    3, "83 c0 02 8d 04 80 44 8d 14 00", {0x41, 0xBA, 0x14, 0x00, 0x00, 0x00, 0x0F, 0x1F, 0x40, 0x00}};
+// The 10-try loop; its replacement (a jump to the cave) is built on first use.
+Site g_buddy_slot_loop{L"spirit slots (search)",
+    "41 83 f9 0a 7d 0a 43 8d 3c 11 49 8d 1c 12 eb 0e 41 8d 7a f6 41 03 f9 49 8d 5a f6 48 03 da 48 03 d9 48 c1 e3 04 49 03 d8 4c 39 3b 74 14 41 ff c1 48 ff c1 48 83 f9 0a 7c c7 49 8b c7",
+    0, "41 83 f9 0a 7d 0a 43 8d 3c 11 49 8d 1c 12 eb 0e 41 8d 7a f6 41 03 f9 49 8d 5a f6 48 03 da 48 03 d9 48 c1 e3 04 49 03 d8 4c 39 3b 74 14 41 ff c1 48 ff c1 48 83 f9 0a 7c c7", std::vector<std::uint8_t>(57, 0x90)};
+constexpr const char* kBuddySetInit =
+    "ba 00 05 00 00 41 b8 08 00 00 00 ff 50 50 48 89 46 18 48 85 c0 74 ? bf 50 00 00 00 89 7e 10 33 d2 "
+    "41 b8 00 05 00 00";
+Site g_buddy_set_bytes{L"spirit set (allocation)", kBuddySetInit, 0, "ba 00 05 00 00",
+    {0xBA, 0x80, 0x20, 0x00, 0x00}};
+Site g_buddy_set_count{L"spirit set (entries)", kBuddySetInit, 0x17, "bf 50 00 00 00",
+    {0xBF, 0x08, 0x02, 0x00, 0x00}};
+Site g_buddy_set_clear{L"spirit set (clear)", kBuddySetInit, 0x21, "41 b8 00 05 00 00",
+    {0x41, 0xB8, 0x80, 0x20, 0x00, 0x00}};
+// Within range of the summoning monument: +0x4BD950 clears it every frame and
+// sets it only when the monument is loaded near the player and the player is
+// inside its region or range; every other path ends at one point. Outside,
+// ashes summoned there are being dismissed and stay frozen, without
+// collision, looping the summoning sound (r140 tests: Radahn's battlefield,
+// Caelid, dungeons with no monument of their own). Summon anywhere sets it
+// there: "cmp [rsi+B5h],r13b; je" becomes "mov byte [rsi+B5h],1".
+Site g_summon_range{L"summoning range",
+    "44 38 ae b5 00 00 00 74 07 44 88 ae b7 00 00 00 4c 39 ae 00 01 00 00",
+    0, "44 38 ae b5 00 00 00 74 07", {0xC6, 0x86, 0xB5, 0x00, 0x00, 0x00, 0x01, 0x66, 0x90}};
+
 Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic,
-    &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn};
+    &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
+    &g_summon_area, &g_summon_area_item, &g_summon_range, &g_buddy_slot_start, &g_buddy_slot_loop};
 
 void resolve(Site& site) noexcept {
     try {
@@ -989,6 +1056,12 @@ const wchar_t* find_movie_name(const wchar_t* name) noexcept {
 }
 
 DialogYesData* g_dialog_yes_data{};
+
+// Fork export (r140): turns the coloured labels on or off live; the defaults
+// stay registered. An older ERNativeUI.dll lacks it: the option then only
+// applies when the game starts.
+using SetHighlightEnabledFn = ERUI_Result (ERUI_CALL*)(std::uint32_t);
+SetHighlightEnabledFn g_set_highlight{};
 std::vector<std::uint8_t*> g_dialog_yes_reads;
 
 // The 32-bit reads of +0x10F4 with a 32-bit displacement and no SIB byte; all
@@ -1480,6 +1553,10 @@ enum Id : std::size_t {
     parry_frames,
     // Movement: invincible while knocked down, super armour while using items
     knockdown_invincible, item_super_armor,
+    // Interface: the former optional files, now [General] switches also in the menu
+    extended_ranges, highlight_changed,
+    // Spirits: the same ash again with its item instead of dismissing it
+    ash_repeat,
     count
 };
 
@@ -1497,50 +1574,57 @@ struct Option {
     std::int16_t value;
     const wchar_t* suffix;
     erui::RowHandle row;
+    bool general = false;  // stored in [General]: a menu preference, not in profiles or resets
 };
 
 constexpr Option toggle(const wchar_t* key) { return {key, Kind::toggle, 0, 0, 1, 1, 0, L"", ERUI_INVALID_ROW}; }
 constexpr Option toggle_on(const wchar_t* key) { return {key, Kind::toggle, 1, 0, 1, 1, 1, L"", ERUI_INVALID_ROW}; }
+// A [General] switch read when the game starts (it changes how the menu is built).
+constexpr Option general_toggle(const wchar_t* key) {
+    Option option = toggle(key);
+    option.general = true;
+    return option;
+}
 constexpr Option slider(const wchar_t* key, std::int16_t fallback, std::int16_t minimum,
     std::int16_t maximum, std::int16_t step, const wchar_t* suffix = L"%") {
     return {key, Kind::slider, fallback, minimum, maximum, step, fallback, suffix, ERUI_INVALID_ROW};
 }
 
 Option g_options[count]{
-    toggle(L"FovEnabled"), slider(L"FovPercent", 100, 25, 200, 5),
+    toggle(L"FovEnabled"), slider(L"FovPercent", 100, 25, 1300, 5),
     toggle(L"DisableCameraAutoRotate"), toggle(L"DisableCameraReset"),
-    slider(L"CameraDistancePercent", 100, 25, 500, 5),
+    slider(L"CameraDistancePercent", 100, 25, 1300, 5),
     toggle(L"RemoveVignette"), toggle(L"RemoveChromaticAberration"), toggle(L"FullAnimationDistance"),
     toggle(L"DisableAntiAliasing"), toggle(L"DisableMotionBlur"), toggle(L"DisableDepthOfField"),
     toggle(L"GodMode"), toggle(L"NoDeath"), toggle(L"InfiniteStamina"), toggle(L"InfiniteFp"),
     toggle(L"InfiniteItems"), toggle(L"InfiniteArrows"),
-    slider(L"EquipWeightPercent", 100, 0, 200, 5),
+    slider(L"EquipWeightPercent", 100, 0, 1275, 5),
     // Sliders with a scale selector use all 256 positions in steps of 5.
-    slider(L"PlayerPoisePercent", 100, 0, 500, 10), toggle(L"PlayerInfinitePoise"),
+    slider(L"PlayerPoisePercent", 100, 0, 1275, 5), toggle(L"PlayerInfinitePoise"),
     toggle(L"NoFallDamage"), toggle(L"StatusImmunity"),
-    slider(L"DamageDealtPercent", 100, 10, 1000, 10), slider(L"DamageTakenPercent", 100, 0, 1000, 10),
-    slider(L"PostureDamageDealtPercent", 100, 0, 1000, 10), slider(L"PostureDamageTakenPercent", 100, 0, 1000, 10),
-    slider(L"StaminaCostPercent", 100, 0, 300, 5), slider(L"SpellFpCostPercent", 100, 0, 300, 5),
-    slider(L"StatusBuildupPercent", 100, 0, 1000, 10), toggle(L"OneHitKill"),
-    slider(L"BuffDurationWeaponPercent", 100, 25, 500, 25), slider(L"BuffDurationSelfPercent", 100, 25, 500, 25),
-    slider(L"BuffDurationEnemyPercent", 100, 25, 500, 25),
-    slider(L"SpeedGlobalPercent", 100, 25, 300, 5), slider(L"SpeedAttackPercent", 100, 25, 300, 5),
-    slider(L"SpeedSpellPercent", 100, 25, 300, 5), slider(L"SpeedRollPercent", 100, 25, 300, 5),
-    slider(L"SpeedMovePercent", 100, 25, 300, 5), slider(L"SpeedJumpPercent", 100, 25, 300, 5),
-    slider(L"EnemyHpPercent", 100, 10, 1000, 10), slider(L"EnemyPoisePercent", 100, 0, 500, 10),
-    toggle(L"EnemyInfinitePoise"), slider(L"EnemySpeedPercent", 100, 25, 300, 5),
+    slider(L"DamageDealtPercent", 100, 10, 1285, 5), slider(L"DamageTakenPercent", 100, 0, 1275, 5),
+    slider(L"PostureDamageDealtPercent", 100, 0, 1275, 5), slider(L"PostureDamageTakenPercent", 100, 0, 1275, 5),
+    slider(L"StaminaCostPercent", 100, 0, 1275, 5), slider(L"SpellFpCostPercent", 100, 0, 1275, 5),
+    slider(L"StatusBuildupPercent", 100, 0, 1275, 5), toggle(L"OneHitKill"),
+    slider(L"BuffDurationWeaponPercent", 100, 25, 1300, 5), slider(L"BuffDurationSelfPercent", 100, 25, 1300, 5),
+    slider(L"BuffDurationEnemyPercent", 100, 25, 1300, 5),
+    slider(L"SpeedGlobalPercent", 100, 25, 1300, 5), slider(L"SpeedAttackPercent", 100, 25, 1300, 5),
+    slider(L"SpeedSpellPercent", 100, 25, 1300, 5), slider(L"SpeedRollPercent", 100, 25, 1300, 5),
+    slider(L"SpeedMovePercent", 100, 25, 1300, 5), slider(L"SpeedJumpPercent", 100, 25, 1300, 5),
+    slider(L"EnemyHpPercent", 100, 10, 1285, 5), slider(L"EnemyPoisePercent", 100, 0, 1275, 5),
+    toggle(L"EnemyInfinitePoise"), slider(L"EnemySpeedPercent", 100, 25, 1300, 5),
     toggle(L"EnemiesNoAttack"),
     toggle(L"EnemiesNoMove"), toggle(L"EnemiesNoAi"), toggle(L"TorrentNoDeath"),
-    slider(L"TorrentSpeedPercent", 100, 25, 300, 5),
-    toggle(L"DisableRuneLoss"), slider(L"RunesGainedPercent", 100, 0, 1000, 10),
-    slider(L"LootDropPercent", 100, 0, 1000, 10),
-    slider(L"SpiritAshCostPercent", 100, 0, 300, 10), slider(L"UpgradeCostPercent", 100, 0, 300, 10),
+    slider(L"TorrentSpeedPercent", 100, 25, 1300, 5),
+    toggle(L"DisableRuneLoss"), slider(L"RunesGainedPercent", 100, 0, 1275, 5),
+    slider(L"LootDropPercent", 100, 0, 1275, 5),
+    slider(L"SpiritAshCostPercent", 100, 0, 1275, 5), slider(L"UpgradeCostPercent", 100, 0, 1275, 5),
     toggle(L"PauseKey"),
     toggle(L"SetTimeOfDay"), slider(L"TimeOfDayHour", 12, 0, 23, 1, L":00"), toggle(L"FreezeTime"),
     toggle(L"SetWeather"), slider(L"WeatherType", 4, 0, 15, 1, L""),
     toggle(L"ShowAllGraces"), toggle(L"RevealMap"), toggle(L"FastTravelAnywhere"),
     toggle_on(L"SpiritResummonWithoutRest"), toggle_on(L"SpiritSummonFarFromStones"),
-    toggle(L"SpiritMultipleAshes"), slider(L"SpiritMaxActiveAshes", 8, 2, 20, 1, L""),
+    toggle_on(L"SpiritMultipleAshes"), slider(L"SpiritMaxActiveAshes", 8, 2, 100, 1, L""),
     toggle_on(L"SpiritKeepAfterBoss"), toggle(L"SpiritDismissAll"),
     slider(L"SpiritExtraAshCostPercent", 100, 0, 200, 10), slider(L"SpiritDamageLossPerExtraAsh", 0, 0, 20, 1),
     toggle(L"UnlockFps"), slider(L"FpsLimit", 120, 30, 360, 10, L" FPS"), toggle(L"AllowUltrawide"),
@@ -1566,7 +1650,7 @@ Option g_options[count]{
     slider(L"CrimsonFlaskPercent", 100, 0, 500, 10), slider(L"CeruleanFlaskPercent", 100, 0, 500, 10),
     slider(L"SpellStaminaCostPercent", 100, 0, 500, 10), toggle(L"SpellsUseOneSlot"), toggle(L"IgnoreSpellRequirements"),
     slider(L"SkillFpCostPercent", 100, 0, 500, 10), toggle(L"Carry999Items"),
-    slider(L"SpeedItemPercent", 100, 25, 300, 5),
+    slider(L"SpeedItemPercent", 100, 25, 1300, 5),
     slider(L"ShopPricePercent", 100, 0, 500, 10), toggle(L"CraftWithoutMaterials"),
     slider(L"WeaponRequirementsPercent", 100, 0, 100, 5), toggle(L"UpgradeWithoutMaterials"),
     toggle(L"HideHelmet"),
@@ -1580,7 +1664,7 @@ Option g_options[count]{
     toggle(L"EnemiesDoNotRespawn"),
     toggle(L"DialogsDefaultToYes"),
     toggle(L"HitDownedEnemies"),
-    slider(L"TorrentJumpSpeedPercent", 100, 25, 300, 5),
+    slider(L"TorrentJumpSpeedPercent", 100, 25, 1300, 5),
     slider(L"JumpHeightPercent", 100, 25, 500, 5), slider(L"JumpDistancePercent", 100, 25, 500, 5),
     slider(L"TorrentJumpHeightPercent", 100, 25, 500, 5), slider(L"TorrentJumpDistancePercent", 100, 25, 500, 5),
     toggle(L"DisableLockOn"),
@@ -1592,12 +1676,14 @@ Option g_options[count]{
     slider(L"WorldDifficulty", 0, 0, 7, 1, L""),
     toggle(L"WorldDifficultyKeepRunes"),
     toggle(L"OpenMirror"), toggle(L"OpenRebirth"),
-    slider(L"BossHpPercent", 100, 10, 1000, 10),
+    slider(L"BossHpPercent", 100, 10, 1285, 5),
     toggle(L"KeepCharactersClean"), toggle(L"HideBuffEffects"),
     toggle(L"HideWeaponBuffEffects"),
     slider(L"DodgeFramesPercent", 100, 100, 500, 10),
     slider(L"ParryWindowPercent", 100, 100, 500, 10),
     toggle(L"KnockdownInvincible"), toggle(L"ItemSuperArmor"),
+    general_toggle(L"ExtendedRanges"), general_toggle(L"HighlightChangedOptions"),
+    toggle(L"SpiritRepeatSameAsh"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1607,8 +1693,69 @@ std::int16_t clamp_value(const Option& option, int value) noexcept {
     return static_cast<std::int16_t>(value);
 }
 
+// Optional extended ranges ([General] ExtendedRanges = 1, or the optional
+// package's marker NativeTweaks.ExtendedRanges.ini beside NativeTweaks.ini):
+// the sliders below use all 256 positions and get a scale row that multiplies
+// their value. Without it they keep the classic range and step listed here.
+constexpr int kScaleFactors[]{1, 2, 5, 10, 100};
+constexpr std::size_t kScaleCount = std::size(kScaleFactors);
+bool g_extended{};
+
+struct Scale {
+    Id id;
+    const wchar_t* key;
+    std::int16_t classic_minimum;
+    std::int16_t classic_maximum;
+    std::int16_t classic_step;
+    std::uint8_t index;
+    erui::RowHandle row;
+};
+
+Scale g_scales[]{
+    {player_poise, L"PlayerPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
+    {damage_dealt, L"DamageDealtScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
+    {damage_taken, L"DamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {posture_dealt, L"PostureDamageDealtScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {posture_taken, L"PostureDamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {status_buildup, L"StatusBuildupScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {enemy_hp, L"EnemyHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
+    {boss_hp, L"BossHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
+    {enemy_poise, L"EnemyPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
+    {runes_gained, L"RunesGainedScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {loot_drop, L"LootDropScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
+    {equip_weight, L"EquipWeightScale", 0, 200, 5, 0, ERUI_INVALID_ROW},
+    {stamina_cost, L"StaminaCostScale", 0, 300, 5, 0, ERUI_INVALID_ROW},
+    {spell_fp_cost, L"SpellFpCostScale", 0, 300, 5, 0, ERUI_INVALID_ROW},
+    {buff_weapon, L"BuffDurationWeaponScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
+    {buff_self, L"BuffDurationSelfScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
+    {buff_enemy, L"BuffDurationEnemyScale", 25, 500, 25, 0, ERUI_INVALID_ROW},
+    {ash_cost, L"SpiritAshCostScale", 0, 300, 10, 0, ERUI_INVALID_ROW},
+    {upgrade_cost, L"UpgradeCostScale", 0, 300, 10, 0, ERUI_INVALID_ROW},
+    {fov_percent, L"FovScale", 25, 200, 5, 0, ERUI_INVALID_ROW},
+    {camera_distance, L"CameraDistanceScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
+    {speed_global, L"SpeedGlobalScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_attack, L"SpeedAttackScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_spell, L"SpeedSpellScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_roll, L"SpeedRollScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_move, L"SpeedMoveScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_jump, L"SpeedJumpScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_item, L"SpeedItemScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {enemy_speed, L"EnemySpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {torrent_speed, L"TorrentSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {torrent_jump_speed, L"TorrentJumpSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+};
+
+Scale* scale_of(Id id) noexcept {
+    if (!g_extended) return nullptr;
+    for (Scale& scale : g_scales)
+        if (scale.id == id) return &scale;
+    return nullptr;
+}
+// Effective value: the slider times its scale.
 int value_of(Id id) noexcept {
-    return g_options[id].value;
+    const int value = g_options[id].value;
+    const Scale* scale = scale_of(id);
+    return scale ? value * kScaleFactors[scale->index] : value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,7 +2034,7 @@ void sync_params() noexcept {
             if (boss_percent != 100 && r < state.boss.size() && state.boss[r] && scaled > 0)
                 scaled = scaled * boss_percent / 100.0;
             // The game wraps poise damage past 32767 (x100 broke nothing in game), so
-            // large percentages stop at the strongest value that still counts.
+            // extended ranges stop at the strongest value that still counts.
             if (field.id == posture_dealt || field.id == posture_taken)
                 scaled = std::min(scaled, kMaxPoiseDamage);
             write_field(state.table.rows[r] + field.offset, field.type,
@@ -2105,7 +2252,13 @@ void sync_travel() noexcept {
 // is raised after a summon and locks that monument until the flag resets on
 // rest, so 0 lets you summon again. activateRange (+0x1C, u16 metres) and
 // overwriteActivateRegionEntityId (+0x20) limit where a monument enables
-// summoning; the widest range and no region open it across the whole area.
+// summoning. Summon anywhere opens every monument by distance: widest range
+// and no region (266 of 304 have one, with activateRange 999). Outside a
+// monument's region the game counts the player out of range, and ashes
+// summoned from it freeze half-dismissed (r140 tests at Radahn's battlefield
+// and when walking into the next map tile). Where the game then finds no
+// monument (Radahn's battlefield, buddy_stone=0), Multiple Spirit Ashes puts
+// in the one nearest to the player's map tile.
 // overwriteReturnRange (+0x1E, s16 metres, -1 = no override) sets how far you
 // can walk off before the spirits are dismissed; Summon anywhere resets it to
 // -1, as the area rules of Multiple Spirit Ashes 0.1.165 do.
@@ -2172,6 +2325,15 @@ void sync_buddy() noexcept {
             game::write<std::uint32_t>(row + 0x20, anywhere ? 0u : g_buddy.regions[r]);
         }
         g_buddy.applied_anywhere = anywhere;
+        spirit_ashes::set_summon_anywhere(anywhere);
+        const bool area = set_site(g_summon_area, anywhere);
+        const bool area_item = set_site(g_summon_area_item, anywhere);
+        const bool range = set_site(g_summon_range, anywhere);
+        wchar_t message[200]{};
+        swprintf_s(message, L"Summon anywhere %ls: monument rules applied; summoning-area checks %ls/%ls; range %ls.",
+            anywhere ? L"on" : L"off", area ? L"ok" : L"not patched", area_item ? L"ok" : L"not patched",
+            range ? L"ok" : L"not patched");
+        log(message);
     }
     const bool keep_after_boss = value_of(ash_keep_after_boss) != 0;
     if (keep_after_boss != g_buddy.applied_keep_after_boss) {
@@ -2193,10 +2355,60 @@ bool g_spirit_ashes_started{};
 // (compatibility package, e.g. Seamless Co-op or other HUD mods).
 bool g_spirit_hud_rows{true};
 
+// The slot search over the whole set (see kBuddySetCapacity). At the loop:
+// r14 = ChrSet, r8 = its entries, r9d = hint, r10d = 20 (start), rcx = 0,
+// r15 = 0; on a free slot edi = its index and rbx = its entry, as the
+// original loop leaves them for the code after it.
+bool build_buddy_slot_search() noexcept {
+    if (!g_buddy_slot_loop.ready) return false;
+    if (g_buddy_slot_loop.replacement[0] == 0xE9) return true;
+    std::uint8_t* const site = g_buddy_slot_loop.address;
+    std::uint8_t* code = alloc_near(site);
+    if (!code) {
+        log(L"Spirit slots: no memory near the game code; kept at 10 per player.");
+        return false;
+    }
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_u64 = [&](const std::uint8_t* v) { std::memcpy(p, &v, 8); p += 8; };
+    put({0x41, 0x8B, 0x46, 0x10});                                     // mov eax,[r14+10h]  capacity
+    put({0x83, 0xE8, 0x14});                                           // sub eax,20         slots from 20
+    std::uint8_t* const loop = p;
+    put({0x41, 0x39, 0xC1});                                           // cmp r9d,eax
+    put({0x43, 0x8D, 0x3C, 0x11});                                     // lea edi,[r9+r10]
+    put({0x7C, 0x02});                                                 // jl have
+    put({0x29, 0xC7});                                                 // sub edi,eax        wrap round
+    put({0x48, 0x63, 0xDF});                                           // have: movsxd rbx,edi
+    put({0x48, 0xC1, 0xE3, 0x04});                                     // shl rbx,4
+    put({0x4C, 0x01, 0xC3});                                           // add rbx,r8
+    put({0x4C, 0x39, 0x3B});                                           // cmp [rbx],r15
+    put({0x74, 0x00});                                                 // je found
+    std::uint8_t* const to_found = p;
+    put({0x41, 0xFF, 0xC1});                                           // inc r9d
+    put({0x48, 0xFF, 0xC1});                                           // inc rcx
+    put({0x48, 0x39, 0xC1});                                           // cmp rcx,rax
+    put({0x7C, static_cast<std::uint8_t>(loop - (p + 2))});           // jl loop
+    put({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); put_u64(site + 57);     // none free: after the loop
+    to_found[-1] = static_cast<std::uint8_t>(p - to_found);
+    put({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00}); put_u64(site + 65);     // found: past "mov rax,r15; jmp"
+    FlushInstructionCache(GetCurrentProcess(), code, static_cast<SIZE_T>(p - code));
+    std::vector<std::uint8_t> jump(57, 0x90);
+    jump[0] = 0xE9;
+    const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(code) -
+        reinterpret_cast<std::intptr_t>(site + 5));
+    std::memcpy(jump.data() + 1, &disp, 4);
+    g_buddy_slot_loop.replacement = jump;
+    return true;
+}
+
 spirit_ashes::Settings spirit_ash_settings() noexcept {
-    return {value_of(ash_multiple) != 0, static_cast<std::uint32_t>(value_of(ash_max_active)), g_diagnostics,
+    // No cap on ashes (0): the spirit set's 500 bodies are the limit, and the
+    // game has 94 ashes. ash_max_active stays defined for old INI files only.
+    return {value_of(ash_multiple) != 0, 0u, g_diagnostics,
         true, true, true, true, true, g_spirit_hud_rows, static_cast<std::uint32_t>(value_of(ash_extra_cost)),
-        static_cast<std::uint32_t>(value_of(ash_damage_per_ash))};
+        static_cast<std::uint32_t>(value_of(ash_damage_per_ash)), value_of(ash_repeat) != 0};
 }
 
 // First thing in initialize(): its HUD movie hook has to be in before the game
@@ -2204,7 +2416,7 @@ spirit_ashes::Settings spirit_ash_settings() noexcept {
 void start_spirit_ashes() noexcept {
     if (!g_config_path.empty())
         g_spirit_hud_rows = GetPrivateProfileIntW(L"SpiritAshes", L"HudRows", 1, g_config_path.c_str()) != 0;
-    for (const Id id : {ash_multiple, ash_max_active, ash_extra_cost, ash_damage_per_ash}) {
+    for (const Id id : {ash_multiple, ash_max_active, ash_extra_cost, ash_damage_per_ash, ash_repeat}) {
         Option& option = g_options[id];
         if (!g_config_path.empty())
             option.value = clamp_value(option, static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key,
@@ -2214,8 +2426,24 @@ void start_spirit_ashes() noexcept {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(&start_spirit_ashes), &self);
     g_spirit_ashes_started = self && spirit_ashes::start(self, spirit_ash_settings());
+    // The spirit set is created once, when the game builds WorldChrMan: its
+    // size can only be raised here, before that (see kBuddySetCapacity).
+    if (g_spirit_ashes_started && value_of(ash_multiple) != 0) {
+        // All three share one pattern, which the first write changes: find
+        // them all before writing.
+        for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear}) resolve(*site);
+        int patched = 0;
+        for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear})
+            patched += set_site(*site, true) ? 1 : 0;
+        if (patched != 3)
+            for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear}) set_site(*site, false);
+        wchar_t message[128]{};
+        swprintf_s(message, L"Spirit set: created with %u entries (%d/3 sites).",
+            patched == 3 ? kBuddySetCapacity : 80u, patched);
+        log(message);
+    }
     log(g_spirit_ashes_started
-            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.0, built in) started."
+            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.2, built in) started."
             : L"Several ashes at once unavailable: unsupported game version or MultipleSpiritAshes.dll is loaded.");
 }
 
@@ -5141,9 +5369,20 @@ void apply(Id id) noexcept {
         break;
     }
     case ultrawide: set_site(g_ultrawide, on(id)); break;
-    case ash_multiple: case ash_max_active: case ash_extra_cost: case ash_damage_per_ash:
+    case ash_multiple: case ash_max_active: case ash_extra_cost: case ash_damage_per_ash: case ash_repeat: {
         spirit_ashes::update(spirit_ash_settings());
+        const bool shared = on(ash_multiple) && g_spirit_ashes_started && build_buddy_slot_search();
+        const bool start = set_site(g_buddy_slot_start, shared);
+        const bool search = set_site(g_buddy_slot_loop, shared);
+        if (id == ash_multiple) {
+            wchar_t message[128]{};
+            swprintf_s(message, L"Spirit slots: %ls (start %ls, search %ls).",
+                shared ? L"shared up to the set's capacity" : L"10 per player",
+                start ? L"ok" : L"not patched", search ? L"ok" : L"not patched");
+            log(message);
+        }
         break;
+    }
     case ash_dismiss_all:
         // A button: act, then back to off (option_changed / set_option_raw
         // refresh the row).
@@ -5165,6 +5404,10 @@ void apply(Id id) noexcept {
         break;
     case skip_intro: set_site(g_intro, on(id)); break;
     case dialog_yes_default: g_dialog_yes_data->on = on(id) ? 1 : 0; break;
+    case extended_ranges: break;  // read when the game starts (it shapes the menu)
+    case highlight_changed:
+        if (g_set_highlight) (void)g_set_highlight(on(id) ? 1u : 0u);
+        break;
     case enemies_downed_vulnerable:
         if (on(id)) install_downed_hook(g_statics.world_chr_man);
         if (g_downed) g_downed->enabled = on(id) ? 1u : 0u;
@@ -5241,12 +5484,14 @@ bool available(Id id) noexcept {
     case fps_unlock: case fps_limit: return g_frametime.ready && g_fullscreen_cap.ready;
     case ultrawide: return g_ultrawide.ready;
     case ash_multiple: case ash_max_active: case ash_dismiss_all: case ash_extra_cost: case ash_damage_per_ash:
+    case ash_repeat:
         return g_spirit_ashes_started;
     case refresh_rate: return g_fullscreen_cap.ready;
     case skip_intro: return g_intro.ready;
     case open_mirror: case open_rebirth:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case dialog_yes_default: return g_dialog_yes_data != nullptr;
+    case extended_ranges: case highlight_changed: return !g_config_path.empty();
     case enemies_downed_vulnerable:
         return (g_downed != nullptr || g_downed_site != nullptr) && g_statics.layout_2_7_1 &&
             g_statics.world_chr_man;
@@ -5318,12 +5563,24 @@ bool optional_feature(const wchar_t* key, const wchar_t* marker_name) noexcept {
 }
 
 void load_settings() noexcept {
+    g_extended = optional_feature(L"ExtendedRanges", L"NativeTweaks.ExtendedRanges.ini");
+    const bool highlight = optional_feature(L"HighlightChangedOptions", L"NativeTweaks.HighlightChanged.ini");
+    if (!g_extended) {
+        for (const Scale& scale : g_scales) {
+            g_options[scale.id].minimum = scale.classic_minimum;
+            g_options[scale.id].maximum = scale.classic_maximum;
+            g_options[scale.id].step = scale.classic_step;
+        }
+    }
     for (auto& option : g_options) {
         const int stored = g_config_path.empty() ? option.fallback :
-            static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key, option.fallback,
+            static_cast<int>(GetPrivateProfileIntW(option.general ? L"General" : L"Vanilla", option.key, option.fallback,
                 g_config_path.c_str()));
         option.value = clamp_value(option, stored);
     }
+    // The old optional packages turn these on with a marker file beside the INI.
+    if (g_extended) g_options[extended_ranges].value = 1;
+    if (highlight) g_options[highlight_changed].value = 1;
     // r121: "Skills without FP" became Skill FP cost at 0%. An INI from before
     // keeps its choice; the old key is removed once migrated.
     if (!g_config_path.empty() &&
@@ -5335,26 +5592,35 @@ void load_settings() noexcept {
         }
         WritePrivateProfileStringW(L"Vanilla", L"SkillsWithoutFp", nullptr, g_config_path.c_str());
     }
+    for (auto& scale : g_scales) {
+        if (!g_extended) break;
+        const UINT stored = g_config_path.empty() ? 0 :
+            GetPrivateProfileIntW(L"Vanilla", scale.key, 0, g_config_path.c_str());
+        scale.index = static_cast<std::uint8_t>(stored < kScaleCount ? stored : 0);
+    }
 }
 
 DWORD WINAPI save_worker(void*) noexcept {
     // Each WritePrivateProfileStringW rewrites the whole INI, so only the
     // options that changed since the last save are written.
-    int written[count]{};
-    bool known[count]{};
+    const std::size_t total = g_extended ? count + std::size(g_scales) : count;
+    int written[count + std::size(g_scales)]{};
+    bool known[count + std::size(g_scales)]{};
     perf::Loop loop(L"save");
     for (;;) {
         loop.pause();
         WaitForSingleObject(g_save_event, INFINITE);
         Sleep(400);  // Coalesce slider drags into one write.
         loop.resume();
-        for (std::size_t i = 0; i < count; ++i) {
-            const wchar_t* const key = g_options[i].key;
-            const int current = g_options[i].value;
+        for (std::size_t i = 0; i < total; ++i) {
+            const bool is_scale = i >= count;
+            const wchar_t* const key = is_scale ? g_scales[i - count].key : g_options[i].key;
+            const int current = is_scale ? g_scales[i - count].index : static_cast<int>(g_options[i].value);
             if (known[i] && written[i] == current) continue;
             wchar_t value[12]{};
             swprintf_s(value, L"%d", current);
-            if (WritePrivateProfileStringW(L"Vanilla", key, value, g_config_path.c_str())) {
+            const wchar_t* const section = !is_scale && g_options[i].general ? L"General" : L"Vanilla";
+            if (WritePrivateProfileStringW(section, key, value, g_config_path.c_str())) {
                 written[i] = current;
                 known[i] = true;
             }
@@ -5433,9 +5699,64 @@ void set_row_default(Id id, erui::RowHandle row, std::int64_t value) noexcept {
         (void)g_set_default(g_registration->provider_handle(), row, value);
 }
 
+// The slider position that gives the game default under the current scale,
+// so the label colour follows the effective value.
+void sync_scaled_default(const Scale& scale) noexcept {
+    const auto& option = g_options[scale.id];
+    if (!g_set_default || !g_registration || option.row == ERUI_INVALID_ROW) return;
+    const int factor = kScaleFactors[scale.index];
+    const int value = clamp_value(option, (option.fallback + factor / 2) / factor);
+    set_row_default(scale.id, option.row, value);
+}
+
+// Fork export (r108; numeric sliders accepted since r119): relabels every
+// position so a scaled slider shows the value it applies (250% at x10 reads
+// 2500%). An older fork rejects numeric rows and keeps the base value.
+using SetSliderTextsFn = ERUI_Result (ERUI_CALL*)(ERUI_ProviderHandle, ERUI_RowHandle,
+    const ERUI_Utf16View*, std::uint32_t);
+SetSliderTextsFn g_set_slider_texts{};
+
+void sync_scaled_texts(const Scale& scale) noexcept {
+    const auto& option = g_options[scale.id];
+    if (!g_set_slider_texts || !g_registration || option.row == ERUI_INVALID_ROW) return;
+    try {
+        const int factor = kScaleFactors[scale.index];
+        std::vector<std::wstring> texts;
+        for (int value = option.minimum; value <= option.maximum; value += option.step)
+            texts.push_back(std::to_wstring(value * factor) + option.suffix);
+        std::vector<ERUI_Utf16View> views(texts.size());
+        for (std::size_t k = 0; k < texts.size(); ++k) {
+            views[k].data = reinterpret_cast<const std::uint16_t*>(texts[k].c_str());
+            views[k].length = static_cast<std::uint32_t>(texts[k].size());
+        }
+        (void)g_set_slider_texts(g_registration->provider_handle(), option.row, views.data(),
+            static_cast<std::uint32_t>(views.size()));
+    } catch (...) {
+    }
+}
+
+void ERUI_CALL scale_changed(void* target, const ERUI_CustomSliderChangeContext* context) noexcept {
+    auto* scale = static_cast<Scale*>(target);
+    if (!scale || !context || context->index >= kScaleCount) return;
+    scale->index = static_cast<std::uint8_t>(context->index);
+    sync_scaled_default(*scale);
+    sync_scaled_texts(*scale);
+    apply(scale->id);
+    request_save();
+}
+
 void restore_option(Id i) noexcept {
     auto& option = g_options[i];
     option.value = option.fallback;
+    Scale* const scale = scale_of(i);
+    if (scale) {
+        const bool was_scaled = scale->index != 0;
+        scale->index = 0;
+        sync_scaled_default(*scale);
+        if (was_scaled) sync_scaled_texts(*scale);
+        if (g_registration && scale->row != ERUI_INVALID_ROW)
+            (void)g_registration->set_custom_slider_index(scale->row, 0);
+    }
     apply(i);
     if (!g_registration || option.row == ERUI_INVALID_ROW) return;
     if (option.kind == Kind::toggle)
@@ -5447,7 +5768,8 @@ void restore_option(Id i) noexcept {
 }
 
 void ERUI_CALL restore_defaults(void*) noexcept {
-    for (std::size_t i = 0; i < count; ++i) restore_option(static_cast<Id>(i));
+    for (std::size_t i = 0; i < count; ++i)
+        if (!g_options[i].general) restore_option(static_cast<Id>(i));
     request_save();
     log(L"Vanilla settings restored to game defaults.");
 }
@@ -6523,7 +6845,7 @@ void start_thread(LPTHREAD_START_ROUTINE routine, const wchar_t* name) noexcept 
 struct Text { const wchar_t* label; const wchar_t* help; };
 
 enum Category : std::size_t {
-    cat_survival, cat_equipment, cat_resources, cat_movement, cat_torrent, cat_dealt, cat_taken, cat_poise,
+    cat_survival, cat_equipment, cat_resources, cat_movement, cat_defense, cat_torrent, cat_dealt, cat_taken, cat_poise,
     cat_status, cat_weapon, cat_buffs, cat_enemies, cat_spirits, cat_runes, cat_map, cat_world, cat_camera,
     cat_image, cat_display, cat_interface, cat_count
 };
@@ -6545,20 +6867,21 @@ const Texts kEnglish{
         {L"Survival", L"Invincibility, no death, fall damage, maximum HP, FP and stamina, regeneration and flasks."},
         {L"Equipment", L"Equipment and weapon weight, stat requirements, spell slots, carry limits and helmet."},
         {L"Resources & Costs", L"Infinite stamina, FP, items and ammunition, and what actions cost."},
-        {L"Movement & Speed", L"Your animation speed, overall and per action, dodge invincibility, the parry window, and how high and far you jump."},
+        {L"Movement & Speed", L"Your animation speed, overall and per action, and how high and far you jump."},
+        {L"Dodge & Defence", L"Longer dodge invincibility and parry window, perfect guard, and protection while knocked down or using items."},
         {L"Torrent", L"Torrent's survival, running and jumping."},
         {L"Damage Dealt", L"Your damage, per element, stat scaling, knockback and one-hit kills."},
-        {L"Damage Taken", L"Enemy damage to you, per element, knockback, guarding and one-hit deaths."},
+        {L"Damage Taken", L"Enemy damage to you, per element, knockback and one-hit deaths."},
         {L"Poise", L"Your poise and enemies' poise, and the poise damage both sides deal."},
         {L"Status Effects", L"How fast each status builds up for everyone, your immunity and enemy immunities."},
         {L"Weapon Effects", L"Add status effects to your attacks, each with its own switch."},
         {L"Buffs & Durations", L"How long buffs, greases and enemy debuffs last, or make them permanent."},
-        {L"Enemies", L"Enemy health, speed, behaviour, respawns and lock-on."},
+        {L"Enemies", L"Enemy health, speed, behaviour and respawns."},
         {L"Spirit Ashes", L"Summoning cost, several spirits at once, and where and when they can be called."},
         {L"Runes, Shops & Upgrades", L"Runes, item drops, shop prices, upgrades and crafting."},
         {L"Map & Travel", L"Graces, map reveal, fast travel, and the mirror and rebirth anywhere."},
         {L"World", L"Time of day and weather."},
-        {L"Camera", L"Field of view and camera behaviour."},
+        {L"Camera", L"Field of view, camera behaviour and lock-on."},
         {L"Image", L"Post-processing and level of detail."},
         {L"Display", L"Frame rate, refresh rate and aspect ratio."},
         {L"Interface & System", L"HUD and menu layout, pause, startup logos and Yes/No dialogs."},
@@ -6628,7 +6951,7 @@ const Texts kEnglish{
         {L"Fast travel anywhere", L"Allows fast travel from inside legacy dungeons and other closed areas. Nearby enemies still block it."},
         {L"Resummon without resting", L"After a spirit falls you can call it again without resting at a grace. Turning it off restores the usual limit."},
         {L"Summon anywhere", L"Every summoning monument reaches across its whole area, so you can summon wherever the game allows spirits, and ashes are no longer dismissed for walking away from it. Turning it off restores the usual reach."},
-        {L"Several ashes at once", L"Multiple Spirit Ashes, built in. Using a different spirit ash keeps the ones already summoned, each paying its FP; using a summoned ash's item again dismisses only that one with a short fade, even with too little FP. No confirmations appear, summoned ashes follow you into new areas and through doors, and each gets a compact row with its name and HP on the HUD (up to 6; the rows need the option on when the game starts). Off, summoning works as in the base game."},
+        {L"Several ashes at once", L"Multiple Spirit Ashes, built in. Using a different spirit ash keeps the ones already summoned, each paying its FP; using a summoned ash's item again dismisses only that one with a short fade, even with too little FP. No confirmations appear, summoned ashes follow you into new areas and through doors, and each gets a compact row with its name and HP on the HUD (up to 7; the rows need the option on when the game starts). Off, summoning works as in the base game."},
         {L"Most ashes at once", L"How many spirit ashes can be summoned together with Several ashes at once. A summon with several spirits counts as one. The HUD shows up to 6; many ashes can lower performance."},
         {L"Ashes stay after a boss falls", L"Monuments tied to a boss no longer dismiss your spirit ashes when it dies, and stay usable afterwards, also in arenas of bosses you already beat. Applies after the area reloads (rest at a grace)."},
         {L"Dismiss all ashes", L"With Several ashes at once, dismisses every summoned spirit ash with a short fade. Works as a button; it can also be bound to a key in [Hotkeys] of NativeTweaks.ini (SpiritDismissAll = F5)."},
@@ -6720,6 +7043,9 @@ const Texts kEnglish{
         {L"Parry window (%) (beta)", L"BETA: makes the parry window of shields and parry skills last longer. 100% is the game's; 200% doubles it. The extra time follows the parry's own window. Your character only."},
         {L"Invincible while knocked down (beta)", L"BETA: hits do not hurt you while a big hit has you on the ground, getting up included, as during a roll. Big knockdowns only, not grabs. Your character only."},
         {L"Super armour while using items (beta)", L"BETA: the game's super armour while you drink a flask or use an item: weaker hits no longer interrupt you, very strong ones still can, and you still take the damage. Your character only."},
+        {L"Extended ranges", L"Off by default. Many sliders of this menu go further and get a Scale row (x1 to x100) under them that multiplies their value. Applies when you restart the game."},
+        {L"Highlight changed options", L"Off by default. The names of options set away from the game's default are coloured, so you can see at a glance what you changed. Applies at once."},
+        {L"Same ash again", L"With Several ashes at once, using a summoned spirit ash's item summons it once more instead of dismissing it, so you can have the same ash several times; each one pays its FP. Dismiss all ashes removes them. Off by default: the item dismisses that ash."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -6732,20 +7058,21 @@ const Texts kSpanish{
         {L"Supervivencia", L"Invencibilidad, no morir, daño por caída, vida, PC y aguante máximos, regeneración y frascos."},
         {L"Equipo", L"Peso del equipo y de las armas, requisitos de atributos, ranuras de hechizos, límite de objetos y casco."},
         {L"Recursos y costes", L"Aguante, PC, objetos y munición infinitos, y lo que cuestan las acciones."},
-        {L"Movimiento y velocidad", L"Tu velocidad de animación, general y por acción, la invencibilidad al esquivar, la ventana de parada y la altura y distancia de tus saltos."},
+        {L"Movimiento y velocidad", L"Tu velocidad de animación, general y por acción, y la altura y distancia de tus saltos."},
+        {L"Esquiva y defensa", L"Más invencibilidad al esquivar y ventana de parada, guardia perfecta, y protección derribado o al usar objetos."},
         {L"Torrent", L"Supervivencia, carrera y saltos de Torrent."},
         {L"Daño infligido", L"Tu daño, por elemento, escalado de atributos, retroceso y matar de un golpe."},
-        {L"Daño recibido", L"El daño enemigo que recibes, por elemento, retroceso, bloqueo y morir de un golpe."},
+        {L"Daño recibido", L"El daño enemigo que recibes, por elemento, retroceso y morir de un golpe."},
         {L"Equilibrio", L"Tu equilibrio y el de los enemigos, y el daño al equilibrio de ambos lados."},
         {L"Estados alterados", L"Acumulación de cada estado para todos, tu inmunidad y la de los enemigos."},
         {L"Efectos de arma", L"Añade estados alterados a tus ataques, cada uno con su interruptor."},
         {L"Mejoras y duraciones", L"Cuánto duran las mejoras, grasas y efectos sobre enemigos, o hacerlos permanentes."},
-        {L"Enemigos", L"Vida, velocidad, comportamiento, reaparición y fijado de los enemigos."},
+        {L"Enemigos", L"Vida, velocidad, comportamiento y reaparición de los enemigos."},
         {L"Cenizas espirituales", L"Coste de invocación, varias cenizas a la vez y dónde y cuándo puedes llamar a los espíritus."},
         {L"Runas, tiendas y mejoras", L"Runas, objetos que sueltan los enemigos, precios de tiendas, mejoras y fabricación."},
         {L"Mapa y viaje", L"Gracias, mapa revelado, viaje rápido, y el espejo y el renacimiento en cualquier lugar."},
         {L"Mundo", L"Hora del día y clima."},
-        {L"Cámara", L"Campo de visión y comportamiento de la cámara."},
+        {L"Cámara", L"Campo de visión, comportamiento de la cámara y fijado de objetivo."},
         {L"Imagen", L"Posprocesado y nivel de detalle."},
         {L"Pantalla", L"FPS, frecuencia de refresco y relación de aspecto."},
         {L"Interfaz y sistema", L"Disposición del HUD y los menús, pausa, logos de inicio y preguntas Sí/No."},
@@ -6815,7 +7142,7 @@ const Texts kSpanish{
         {L"Viaje rápido en cualquier sitio", L"Permite viajar desde dentro de mazmorras legado y otras zonas cerradas. Los enemigos cercanos aún lo impiden."},
         {L"Reinvocar sin descansar", L"Tras caer una ceniza puedes volver a invocarla sin descansar en una gracia. Al desactivarlo vuelve el límite original."},
         {L"Invocar en cualquier lugar", L"Cada monumento de invocación alcanza toda su zona, así que puedes invocar donde el juego permita espíritus, y las cenizas ya no se retiran por alejarte de él. Al desactivarla vuelve el alcance original."},
-        {L"Varias cenizas a la vez", L"Multiple Spirit Ashes, integrado. Al usar otra ceniza espiritual se quedan las que ya están invocadas, y cada una cobra sus PC; volver a usar el objeto de una invocada retira solo esa con un fundido corto, aunque no tengas PC. No salen confirmaciones, las cenizas te siguen al cambiar de zona y al cruzar puertas, y cada una tiene una fila con su nombre y su vida en el HUD (hasta 6; las filas necesitan la opción activada al arrancar el juego). Desactivada, invocar funciona como en el juego original."},
+        {L"Varias cenizas a la vez", L"Multiple Spirit Ashes, integrado. Al usar otra ceniza espiritual se quedan las que ya están invocadas, y cada una cobra sus PC; volver a usar el objeto de una invocada retira solo esa con un fundido corto, aunque no tengas PC. No salen confirmaciones, las cenizas te siguen al cambiar de zona y al cruzar puertas, y cada una tiene una fila con su nombre y su vida en el HUD (hasta 7; las filas necesitan la opción activada al arrancar el juego). Desactivada, invocar funciona como en el juego original."},
         {L"Máximo de cenizas a la vez", L"Cuántas cenizas espirituales puedes tener invocadas juntas con «Varias cenizas a la vez». Una invocación de varios espíritus cuenta como una. El HUD muestra hasta 6; muchas cenizas pueden bajar el rendimiento."},
         {L"Las cenizas se quedan al vencer al jefe", L"Los monumentos ligados a un jefe ya no retiran tus cenizas cuando muere y siguen activos después, también en las salas de jefes que ya venciste. Se aplica al recargar la zona (descansa en una gracia)."},
         {L"Retirar todas las cenizas", L"Con «Varias cenizas a la vez», retira todas las cenizas invocadas con un fundido corto. Funciona como un botón; también puedes asignarle una tecla en [Hotkeys] de NativeTweaks.ini (SpiritDismissAll = F5)."},
@@ -6907,6 +7234,9 @@ const Texts kSpanish{
         {L"Ventana de parada (%) (beta)", L"BETA: alarga la ventana de parada de los escudos y las habilidades de parada. El 100 % es la del juego; el 200 % la duplica. El tiempo extra sigue a la ventana de la propia parada. Solo para tu personaje."},
         {L"Invencible mientras estás derribado (beta)", L"BETA: los golpes no te hacen daño mientras un golpe fuerte te tiene en el suelo, incluido el levantarte, como durante una voltereta. Solo los derribos fuertes, no los agarres. Solo para tu personaje."},
         {L"Superarmadura al usar objetos (beta)", L"BETA: la superarmadura del juego mientras bebes un frasco o usas un objeto: los golpes más débiles ya no te interrumpen, los muy fuertes sí pueden, y el daño lo recibes igual. Solo para tu personaje."},
+        {L"Rangos ampliados", L"Desactivado por defecto. Muchos deslizadores de este menú llegan más lejos y tienen debajo una fila de Escala (x1 a x100) que multiplica su valor. Se aplica al reiniciar el juego."},
+        {L"Resaltar opciones cambiadas", L"Desactivado por defecto. Los nombres de las opciones que no están en el valor del juego salen en color, para ver de un vistazo qué has cambiado. Se aplica al momento."},
+        {L"Repetir la misma ceniza", L"Con «Varias cenizas a la vez», usar el objeto de una ceniza ya invocada la invoca otra vez en lugar de retirarla, para tener la misma ceniza varias veces; cada una cobra sus PC. «Retirar todas las cenizas» las quita todas. Desactivada por defecto: el objeto retira esa ceniza."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -6919,20 +7249,21 @@ const Texts kChinese{
         {L"生存", L"无敌、不会死亡、坠落伤害、最大血量、FP 与精力、回复和圣杯瓶。"},
         {L"装备", L"装备与武器重量、能力值需求、法术栏位、携带上限和头盔。"},
         {L"资源与消耗", L"无限精力、FP、道具与弹药，以及各种行动的消耗。"},
-        {L"移动与速度", L"你的动作速度（整体和各类动作）、闪避无敌时间、弹反判定时间，以及跳跃高度与距离。"},
+        {L"移动与速度", L"你的动作速度（整体和各类动作），以及跳跃高度与距离。"},
+        {L"闪避与防御", L"更长的闪避无敌与弹反判定、完美防御，以及倒地或使用道具时的保护。"},
         {L"灵马", L"灵马的生存、奔跑与跳跃。"},
         {L"造成伤害", L"你的伤害、各属性伤害、能力补正、击退和一击必杀。"},
-        {L"受到伤害", L"你受到的敌人伤害、各属性伤害、击退、格挡和一击即死。"},
+        {L"受到伤害", L"你受到的敌人伤害、各属性伤害、击退和一击即死。"},
         {L"韧性", L"你和敌人的韧性，以及双方造成的削韧。"},
         {L"异常状态", L"所有人的异常状态累积速度、你的免疫和敌人免疫。"},
         {L"武器效果", L"为你的攻击附加异常状态，每种都有单独的开关。"},
         {L"增益与持续时间", L"增益、油脂和敌人减益的持续时间，或使其永久生效。"},
-        {L"敌人", L"敌人的血量、速度、行为、重生与锁定。"},
+        {L"敌人", L"敌人的血量、速度、行为与重生。"},
         {L"骨灰", L"召唤消耗、同时召唤多个骨灰，以及何时何地可以召唤骨灰。"},
         {L"卢恩、商店与强化", L"卢恩、道具掉落、商店价格、强化与制作。"},
         {L"地图与传送", L"赐福、地图显示、传送，以及随时使用镜子与重生。"},
         {L"世界", L"时间与天气。"},
-        {L"镜头", L"视野与镜头行为。"},
+        {L"镜头", L"视野、镜头行为与锁定。"},
         {L"画面", L"后期处理与细节层次。"},
         {L"显示", L"帧率、刷新率与画面比例。"},
         {L"界面与系统", L"HUD 与菜单布局、暂停、启动标志和是/否对话框。"},
@@ -7002,7 +7333,7 @@ const Texts kChinese{
         {L"任意地点传送", L"允许在传说地下城和其他封闭区域内传送。附近有敌人时仍无法传送。"},
         {L"无需休息即可再次召唤", L"骨灰死亡后无需在赐福休息即可再次召唤。关闭后恢复原版限制。"},
         {L"随处召唤", L"每块召唤碑的范围覆盖其整个区域，只要游戏允许召唤灵体即可召唤，骨灰也不会因你远离召唤碑而被解除。关闭后恢复原版范围。"},
-        {L"同时召唤多个骨灰", L"内置 Multiple Spirit Ashes。使用另一个骨灰时，已召唤的骨灰会保留，且每个都会消耗 FP；再次使用已召唤骨灰的道具会以短暂淡出只解除该骨灰，即使 FP 不足也可以。不会弹出确认，骨灰会跟随你进入新区域和穿过门，并在 HUD 上各有一行名称和生命值（最多 6 行；这些行需要在游戏启动时开启此选项）。关闭后召唤与原版游戏相同。"},
+        {L"同时召唤多个骨灰", L"内置 Multiple Spirit Ashes。使用另一个骨灰时，已召唤的骨灰会保留，且每个都会消耗 FP；再次使用已召唤骨灰的道具会以短暂淡出只解除该骨灰，即使 FP 不足也可以。不会弹出确认，骨灰会跟随你进入新区域和穿过门，并在 HUD 上各有一行名称和生命值（最多 7 行；这些行需要在游戏启动时开启此选项）。关闭后召唤与原版游戏相同。"},
         {L"同时召唤骨灰上限", L"开启“同时召唤多个骨灰”时，最多可同时召唤多少个骨灰。一次召唤多个灵体算作一个。HUD 最多显示 6 个；骨灰过多可能降低性能。"},
         {L"击败首领后骨灰保留", L"与首领绑定的召唤碑在首领死亡后不再解除你的骨灰，之后仍可使用，已击败首领的场地也一样。区域重新载入后生效（在赐福处休息）。"},
         {L"解除全部骨灰", L"开启“同时召唤多个骨灰”时，以短暂淡出解除所有已召唤的骨灰。像按钮一样使用；也可以在 NativeTweaks.ini 的 [Hotkeys] 中绑定按键（SpiritDismissAll = F5）。"},
@@ -7094,6 +7425,9 @@ const Texts kChinese{
         {L"弹反判定时间 (%)（测试版）", L"测试版：延长盾牌和弹反类战技的弹反判定时间。100% 为游戏原本的时间；200% 为两倍。额外时间紧接弹反本身的判定时间。仅对你的角色生效。"},
         {L"倒地时无敌（测试版）", L"测试版：被重击击倒在地时（包括起身）不会受到伤害，与翻滚时相同。仅限重击倒地，不含抓取。仅对你的角色生效。"},
         {L"使用道具时霸体（测试版）", L"测试版：喝圣杯瓶或使用道具时获得游戏的霸体：较弱的攻击不再打断你，极强的攻击仍可能打断，伤害照常承受。仅对你的角色生效。"},
+        {L"扩展范围", L"默认关闭。此菜单中的许多滑块可调范围更大，下方另有一行“倍率”（x1 至 x100）用于放大数值。重启游戏后生效。"},
+        {L"高亮已更改的选项", L"默认关闭。不在游戏默认值的选项名称会以颜色显示，一眼就能看出改过什么。立即生效。"},
+        {L"重复召唤同一骨灰", L"开启“同时召唤多个骨灰”时，再次使用已召唤骨灰的道具会再召唤一次，而不是解除它，这样可以同时拥有多个相同的骨灰；每次都会消耗 FP。“解除所有骨灰”可将其全部解除。默认关闭：道具会解除该骨灰。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -7109,14 +7443,15 @@ const Layout kLayout[]{
         carry_max, hide_helmet}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
-    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, dodge_frames, parry_frames, knockdown_invincible, item_super_armor, speed_move, speed_jump, speed_item,
+    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_jump, speed_item,
         jump_height, jump_distance}},
+    {cat_defense, {dodge_frames, parry_frames, perfect_guard, knockdown_invincible, item_super_armor}},
     {cat_torrent, {torrent_no_death, torrent_speed, torrent_jump_speed, torrent_jump_height,
         torrent_jump_distance}},
     {cat_dealt, {damage_dealt, dmg_physical, dmg_magic, dmg_fire, dmg_lightning, dmg_holy, weapon_scaling,
         knockback_dealt, charged_launch, launch_all, launch_distance, one_hit_kill}},
     {cat_taken, {damage_taken, taken_physical, taken_magic, taken_fire, taken_lightning, taken_holy,
-        knockback_taken, perfect_guard, die_one_hit}},
+        knockback_taken, die_one_hit}},
     {cat_poise, {player_poise, player_poise_lock, posture_taken, posture_one_hit_taken, posture_dealt,
         posture_one_hit, enemy_poise, enemy_poise_lock}},
     {cat_status, {status_buildup, buildup_bleed, buildup_poison, buildup_rot, buildup_frost, buildup_sleep,
@@ -7124,23 +7459,25 @@ const Layout kLayout[]{
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, buff_enemy}},
     {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemies_no_attack, enemies_no_move,
-        enemies_no_ai, enemies_no_respawn, enemies_downed_vulnerable, enemies_no_lock_on}},
-    {cat_spirits, {ash_cost, ash_multiple, ash_max_active, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
+        enemies_no_ai, enemies_no_respawn, enemies_downed_vulnerable}},
+    {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
     {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
-    {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off}},
+    {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on}},
     {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance,
         clean_characters, hide_buff_effects, hide_weapon_buff_effects}},
     {cat_display, {fps_unlock, fps_limit, refresh_rate, ultrawide}},
-    {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default}},
+    {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default,
+        extended_ranges, highlight_changed}},
 };
 
 void ERUI_CALL restore_page_defaults(void* target) noexcept {
     const auto* layout = static_cast<const Layout*>(target);
     if (!layout) return;
-    for (const Id i : layout->ids) restore_option(i);
+    for (const Id i : layout->ids)
+        if (!g_options[i].general) restore_option(i);
     request_save();
     log(L"Vanilla settings: one page restored to game defaults.");
 }
@@ -7162,6 +7499,13 @@ Id find_option(std::wstring_view key) noexcept {
     return count;
 }
 
+Scale* find_scale(std::wstring_view key) noexcept {
+    if (!g_extended) return nullptr;
+    for (Scale& scale : g_scales)
+        if (same_key(scale.key, key)) return &scale;
+    return nullptr;
+}
+
 // Pushes an option's current value to its menu row (when the menu exists).
 void refresh_row(Id i) noexcept {
     const auto& option = g_options[i];
@@ -7174,7 +7518,16 @@ void refresh_row(Id i) noexcept {
         (void)g_registration->set_numeric_slider_value(option.row, option.value);
 }
 
-// Sets an option's slider/toggle value.
+void set_scale_index(Scale& scale, std::uint8_t index) noexcept {
+    if (index >= kScaleCount || scale.index == index) return;
+    scale.index = index;
+    sync_scaled_default(scale);
+    sync_scaled_texts(scale);
+    if (g_registration && scale.row != ERUI_INVALID_ROW)
+        (void)g_registration->set_custom_slider_index(scale.row, index);
+}
+
+// Sets an option's raw slider/toggle value (not multiplied by its scale).
 bool set_option_raw(Id i, int value) noexcept {
     if (i >= count || !available(i)) return false;
     auto& option = g_options[i];
@@ -7198,9 +7551,12 @@ bool hotkey_get(std::wstring_view key, int& value) noexcept {
     return true;
 }
 
+// Hotkey values are effective values: a scaled slider goes back to x1 first
+// so "> 200" always means 200 %.
 bool hotkey_set(std::wstring_view key, int value, int& applied) noexcept {
     const Id i = find_option(key);
     if (i >= count || !available(i)) return false;
+    if (Scale* const scale = scale_of(i)) set_scale_index(*scale, 0);
     if (!set_option_raw(i, value)) return false;
     request_save();
     applied = value_of(i);
@@ -7252,7 +7608,11 @@ bool write_profile(int slot) {
     std::wstring text = L"\xFEFF; NativeTweaks Vanilla Settings profile. Edit Name freely; keys left out\r\n"
         L"; are not changed when the profile is loaded.\r\n[Profile]\r\nName=" + name + L"\r\n[Vanilla]\r\n";
     for (std::size_t i = 0; i < count; ++i)
-        text += std::wstring(g_options[i].key) + L"=" + std::to_wstring(g_options[i].value) + L"\r\n";
+        if (!g_options[i].general)
+            text += std::wstring(g_options[i].key) + L"=" + std::to_wstring(g_options[i].value) + L"\r\n";
+    if (g_extended)
+        for (const Scale& scale : g_scales)
+            text += std::wstring(scale.key) + L"=" + std::to_wstring(scale.index) + L"\r\n";
     const std::wstring path = profile_path(slot);
     const std::wstring temporary = path + L".tmp";
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -7285,18 +7645,25 @@ bool load_profile_slot(int slot) noexcept {
         std::vector<wchar_t> section(65536);
         const DWORD length = GetPrivateProfileSectionW(L"Vanilla", section.data(),
             static_cast<DWORD>(section.size()), path.c_str());
-        // Profiles saved with the old extended ranges also hold "...Scale" keys:
-        // they match no option and are skipped.
-        for (const wchar_t* line = section.data(); line < section.data() + length && *line;
-             line += std::wcslen(line) + 1) {
-            const std::wstring_view entry(line);
-            const std::size_t equals = entry.find(L'=');
-            if (equals == entry.npos) continue;
-            const std::wstring key(entry.substr(0, equals));
-            const std::wstring value_text(entry.substr(equals + 1));
-            int value{};
-            if (!parse_profile_int(value_text.c_str(), value)) continue;
-            (void)set_option_raw(find_option(key), value);
+        // Scales first, so the slider values that follow are read at x1..x100.
+        for (int pass = 0; pass < 2; ++pass) {
+            for (const wchar_t* line = section.data(); line < section.data() + length && *line;
+                 line += std::wcslen(line) + 1) {
+                const std::wstring_view entry(line);
+                const std::size_t equals = entry.find(L'=');
+                if (equals == entry.npos) continue;
+                const std::wstring key(entry.substr(0, equals));
+                const std::wstring value_text(entry.substr(equals + 1));
+                int value{};
+                if (!parse_profile_int(value_text.c_str(), value)) continue;
+                if (Scale* const scale = find_scale(key)) {
+                    if (pass == 0 && value >= 0 && value < static_cast<int>(kScaleCount))
+                        set_scale_index(*scale, static_cast<std::uint8_t>(value));
+                    continue;
+                }
+                const Id id = find_option(key);
+                if (pass == 1 && id < count && !g_options[id].general) (void)set_option_raw(id, value);
+            }
         }
         request_save();
         log((L"Vanilla settings: profile slot " + std::to_wstring(slot) + L" loaded.").c_str());
@@ -7579,11 +7946,23 @@ void attach_registration(const erui::Registration* registration) noexcept {
     const HMODULE host = GetModuleHandleW(L"ERNativeUI.dll");
     const auto set_default = host
         ? reinterpret_cast<SetRowDefaultFn>(GetProcAddress(host, "ERNativeUIFork_SetRowDefault")) : nullptr;
-    // Optional (off by default): [General] HighlightChangedOptions = 1, or the
-    // optional package's marker file NativeTweaks.HighlightChanged.ini beside
-    // NativeTweaks.ini (so installing it never replaces the user's INI).
-    const bool enabled = optional_feature(L"HighlightChangedOptions", L"NativeTweaks.HighlightChanged.ini");
-    if (!registration || !set_default || !enabled) return;
+    // Scaled sliders show the applied value whether or not labels are coloured.
+    g_set_slider_texts = host
+        ? reinterpret_cast<SetSliderTextsFn>(GetProcAddress(host, "ERNativeUIFork_SetCustomSliderValues")) : nullptr;
+    if (registration)
+        for (const Scale& scale : g_scales)
+            if (scale.index != 0) sync_scaled_texts(scale);
+    // Highlight changed options (off by default): the menu switch, [General]
+    // HighlightChangedOptions = 1, or the old optional package's marker file
+    // NativeTweaks.HighlightChanged.ini beside NativeTweaks.ini. With the live
+    // switch the defaults are always registered and the colours turned on or
+    // off; before registering, so nothing is coloured for a frame.
+    const bool enabled = value_of(highlight_changed) != 0;
+    const auto set_highlight = host
+        ? reinterpret_cast<SetHighlightEnabledFn>(GetProcAddress(host, "ERNativeUIFork_SetHighlightEnabled")) : nullptr;
+    if (!registration || !set_default || (!enabled && !set_highlight)) return;
+    if (set_highlight) (void)set_highlight(enabled ? 1u : 0u);
+    g_set_highlight = set_highlight;
     const auto set_default_ex =
         reinterpret_cast<SetRowDefaultExFn>(GetProcAddress(host, "ERNativeUIFork_SetRowDefaultEx"));
     std::size_t failures{};
@@ -7600,6 +7979,11 @@ void attach_registration(const erui::Registration* registration) noexcept {
     }
     g_set_default = set_default;
     g_set_default_ex = set_default_ex;
+    for (const Scale& scale : g_scales) {
+        if (scale.row == ERUI_INVALID_ROW) continue;
+        if (set_default(registration->provider_handle(), scale.row, 0) != ERUI_OK) ++failures;
+        sync_scaled_default(scale);
+    }
     if (failures) log(L"Vanilla settings: some default values were not accepted by ERNativeUI.");
 }
 
@@ -7667,6 +8051,28 @@ constexpr const wchar_t* kJourneyChinese[kJourneyCount]{
 constexpr const wchar_t* kWeatherChinese[kWeatherCount]{
     L"晴天", L"晴朗", L"少云", L"多云", L"雨", L"雨云", L"风雨", L"风雾", L"雪",
     L"大雪", L"雾", L"浓雾", L"大风多云", L"雨雾", L"雪雾", L"阵雨"};
+
+// Row under a scaled slider.
+Text builtin_scale_text(std::string_view lang) noexcept {
+    if (lang == "es")
+        return {L"    Escala", L"Multiplica el valor del control de arriba. Por ejemplo, 250% con ×10 aplica 2500%."};
+    if (lang == "zh") return {L"    倍率", L"将上方数值乘以此倍率。例如 250% ×10 即为 2500%。"};
+    if (lang == "zht") return {L"    倍率", L"將上方數值乘以此倍率。例如 250% ×10 即為 2500%。"};
+    return {L"    Scale", L"Multiplies the value above. For example, 250% at ×10 applies 2500%."};
+}
+
+Text scale_text(std::string_view lang) noexcept {
+    const Text english = builtin_scale_text("en");
+    const Text text = builtin_scale_text(lang);
+    return {translate_text(lang, english.label, text.label),
+        translate_text(lang, english.help, text.help)};
+}
+
+std::vector<std::wstring> scale_names() {
+    std::vector<std::wstring> names;
+    for (const int factor : kScaleFactors) names.push_back(L"×" + std::to_wstring(factor));
+    return names;
+}
 
 std::vector<std::wstring> value_names(std::string_view lang, Id i) {
     if (!is_named(i)) return {};
@@ -7812,6 +8218,22 @@ void add_pages(erui::Page& parent, const char* language) noexcept {
                 const char* const code = complete ? l : "en";                return live_text::Texts{texts_for(code).options[i].label, option_help(code, i), {}, {},
                     value_names(l, i)};
             });
+            if (Scale* const scale = scale_of(i)) {
+                const std::vector<std::wstring> names = scale_names();
+                const Text text = scale_text(lang);
+                erui::CustomSliderOptions slider{};
+                slider.value_count = static_cast<std::uint32_t>(names.size());
+                slider.initial_index = scale->index;
+                slider.enabled = ok;
+                slider.format_value = [&names](std::uint32_t index, std::uint32_t) {
+                    return names[index];
+                };
+                scale->row = page.add_custom_slider(text.label, text.help, slider, &scale_changed, scale);
+                live_text::track_row(scale->row, [](const char* l) {
+                    const Text x = scale_text(l);
+                    return live_text::Texts{x.label, x.help, {}, {}, scale_names()};
+                });
+            }
         }
         const auto page_restore = page.add_button(t.restore_page.label, t.restore_page.help,
             &restore_page_defaults, const_cast<Layout*>(&layout));

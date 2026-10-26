@@ -34,7 +34,7 @@ namespace {
 HMODULE g_own_module{};
 erui::Registration g_registration{};
 // Build tag shown in the log and, with ERUI 1.3, on the title screen.
-constexpr wchar_t kBuildTag[] = L"r139";
+constexpr wchar_t kBuildTag[] = L"r140";
 SRWLOCK g_settings_lock = SRWLOCK_INIT;
 SRWLOCK g_save_lock = SRWLOCK_INIT;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
@@ -435,10 +435,14 @@ void track_submenu_texts(const erui::Page& page, TextField label, TextField help
 // game thread, only formats the line and appends it to a buffer: opening and
 // writing the file goes through MO2's virtual file system and must never
 // hold up the game (stutter reports, r129).
+// Until initialization ends every line is written at once instead, so a crash
+// at game launch still leaves the lines before it (Linux/Proton report, r139).
 constexpr std::size_t kLogBufferLimit = std::size_t{1} << 20;
 std::string g_log_pending{};  // UTF-8 lines not written yet
 std::size_t g_log_dropped{};
 HANDLE g_log_event{};
+HANDLE g_log_startup_file{INVALID_HANDLE_VALUE};
+std::atomic_bool g_log_startup{};
 
 HANDLE open_log_file() noexcept {
     return CreateFileW(g_log_path.c_str(), FILE_APPEND_DATA,
@@ -501,6 +505,14 @@ void log_message(const wchar_t* message) noexcept {
                 utf8.data(), required, nullptr, nullptr) != required) return;
 
         AcquireSRWLockExclusive(&g_log_lock);
+        if (g_log_startup.load(std::memory_order_acquire) &&
+            g_log_startup_file != INVALID_HANDLE_VALUE && utf8.size() <= MAXDWORD) {
+            DWORD written{};
+            (void)WriteFile(g_log_startup_file, utf8.data(),
+                static_cast<DWORD>(utf8.size()), &written, nullptr);
+            ReleaseSRWLockExclusive(&g_log_lock);
+            return;
+        }
         if (g_log_pending.size() + utf8.size() <= kLogBufferLimit) {
             g_log_pending.append(utf8);
         } else {
@@ -543,6 +555,9 @@ void initialize_logging() noexcept {
             return;
         }
         CloseHandle(writer);
+        g_log_startup_file = open_log_file();
+        g_log_startup.store(g_log_startup_file != INVALID_HANDLE_VALUE,
+            std::memory_order_release);
         g_log_enabled = true;
         log_message(L"Diagnostic logging enabled; startup worker running.");
     } catch (...) {
@@ -3062,7 +3077,23 @@ DWORD WINAPI late_module_check(void*) noexcept {
     return 0;
 }
 
+// Hands the log to its writer thread once initialization has ended.
+void end_startup_logging() noexcept {
+    AcquireSRWLockExclusive(&g_log_lock);
+    g_log_startup.store(false, std::memory_order_release);
+    if (g_log_startup_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_log_startup_file);
+        g_log_startup_file = INVALID_HANDLE_VALUE;
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
+}
+
+struct StartupLogScope {
+    ~StartupLogScope() { end_startup_logging(); }
+};
+
 DWORD WINAPI initialize_mod(void*) noexcept {
+    const StartupLogScope startup_log{};
     try {
         initialize_logging();
         log_message((std::wstring(L"NativeTweaks initialization started (build ") + kBuildTag + L", vanilla settings, weapon effects, hotkeys, vanilla profiles, INI templates, lang files, profiles, en/es/zh/zht).").c_str());

@@ -21,6 +21,7 @@ struct Settings {
     bool hud_rows;           // compact HUD rows (read at startup)
     std::uint32_t extra_cost_percent;        // FP cost of each additional ash (100 = native)
     std::uint32_t damage_reduction_percent;  // damage lost per extra living ash (0 = native)
+    bool repeat_same_ash;    // a summoned ash's item summons it again instead of dismissing it
 };
 
 // Once, early (the HUD hook must be in before the HUD movie opens). False when
@@ -38,6 +39,10 @@ void dismiss_all() noexcept;
 // 1 = mirror (appearance), 3 = rebirth.
 // False when the game version or its task scheduler isn't supported.
 bool open_game_menu(int kind) noexcept;
+
+// Summon anywhere beyond the monument's own map tile: while the game finds no
+// summoning monument near the player, the last one it found is kept.
+void set_summon_anywhere(bool enabled) noexcept;
 // 0 none yet, 1 opened, 2 no character loaded, 3 refused by the game.
 int game_menu_last_result() noexcept;
 
