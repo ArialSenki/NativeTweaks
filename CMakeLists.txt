@@ -21,6 +21,9 @@ set_target_properties(NativeTweaks PROPERTIES
 
 if(MSVC)
     target_compile_options(NativeTweaks PRIVATE /W4 /permissive- /utf-8)
+    # MSVC 14.40+ makes std::mutex constexpr, which an older MSVCP140.dll
+    # (common in Proton/Wine prefixes) cannot lock: keep the old constructor.
+    target_compile_definitions(NativeTweaks PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 endif()
 
 # Multiple Spirit Ashes (Rust, msa\) is linked in as a static library; cargo

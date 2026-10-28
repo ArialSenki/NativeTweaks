@@ -30,6 +30,7 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <tuple>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -260,11 +261,17 @@ Site g_summon_area_item{L"summoning area (items)",
 // slot means no body, with the FP already spent (r140 test: Lone Wolf Ashes
 // gave 1 wolf of 3 with 9 bodies out, Black Knife Tiche none with 10).
 // With several ashes at once:
-// - the set is created with 520 entries (+0x495590 allocates 80 * 16 bytes
-//   through the game's allocator and builds 80 entries): patched when the Hub
-//   starts, before the game creates it, so the game allocates and frees the
-//   larger array itself (moving the array to one of our own corrupted the
-//   heap on the next map load, c0000374);
+// - the set gets 520 entries (+0x495590 allocates 80 * 16 bytes through the
+//   game's allocator and builds 80 entries): a hook on that function's
+//   epilogue, placed when the Hub starts, before the game creates the set,
+//   allocates 520 zeroed entries (what the entry constructor leaves) through
+//   the same allocator and frees the 80, so the game frees the larger array
+//   itself (moving the array to one of our own corrupted the heap on the
+//   next map load, c0000374). r140 rewrote the three sizes in the function's
+//   body instead, and Seamless Co-op 2.0.1, which looks for those bytes
+//   ("BA 00 05 00 00 41 B8 08 ..."), stopped at launch with a fatal error:
+//   the body is left as it is, and a set somebody else already resized
+//   (not 80 entries) is left alone;
 // - the search starts at 20 for everyone and runs over every slot from 20 to
 //   the set's real capacity (a code cave reads it, so a set created before the
 //   patch keeps to its 80): up to 500 bodies.
@@ -278,15 +285,16 @@ Site g_buddy_slot_start{L"spirit slots (start)",
 Site g_buddy_slot_loop{L"spirit slots (search)",
     "41 83 f9 0a 7d 0a 43 8d 3c 11 49 8d 1c 12 eb 0e 41 8d 7a f6 41 03 f9 49 8d 5a f6 48 03 da 48 03 d9 48 c1 e3 04 49 03 d8 4c 39 3b 74 14 41 ff c1 48 ff c1 48 83 f9 0a 7c c7 49 8b c7",
     0, "41 83 f9 0a 7d 0a 43 8d 3c 11 49 8d 1c 12 eb 0e 41 8d 7a f6 41 03 f9 49 8d 5a f6 48 03 da 48 03 d9 48 c1 e3 04 49 03 d8 4c 39 3b 74 14 41 ff c1 48 ff c1 48 83 f9 0a 7c c7", std::vector<std::uint8_t>(57, 0x90)};
+// From "mov rcx,[allocator]" to the function's ret; the hook goes on the
+// epilogue (+0x6B) and its replacement (a jump to the cave) is built on start.
 constexpr const char* kBuddySetInit =
-    "ba 00 05 00 00 41 b8 08 00 00 00 ff 50 50 48 89 46 18 48 85 c0 74 ? bf 50 00 00 00 89 7e 10 33 d2 "
-    "41 b8 00 05 00 00";
-Site g_buddy_set_bytes{L"spirit set (allocation)", kBuddySetInit, 0, "ba 00 05 00 00",
-    {0xBA, 0x80, 0x20, 0x00, 0x00}};
-Site g_buddy_set_count{L"spirit set (entries)", kBuddySetInit, 0x17, "bf 50 00 00 00",
-    {0xBF, 0x08, 0x02, 0x00, 0x00}};
-Site g_buddy_set_clear{L"spirit set (clear)", kBuddySetInit, 0x21, "41 b8 00 05 00 00",
-    {0x41, 0xB8, 0x80, 0x20, 0x00, 0x00}};
+    "48 8b 0d ? ? ? ? 48 8b 01 ba 00 05 00 00 41 b8 08 00 00 00 ff 50 50 48 89 46 18 48 85 c0 74 ? "
+    "bf 50 00 00 00 89 7e 10 33 d2 41 b8 00 05 00 00 48 8b c8 e8 ? ? ? ? 33 db 66 66 66 0f 1f 84 00 00 00 00 00 "
+    "48 8b 4e 18 48 03 cb 48 89 4c 24 58 48 89 4c 24 60 74 08 33 d2 e8 ? ? ? ? 90 48 83 c3 10 48 83 ef 01 "
+    "75 db 48 83 c4 30 5f 5e 5b c3";
+constexpr std::ptrdiff_t kBuddySetEpilogue = 0x6B;
+Site g_buddy_set_size{L"spirit set (size)", kBuddySetInit, kBuddySetEpilogue, "48 83 c4 30 5f 5e 5b c3",
+    std::vector<std::uint8_t>(8, 0xCC)};
 // Within range of the summoning monument: +0x4BD950 clears it every frame and
 // sets it only when the monument is loaded near the player and the player is
 // inside its region or range; every other path ends at one point. Outside,
@@ -1557,6 +1565,18 @@ enum Id : std::size_t {
     extended_ranges, highlight_changed,
     // Spirits: the same ash again with its item instead of dismissing it
     ash_repeat,
+    // Damage taken: longer Deflecting Hardtear perfect guard (Nexus request)
+    deflect_window,
+    // Image: spirit ashes without their ghostly look (Nexus request)
+    solid_ashes,
+    // Buffs: self buffs of the same kind stack instead of replacing each other (Nexus request)
+    stack_buffs,
+    // Enemies: kills before an enemy stays dead, like Dark Souls II (Nexus request)
+    enemy_respawn_kills,
+    // Image: no ghostly look on any character (Evergaol bosses, summoned NPCs; Nexus request)
+    solid_ghosts,
+    // Image: only your character stays clean (Nexus request)
+    player_clean,
     count
 };
 
@@ -1684,6 +1704,12 @@ Option g_options[count]{
     toggle(L"KnockdownInvincible"), toggle(L"ItemSuperArmor"),
     general_toggle(L"ExtendedRanges"), general_toggle(L"HighlightChangedOptions"),
     toggle(L"SpiritRepeatSameAsh"),
+    slider(L"DeflectWindowPercent", 100, 100, 500, 25),
+    toggle(L"SolidSpiritAshes"),
+    toggle(L"StackSelfBuffs"),
+    slider(L"EnemyRespawnKills", 1, 1, 50, 1),
+    toggle(L"SolidGhostCharacters"),
+    toggle(L"KeepPlayerClean"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -2117,7 +2143,10 @@ void sync_loot() noexcept {
 // Effect durations: SpEffectParam.effectEndurance (f32 +0x8, -1 permanent, 0
 // instant). Only timed effects of 5-999 s are touched, so short internal
 // helpers and permanent passives keep their values. Categories, first match:
-// weapon = wepParamChange (+0x158) set; enemy = effectTargetOpposeTarget
+// weapon = wepParamChange (+0x158) set, except 3 ("Self": what a hit leaves
+// on its target, such as Destined Death or a grease's "On Attack" status,
+// which stacked forever on enemies with permanent weapon buffs); enemy =
+// effectTargetOpposeTarget
 // (+0x16C bit 0); self = self or friendly target (+0x16C bits 2/1) that
 // applies to the player (+0x15F bit 3).
 struct BuffState {
@@ -2126,10 +2155,25 @@ struct BuffState {
     std::vector<std::uintptr_t> rows[3]{};
     std::vector<float> original[3]{};
     int applied_percent[3]{100, 100, 100};
+    // Stack self buffs: spCategory (u16 +0x13E) groups effects that replace
+    // each other: 151 body (Flame, Grant Me Strength, Barrier of Gold, Boiled
+    // Crab...), 160 Golden Vow and aromatics, 161 HP regeneration, 154
+    // stealth... Self buffs in 150-199 go to 0 (no group) while it is on.
+    std::vector<std::uintptr_t> stack_rows{};
+    std::vector<std::uint16_t> stack_original{};
+    bool stack_applied{};
+    // Deflect window: msa\src\deflect.rs carries the perfect guard on.
+    int deflect_applied{100};
 };
 
 BuffState g_buffs{};
 constexpr Id kBuffIds[3]{buff_weapon, buff_self, buff_enemy};
+constexpr std::uint8_t kWepChangeSelf = 3;
+constexpr std::ptrdiff_t kSpCategory = 0x13E;
+// Deflecting Hardtear perfect guard window: 6 frames at 30 per second.
+constexpr int kDeflectWindowMs = 200;
+
+extern "C" std::uint8_t nt_set_deflect_window(std::uint32_t extra_ms);
 
 void sync_buffs() noexcept {
     if (g_buffs.attempted) return;
@@ -2147,7 +2191,7 @@ void sync_buffs() noexcept {
             game::read(row + 0x16C, targets);
             game::read(row + 0x15F, affiliation);
             int category = -1;
-            if (weapon) category = 0;
+            if (weapon && weapon != kWepChangeSelf) category = 0;
             else if (targets & 0x1) category = 2;
             else if ((targets & 0x6) && (affiliation & 0x8)) category = 1;
             if (category < 0) continue;
@@ -2157,6 +2201,14 @@ void sync_buffs() noexcept {
         wchar_t message[160]{};
         swprintf_s(message, L"Effect durations: %zu weapon, %zu self, %zu enemy SpEffectParam rows.",
             g_buffs.rows[0].size(), g_buffs.rows[1].size(), g_buffs.rows[2].size());
+        log(message);
+        for (const auto row : g_buffs.rows[1]) {
+            std::uint16_t group{};
+            if (!game::read(row + kSpCategory, group) || group < 150 || group > 199) continue;
+            g_buffs.stack_rows.push_back(row);
+            g_buffs.stack_original.push_back(group);
+        }
+        swprintf_s(message, L"Stack self buffs: %zu self buffs in replacing groups.", g_buffs.stack_rows.size());
         log(message);
         g_buffs.ready = true;
     }
@@ -2169,6 +2221,23 @@ void sync_buffs() noexcept {
         for (std::size_t r = 0; r < g_buffs.rows[c].size(); ++r)
             game::write(g_buffs.rows[c][r] + 0x8, forever ? -1.0f : g_buffs.original[c][r] * percent / 100.0f);
         g_buffs.applied_percent[c] = percent;
+    }
+    const bool stack = value_of(stack_buffs) != 0;
+    if (stack != g_buffs.stack_applied) {
+        for (std::size_t r = 0; r < g_buffs.stack_rows.size(); ++r)
+            game::write<std::uint16_t>(g_buffs.stack_rows[r] + kSpCategory, stack ? 0 : g_buffs.stack_original[r]);
+        g_buffs.stack_applied = stack;
+    }
+    const int deflect = value_of(deflect_window);
+    if (deflect != g_buffs.deflect_applied) {
+        const int extra = kDeflectWindowMs * (deflect - 100) / 100;
+        const bool ok = nt_set_deflect_window(static_cast<std::uint32_t>(extra)) != 0;
+        if (ok) g_buffs.deflect_applied = deflect;
+        wchar_t message[128]{};
+        swprintf_s(message, ok ? L"Deflect window: %d%% (perfect guard held %d ms more)."
+                              : L"Deflect window: %d%% not applied yet (%d ms; game tasks not ready).",
+            deflect, extra);
+        log(message);
     }
 }
 
@@ -2403,6 +2472,65 @@ bool build_buddy_slot_search() noexcept {
     return true;
 }
 
+// The spirit set's size (see kBuddySetCapacity). At the epilogue: rsi = the
+// new ChrSet, its 80 entries built; rbx and rdi are restored by the epilogue
+// and rsp+0..1Fh is free for the calls' shadow space.
+bool build_buddy_set_size() noexcept {
+    if (!g_buddy_set_size.ready) return false;
+    std::uint8_t* const site = g_buddy_set_size.address;
+    std::uint8_t* const load = site - kBuddySetEpilogue;                // mov rcx,[rip+disp32]
+    std::int32_t disp{};
+    std::memcpy(&disp, load + 3, 4);
+    const std::uint8_t* const allocator = load + 7 + disp;
+    std::uint8_t* code = alloc_near(site);
+    if (!code) {
+        log(L"Spirit set: no memory near the game code; kept at 80 entries.");
+        return false;
+    }
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_u64 = [&](const std::uint8_t* v) { std::memcpy(p, &v, 8); p += 8; };
+    const std::uint32_t bytes = kBuddySetCapacity * 16;
+    std::uint8_t* to_done[3]{};
+    put({0x83, 0x7E, 0x10, 0x50});                                     // cmp dword [rsi+10h],80
+    put({0x75, 0x00}); to_done[0] = p;                                 // jne done
+    put({0x48, 0x83, 0x7E, 0x18, 0x00});                               // cmp qword [rsi+18h],0
+    put({0x74, 0x00}); to_done[1] = p;                                 // je done
+    put({0x48, 0xB9}); put_u64(allocator);                             // mov rcx,&allocator
+    put({0x48, 0x8B, 0x09});                                           // mov rcx,[rcx]
+    put({0x48, 0x8B, 0x01});                                           // mov rax,[rcx]
+    put({0xBA}); std::memcpy(p, &bytes, 4); p += 4;                    // mov edx,520*16
+    put({0x41, 0xB8, 0x08, 0x00, 0x00, 0x00});                         // mov r8d,8
+    put({0xFF, 0x50, 0x50});                                           // call [rax+50h]  allocate
+    put({0x48, 0x85, 0xC0});                                           // test rax,rax
+    put({0x74, 0x00}); to_done[2] = p;                                 // je done
+    put({0x48, 0x89, 0xC3});                                           // mov rbx,rax
+    put({0x48, 0x89, 0xC7});                                           // mov rdi,rax
+    put({0x31, 0xC0});                                                 // xor eax,eax
+    const std::uint32_t qwords = bytes / 8;
+    put({0xB9}); std::memcpy(p, &qwords, 4); p += 4;                   // mov ecx,520*2
+    put({0xF3, 0x48, 0xAB});                                           // rep stosq        zeroed entries
+    put({0x48, 0x8B, 0x56, 0x18});                                     // mov rdx,[rsi+18h] the 80
+    put({0x48, 0x89, 0x5E, 0x18});                                     // mov [rsi+18h],rbx
+    put({0xC7, 0x46, 0x10}); std::memcpy(p, &kBuddySetCapacity, 4); p += 4; // mov dword [rsi+10h],520
+    put({0x48, 0xB9}); put_u64(allocator);                             // mov rcx,&allocator
+    put({0x48, 0x8B, 0x09});                                           // mov rcx,[rcx]
+    put({0x48, 0x8B, 0x01});                                           // mov rax,[rcx]
+    put({0xFF, 0x50, 0x68});                                           // call [rax+68h]  free
+    for (std::uint8_t* at : to_done) at[-1] = static_cast<std::uint8_t>(p - at);
+    for (std::uint8_t b : g_buddy_set_size.original) *p++ = b;          // done: the epilogue
+    FlushInstructionCache(GetCurrentProcess(), code, static_cast<SIZE_T>(p - code));
+    std::vector<std::uint8_t> jump(8, 0xCC);
+    jump[0] = 0xE9;
+    const auto rel = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(code) -
+        reinterpret_cast<std::intptr_t>(site + 5));
+    std::memcpy(jump.data() + 1, &rel, 4);
+    g_buddy_set_size.replacement = jump;
+    return true;
+}
+
 spirit_ashes::Settings spirit_ash_settings() noexcept {
     // No cap on ashes (0): the spirit set's 500 bodies are the limit, and the
     // game has 94 ashes. ash_max_active stays defined for old INI files only.
@@ -2429,21 +2557,15 @@ void start_spirit_ashes() noexcept {
     // The spirit set is created once, when the game builds WorldChrMan: its
     // size can only be raised here, before that (see kBuddySetCapacity).
     if (g_spirit_ashes_started && value_of(ash_multiple) != 0) {
-        // All three share one pattern, which the first write changes: find
-        // them all before writing.
-        for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear}) resolve(*site);
-        int patched = 0;
-        for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear})
-            patched += set_site(*site, true) ? 1 : 0;
-        if (patched != 3)
-            for (Site* site : {&g_buddy_set_bytes, &g_buddy_set_count, &g_buddy_set_clear}) set_site(*site, false);
+        resolve(g_buddy_set_size);
+        const bool hooked = build_buddy_set_size() && set_site(g_buddy_set_size, true);
         wchar_t message[128]{};
-        swprintf_s(message, L"Spirit set: created with %u entries (%d/3 sites).",
-            patched == 3 ? kBuddySetCapacity : 80u, patched);
+        swprintf_s(message, L"Spirit set: %u entries when the game creates it.",
+            hooked ? kBuddySetCapacity : 80u);
         log(message);
     }
     log(g_spirit_ashes_started
-            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.2, built in) started."
+            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.3, built in) started."
             : L"Several ashes at once unavailable: unsupported game version or MultipleSpiritAshes.dll is loaded.");
 }
 
@@ -3723,6 +3845,135 @@ void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* 
     state.applied = want;
 }
 
+// Solid spirit ashes (Nexus request): summoned ashes carry SpEffect 295000
+// ([Spirit Summon] Color, puppets 295200), whose SpEffectVfxParam row 57000
+// (57100) overrides the character's look with PhantomParam 200 (201): the
+// blue ghost shading. phantomParamOverwriteId (s32 +0x80) -1, as on rows
+// without an override, leaves them with their normal look. Evergaol bosses
+// and summoned NPCs get theirs from other rows and stay as they are.
+struct GhostState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> rows{};
+    std::vector<std::int32_t> original{};
+    bool applied{};
+};
+
+GhostState g_ghost{};
+constexpr std::uint32_t kAshGhostVfx[]{57000, 57100};
+constexpr std::ptrdiff_t kPhantomOverwriteId = 0x80;
+
+void sync_ghost() noexcept {
+    auto& state = g_ghost;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"SpEffectVfxParam", 0xA4, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (const auto id : kAshGhostVfx) {
+            const std::uintptr_t row = param_row_by_id(table, id);
+            std::int32_t phantom{-1};
+            if (!row || !game::read(row + kPhantomOverwriteId, phantom) || phantom <= 0) continue;
+            state.rows.push_back(row);
+            state.original.push_back(phantom);
+        }
+        wchar_t message[120]{};
+        swprintf_s(message, L"Solid spirit ashes: %zu ghost-look SpEffectVfxParam rows.", state.rows.size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(solid_ashes) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        game::write<std::int32_t>(state.rows[r] + kPhantomOverwriteId, want ? -1 : state.original[r]);
+    state.applied = want;
+}
+
+// Solid ghostly characters, effect side: the other 54 SpEffectVfxParam rows
+// with a phantom shading override (+0x80 > 0; golden and ghost looks that
+// SpEffects put on NPCs, summons and enemies) lose it while the option is
+// on. The ash rows stay with Solid spirit ashes.
+GhostState g_ghost_all{};
+
+void sync_ghost_all() noexcept {
+    auto& state = g_ghost_all;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"SpEffectVfxParam", 0xA4, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (std::size_t i = 0; i < table.rows.size(); ++i) {
+            std::uint32_t id{};
+            std::int32_t phantom{-1};
+            if (!game::read(table.file + 0x40 + i * 0x18, id) ||
+                std::find(std::begin(kAshGhostVfx), std::end(kAshGhostVfx), id) != std::end(kAshGhostVfx) ||
+                !game::read(table.rows[i] + kPhantomOverwriteId, phantom) || phantom <= 0)
+                continue;
+            state.rows.push_back(table.rows[i]);
+            state.original.push_back(phantom);
+        }
+        wchar_t message[120]{};
+        swprintf_s(message, L"Solid ghostly characters: %zu ghost-look SpEffectVfxParam rows.", state.rows.size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(solid_ghosts) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        game::write<std::int32_t>(state.rows[r] + kPhantomOverwriteId, want ? -1 : state.original[r]);
+    state.applied = want;
+}
+
+// Solid ghostly characters, NPC side: NpcParam.phantomShaderId (s32 +0x1D4,
+// PhantomParam row, -1 none) draws a character as a spirit by itself; in
+// 2.7.2.0 only Melina (21801000, 21801034: row 80) has one. -1 while the
+// option is on; it is read when the character loads.
+GhostState g_ghost_npc{};
+constexpr std::ptrdiff_t kNpcPhantomShader = 0x1D4;
+
+void sync_ghost_npc() noexcept {
+    auto& state = g_ghost_npc;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"NpcParam", 0x2E0, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (const auto row : table.rows) {
+            std::int32_t phantom{-1};
+            if (!game::read(row + kNpcPhantomShader, phantom) || phantom <= 0) continue;
+            state.rows.push_back(row);
+            state.original.push_back(phantom);
+        }
+        wchar_t message[120]{};
+        swprintf_s(message, L"Solid ghostly characters: %zu NpcParam rows with a phantom shader.", state.rows.size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(solid_ghosts) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        game::write<std::int32_t>(state.rows[r] + kNpcPhantomShader, want ? -1 : state.original[r]);
+    state.applied = want;
+}
+
 bool all_params_ready() noexcept {
     for (const auto& state : g_param_states)
         if (!state.ready && !state.attempted) return false;
@@ -3733,7 +3984,8 @@ bool all_params_ready() noexcept {
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
         (g_clean.ready || g_clean.attempted) && (g_buff_vfx.ready || g_buff_vfx.attempted) &&
-        (g_weapon_buff_vfx.ready || g_weapon_buff_vfx.attempted);
+        (g_weapon_buff_vfx.ready || g_weapon_buff_vfx.attempted) && (g_ghost.ready || g_ghost.attempted) &&
+        (g_ghost_all.ready || g_ghost_all.attempted) && (g_ghost_npc.ready || g_ghost_npc.attempted);
 }
 
 DWORD WINAPI param_worker(void*) noexcept {
@@ -3757,6 +4009,9 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_clean();
         sync_buff_vfx(g_buff_vfx, 1, hide_buff_effects, L"self buff");
         sync_buff_vfx(g_weapon_buff_vfx, 0, hide_weapon_buff_effects, L"weapon buff");
+        sync_ghost();
+        sync_ghost_all();
+        sync_ghost_npc();
         sync_flasks();
         sync_materials();
         sync_helmet();
@@ -5339,6 +5594,12 @@ void apply(Id id) noexcept {
         set_site(g_enemy_respawn, false);
         set_death_hook(on(id));
         break;
+    case enemy_respawn_kills: break;  // dead_enemy_worker
+    case solid_ghosts:  // ghost_worker and the param worker
+        wake_workers();
+        if (g_param_event) SetEvent(g_param_event);
+        break;
+    case player_clean: wake_workers(); break;  // clean_worker
     case pause_key:
         if (!on(id) && g_paused) {
             set_site(g_pause, false);
@@ -5387,6 +5648,7 @@ void apply(Id id) noexcept {
         // A button: act, then back to off (option_changed / set_option_raw
         // refresh the row).
         if (on(id) && on(ash_multiple)) spirit_ashes::dismiss_all();
+        else if (on(id)) log(L"Dismiss all ashes: needs Several ashes at once; nothing dismissed.");
         g_options[id].value = 0;
         break;
     case open_mirror: case open_rebirth:
@@ -5440,7 +5702,7 @@ void apply(Id id) noexcept {
     case equip_weight: case status_buildup: case player_poise: case enemy_poise:
     case player_poise_lock: case enemy_poise_lock: case posture_one_hit: case status_instant: case die_one_hit:
     case posture_one_hit_taken: case loot_drop: case fast_travel_anywhere:
-    case buff_weapon: case buff_self: case buff_enemy: case ash_cost: case upgrade_cost:
+    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case ash_cost: case upgrade_cost:
     case ash_no_rest: case ash_anywhere: case ash_keep_after_boss:
     case weapon_bleed: case weapon_poison: case weapon_rot: case weapon_frost: case weapon_sleep:
     case dmg_physical: case dmg_magic: case dmg_fire: case dmg_lightning: case dmg_holy:
@@ -5455,7 +5717,7 @@ void apply(Id id) noexcept {
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance:
     case world_journey: case journey_keep_runes: case boss_hp:
-    case clean_characters: case hide_buff_effects: case hide_weapon_buff_effects:
+    case clean_characters: case hide_buff_effects: case hide_weapon_buff_effects: case solid_ashes:
         if (g_param_event) SetEvent(g_param_event);
         break;
     case skill_fp_cost:
@@ -5479,7 +5741,7 @@ bool available(Id id) noexcept {
     case chromatic_off: return g_chromatic.ready;
     case animation_distance: return g_animation.ready;
     case rune_loss_off: return g_rune_loss.ready;
-    case enemies_no_respawn: return g_enemy_respawn.ready;
+    case enemies_no_respawn: case enemy_respawn_kills: return g_enemy_respawn.ready;
     case pause_key: return g_pause.ready;
     case fps_unlock: case fps_limit: return g_frametime.ready && g_fullscreen_cap.ready;
     case ultrawide: return g_ultrawide.ready;
@@ -5505,7 +5767,7 @@ bool available(Id id) noexcept {
     case equip_weight: case status_buildup: case player_poise: case enemy_poise:
     case player_poise_lock: case enemy_poise_lock: case posture_one_hit: case status_instant: case die_one_hit:
     case posture_one_hit_taken: case loot_drop: case fast_travel_anywhere:
-    case buff_weapon: case buff_self: case buff_enemy: case ash_cost: case upgrade_cost:
+    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case ash_cost: case upgrade_cost:
     case ash_no_rest: case ash_anywhere: case ash_keep_after_boss:
     case weapon_bleed: case weapon_poison: case weapon_rot: case weapon_frost: case weapon_sleep:
     case dmg_physical: case dmg_magic: case dmg_fire: case dmg_lightning: case dmg_holy:
@@ -5525,6 +5787,10 @@ bool available(Id id) noexcept {
         return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_buff_vfx.attempted;
     case hide_weapon_buff_effects:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_weapon_buff_vfx.attempted;
+    case solid_ashes: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_ghost.attempted;
+    case solid_ghosts: return g_statics.layout_2_7_1 && g_statics.world_chr_man;
+    case player_clean:
+        return g_statics.layout_2_7_1 && g_statics.world_chr_man && g_statics.regulation_manager;
     // Also needs the save's cycle (GameDataMan) to add only what the save lacks.
     case world_journey: case journey_keep_runes:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_statics.game_data_man &&
@@ -5927,30 +6193,35 @@ std::wstring dead_enemy_path(const game::SaveIdentity& id) {
         std::to_wstring(id.slot) + L"_" + name + L"_NG" + std::to_wstring(id.cycle) + L".txt";
 }
 
-void load_dead_enemies(const std::wstring& path, std::set<DeadEnemy>& dead) {
-    dead.clear();
+// A line without a count (lists from before Kills before staying dead) is one
+// kill, so those enemies stay dead at 1 and come back for more kills above.
+// 1000 was what the first test build wrote for them (2026-10-28).
+constexpr int kOldListKills = 1000;
+
+void load_dead_enemies(const std::wstring& path, std::map<DeadEnemy, int>& kills) {
+    kills.clear();
     FILE* file{};
     if (path.empty() || _wfopen_s(&file, path.c_str(), L"r") != 0 || !file) return;
     char line[128]{};
     while (std::fgets(line, sizeof(line), file)) {
         unsigned block{}, index{};
-        int npc_param{};
-        if (line[0] != ';' && sscanf_s(line, "%x %u %d", &block, &index, &npc_param) == 3)
-            dead.insert({block, index, npc_param});
+        int npc_param{}, count{1};
+        if (line[0] != ';' && sscanf_s(line, "%x %u %d %d", &block, &index, &npc_param, &count) >= 3 && count > 0)
+            kills[{block, index, npc_param}] = count >= kOldListKills ? 1 : count;
     }
     std::fclose(file);
 }
 
-bool save_dead_enemies(const std::wstring& path, const std::set<DeadEnemy>& dead) {
+bool save_dead_enemies(const std::wstring& path, const std::map<DeadEnemy, int>& kills) {
     if (path.empty()) return false;
     const std::wstring folder = path.substr(0, path.find_last_of(L'\\'));
     CreateDirectoryW(folder.substr(0, folder.find_last_of(L'\\')).c_str(), nullptr);
     CreateDirectoryW(folder.c_str(), nullptr);
-    std::string text = "; NativeTweaks: enemies that stay dead in this save (block, index, NpcParam).\n"
-        "; Delete this file to bring them all back.\n";
+    std::string text = "; NativeTweaks: enemies killed in this save (block, index, NpcParam, kills).\n"
+        "; They stay dead from Kills before staying dead on. Delete this file to bring them all back.\n";
     char line[64]{};
-    for (const DeadEnemy& e : dead) {
-        std::snprintf(line, sizeof(line), "%08X %u %d\n", e.block, e.index, e.npc_param);
+    for (const auto& [e, count] : kills) {
+        std::snprintf(line, sizeof(line), "%08X %u %d %d\n", e.block, e.index, e.npc_param, count);
         text += line;
     }
     const std::wstring temporary = path + L".tmp";
@@ -5966,6 +6237,12 @@ bool save_dead_enemies(const std::wstring& path, const std::set<DeadEnemy>& dead
         return false;
     }
     return true;
+}
+
+void listed_dead(const std::map<DeadEnemy, int>& kills, int limit, std::set<DeadEnemy>& dead) {
+    dead.clear();
+    for (const auto& [e, count] : kills)
+        if (count >= limit) dead.insert(dead.end(), e);
 }
 
 // Death hook. Two functions pay for a character's death, rcx = ChrIns
@@ -6123,6 +6400,7 @@ void set_death_hook(bool on) noexcept {
         clear_rekilled();
     }
 }
+
 
 // Character enable state, as event scripts set it: ChrIns debug flags (+0x538,
 // fromsoftware-rs ChrDebugFlags) bit 12 "character_disabled" turns off
@@ -6296,7 +6574,9 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
     DWORD next_full = GetTickCount();
     bool force_full{};
     std::wstring path{};  // list of the loaded save; empty when none
-    std::set<DeadEnemy> dead{};
+    std::map<DeadEnemy, int> kills{};  // the save's list: kills of each enemy
+    std::set<DeadEnemy> dead{};        // the ones with Kills before staying dead or more
+    int kills_limit{};
     std::map<std::uintptr_t, int> attempts{};
     std::set<std::uintptr_t> disabled{};  // characters this worker disabled, while loaded
     // The world runs when the play time of the player's current animation
@@ -6329,10 +6609,11 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
     };
     const auto flush = [&]() noexcept {
         try {
-            if (dirty && save_dead_enemies(path, dead)) {
+            if (dirty && save_dead_enemies(path, kills)) {
                 wchar_t message[200]{};
-                swprintf_s(message, L"Enemies stay dead: %zu in the list (%d new, %d respawns prevented).",
-                    dead.size(), recorded, prevented);
+                swprintf_s(message,
+                    L"Enemies stay dead: %zu stay dead, %zu with kills counted (%d new, %d respawns prevented).",
+                    dead.size(), kills.size(), recorded, prevented);
                 log(message);
                 recorded = prevented = 0;
             }
@@ -6347,6 +6628,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
         g_death_events.clear();  // deaths of a save that is no longer loaded
         ReleaseSRWLockExclusive(&g_death_lock);
         path.clear();
+        kills.clear();
         dead.clear();
         attempts.clear();
         clear_rekilled();
@@ -6378,15 +6660,42 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
         log(message);
         disabled.clear();
     };
+    // The save's list starts over when the option is turned off with a save
+    // loaded, and when it is turned on during the session: only enemies killed
+    // while it is on count (user requests 2026-10-28). On from the start of
+    // the game keeps the list across sessions. The old list stays as .bak.
+    bool was_on = value_of(enemies_no_respawn) != 0;
+    bool fresh_start = false;
+    const auto reset_list = [&](const wchar_t* why) noexcept {
+        try {
+            flush();
+            const std::wstring backup = path + L".bak";
+            const bool kept = MoveFileExW(path.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+            wchar_t message[1200]{};
+            swprintf_s(message, L"Enemies stay dead: %ls, list of %zu enemies reset%ls%ls.", why, kills.size(),
+                kept ? L"; the old one is " : L"", kept ? backup.c_str() : L"");
+            log(message);
+        } catch (...) {
+        }
+        kills.clear();
+        dead.clear();
+        dirty = false;
+    };
     perf::Loop loop(L"dead_enemy");
     for (;;) {
         loop.sleep(50);
         try {
             if (!value_of(enemies_no_respawn)) {
                 enable_again();
+                if (!path.empty()) reset_list(L"option off");
+                was_on = false;
                 close();
                 idle_wait(loop);
                 continue;
+            }
+            if (!was_on) {
+                fresh_start = true;  // turned on during this session
+                was_on = true;
             }
             std::uintptr_t manager{}, player{};
             game::SaveIdentity id{};
@@ -6400,10 +6709,46 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
             if (current != path) {
                 close();
                 path = current;
-                load_dead_enemies(path, dead);
+                load_dead_enemies(path, kills);
+                kills_limit = 0;
                 wchar_t message[1024]{};
-                swprintf_s(message, L"Enemies stay dead: %zu enemies listed for %ls.", dead.size(), path.c_str());
+                swprintf_s(message, L"Enemies stay dead: %zu enemies with kills listed for %ls.", kills.size(),
+                    path.c_str());
                 log(message);
+            }
+            if (fresh_start) {
+                reset_list(L"option on");
+                fresh_start = false;
+                kills_limit = 0;
+            }
+
+            const int limit = value_of(enemy_respawn_kills);
+            if (limit != kills_limit) {
+                listed_dead(kills, limit, dead);
+                // A higher limit: enemies this worker disabled that now need
+                // more kills come back where they are, without a rest.
+                int back = 0;
+                if (!disabled.empty() && g_chr_enable) {
+                    loaded.clear();
+                    game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
+                    for (const std::uintptr_t chr : loaded) {
+                        EnemyState s{};
+                        if (!disabled.count(chr) || !read_enemy(chr, s) || dead.count(s.key()) ||
+                            !chr_disabled(chr) || !call_chr_enable(g_chr_enable, chr))
+                            continue;
+                        disabled.erase(chr);
+                        ++back;
+                    }
+                }
+                if (kills_limit) {
+                    wchar_t message[200]{};
+                    swprintf_s(message,
+                        L"Enemies stay dead: after %d kill(s) now; %zu of %zu enemies stay dead, %d back at once.",
+                        limit, dead.size(), kills.size(), back);
+                    log(message);
+                }
+                kills_limit = limit;
+                force_full = true;
             }
 
             // The player's own death.
@@ -6463,19 +6808,26 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 const wchar_t* reason = not_kept_reason(s);
                 const bool listed = dead.count(key) != 0;
                 const bool recording = !reason && !listed;
+                int killed = 0;
+                if (recording) {
+                    killed = ++kills[key];
+                    dirty = true;
+                }
+                const bool now_dead = recording && killed >= limit;
+                wchar_t counted[48]{};
+                if (recording && !now_dead) swprintf_s(counted, L"kill %d of %d", killed, limit);
                 wchar_t message[360]{};
                 swprintf_s(message,
                     L"Enemies stay dead: death seen (%ls) block %08X index %u NpcParam %d team %u entity %u "
                     L"HP %d/%d: %ls%ls.",
                     d.kind ? L"runes only" : L"item lot and runes", s.block, key.index, s.npc_param, s.team,
                     s.entity, s.hp, s.hp_max,
-                    reason ? reason : recording ? L"recorded" : L"already listed",
+                    reason ? reason : now_dead ? L"recorded" : recording ? counted : L"already listed",
                     d.suppressed ? L", killed again on load: payout skipped" : L"");
                 line(message);
-                if (recording) {
+                if (now_dead) {
                     dead.insert(key);
                     ++recorded;
-                    dirty = true;
                     force_full = true;  // a loaded character may share the new key
                 }
             }
@@ -6628,6 +6980,131 @@ void put_pointer_on_yes(std::uint64_t movie) noexcept {
         swprintf_s(message, L"Yes/No box (%ls): mouse pointer moved onto Yes at %ld,%ld (window %ldx%ld).",
             name, point.x, point.y, client.right, client.bottom);
         log(message);
+    }
+}
+
+// Solid ghostly characters (Nexus request): ChrIns.phantomParamOverride
+// (s32 +0x540, after the debug flags at +0x538; fromsoftware-rs) is the
+// PhantomParam row a character is drawn with, -1 for the one its character
+// type brings (chrType +0x68: 19 the golden NPC signs, 1 white phantoms...).
+// -1 kept those golden (test 2026-10-28), so every loaded character but the
+// player that is of a phantom type or has an override gets PhantomParam 999
+// instead, a row that changes nothing (black additive edge and front,
+// diffuse and specular x1, no glow; same as 813 and 890). Turning the option
+// off puts the old value back on the ones still loaded. Each NpcParam /
+// chrType / override seen is logged once.
+constexpr std::uintptr_t kPhantomOverride = 0x540;
+constexpr std::uintptr_t kChrType = 0x68;
+constexpr std::int32_t kSolidPhantomParam = 999;
+
+struct GhostChr {
+    std::int32_t npc_param;
+    std::int32_t original;
+};
+
+// fromsoftware-rs ChrType: 1 white phantom, 2 duelist, 3-4 ghosts, 8 gray,
+// 15-18 invaders and blue phantoms, 19-21 NPC signs and invaders.
+bool phantom_type(std::int32_t type) noexcept {
+    return (type >= 1 && type <= 4) || type == 8 || (type >= 15 && type <= 21);
+}
+
+DWORD WINAPI ghost_worker(void*) noexcept {
+    std::vector<std::uintptr_t> loaded{};
+    std::map<std::uintptr_t, GhostChr> changed{};
+    std::set<std::tuple<std::int32_t, std::int32_t, std::int32_t>> logged{};
+    std::set<std::tuple<std::int32_t, std::int32_t, std::uint8_t>> allies_logged{};
+    perf::Loop loop(L"ghost");
+    for (;;) {
+        try {
+            const bool want = value_of(solid_ghosts) != 0;
+            if (!want && changed.empty()) {
+                idle_wait(loop);
+                continue;
+            }
+            loop.sleep(1000);
+            std::uintptr_t manager{}, player{};
+            if (!game::read(g_statics.world_chr_man, manager) || !manager ||
+                !game::read(manager + game::kPlayerIns, player) || !player) {
+                changed.clear();  // title screen or loading: those characters are gone
+                continue;
+            }
+            loaded.clear();
+            game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
+            std::sort(loaded.begin(), loaded.end());
+            loaded.erase(std::unique(loaded.begin(), loaded.end()), loaded.end());
+            if (!want) {
+                int restored = 0;
+                for (const std::uintptr_t chr : loaded) {
+                    const auto it = changed.find(chr);
+                    std::int32_t npc_param{}, now{};
+                    if (it == changed.end() || !game::read(chr + 0x60, npc_param) ||
+                        npc_param != it->second.npc_param || !game::read(chr + kPhantomOverride, now) ||
+                        now != kSolidPhantomParam)
+                        continue;
+                    game::write<std::int32_t>(chr + kPhantomOverride, it->second.original);
+                    ++restored;
+                }
+                wchar_t message[120]{};
+                swprintf_s(message, L"Solid ghostly characters: off, %d ghostly looks back.", restored);
+                log(message);
+                changed.clear();
+                continue;
+            }
+            for (auto it = changed.begin(); it != changed.end();)
+                it = std::binary_search(loaded.begin(), loaded.end(), it->first) ? std::next(it) : changed.erase(it);
+            for (const std::uintptr_t chr : loaded) {
+                std::int32_t look{}, npc_param{}, type{};
+                std::uint8_t team{};
+                if (chr != player && game::read(chr + 0x6C, team) && (team == 2 || team == 8 || team == 12 ||
+                    team == 26 || team == 27 || team == 28 || team == 47) && game::read(chr + 0x60, npc_param) &&
+                    game::read(chr + kChrType, type) && game::read(chr + kPhantomOverride, look) &&
+                    allies_logged.size() < 60 && allies_logged.insert({npc_param, type, team}).second) {
+                    wchar_t message[160]{};
+                    swprintf_s(message, L"Solid ghostly characters: ally NpcParam %d chrType %d team %u override %d.",
+                        npc_param, type, team, look);
+                    log(message);
+                }
+                if (chr == player || !game::read(chr + kPhantomOverride, look) ||
+                    look == kSolidPhantomParam || !game::read(chr + 0x60, npc_param) ||
+                    !game::read(chr + kChrType, type) || (look <= 0 && !phantom_type(type)))
+                    continue;
+                if (logged.size() < 200 && logged.insert({npc_param, type, look}).second) {
+                    wchar_t message[180]{};
+                    swprintf_s(message,
+                        L"Solid ghostly characters: NpcParam %d chrType %d PhantomParam override %d -> %d.",
+                        npc_param, type, look, kSolidPhantomParam);
+                    log(message);
+                }
+                changed.try_emplace(chr, GhostChr{npc_param, look});
+                game::write<std::int32_t>(chr + kPhantomOverride, kSolidPhantomParam);
+            }
+        } catch (...) {
+        }
+    }
+}
+
+// Keep your character clean (Nexus request): msa\src\clean.rs puts a bare
+// copy of the Soap's cleaning (SpEffect 502120: deletes paint decal group 10
+// when it ends) on the player every quarter second. Tried first and dropped
+// (2026-10-28): the decal request never names the character (decal hooks at
+// +0xB2E9F6/+0xB2EA88: 49 paint requests, the player in none), and the
+// player's NpcParam 0 paintRenderTargetSize (u16 +0x1CE) set to 0 before the
+// save loaded changed nothing.
+extern "C" std::uint8_t nt_set_player_clean(std::uint8_t enabled);
+
+DWORD WINAPI clean_worker(void*) noexcept {
+    bool running{};
+    perf::Loop loop(L"clean");
+    for (;;) {
+        const bool want = value_of(player_clean) != 0;
+        if (want != running) {
+            if (nt_set_player_clean(want ? 1 : 0)) {
+                running = want;
+                log(want ? L"Keep your character clean: on." : L"Keep your character clean: off.");
+            }
+        }
+        if (want == running) idle_wait(loop);
+        else loop.sleep(1000);  // the game's task scheduler isn't up yet
     }
 }
 
@@ -7015,7 +7492,7 @@ const Texts kEnglish{
         {L"HUD to screen edges", L"On screens wider than 16:9, moves the gauges, equipment, runes and other corner elements to the screen edges. Use with Allow ultrawide. Restart the game to apply: it loads the HUD once at startup. Turn it off if another mod already places the HUD for ultrawide."},
         {L"HUD scale (%)", L"Resizes the gauges, equipment, compass, boss bars, runes and other corner elements, each one from its own corner. Restart the game to apply: it loads the HUD once at startup."},
         {L"Menus to screen edges", L"On screens wider than 16:9, moves the pause menu and the other menus (equipment, inventory, status, shops, level up, spells, storage, options, loading and title screens) to the screen edges and widens their backgrounds. Restart the game to apply: it loads the menus once at startup. Turn it off if another mod replaces these menus."},
-        {L"Enemies stay dead", L"Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turn it off and the next rest brings everyone back; turning it on again brings the list back too. Delete the save's file to start over."},
+        {L"Enemies stay dead", L"Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turning it off brings everyone back with the next rest. Turning it on or off during play starts the save's list over (the old one is kept as .bak), so only enemies killed while it is on count; on from the start of the game, the list carries over between sessions."},
         {L"Yes/No questions start on Yes (beta)", L"BETA: Yes/No questions open with the cursor on Yes instead of No: travel, quit, use an item and the like; with the mouse, the pointer is moved onto Yes too. It applies to every Yes/No question, risky ones too, so check before confirming. Other windows, such as item quantities, do not change."},
         {L"Hit downed enemies", L"Like Nightreign, enemies knocked to the ground by a critical hit or a riposte take damage while they lie there and get up. They get super armour instead, so your hits do not stagger them again, but they still take posture damage. Spirit ashes can also hit them during the critical hit. You keep your own protection when an enemy grabs you."},
         {L"Torrent jump speed (%)", L"Scales Torrent's animation speed during jumps and double jumps, spiritspring jumps included. At 100% the double jump is as easy to get as in the base game, even with a faster run speed. Applies instantly."},
@@ -7036,7 +7513,7 @@ const Texts kEnglish{
         {L"Open the mirror", L"Opens the appearance screen of the Roundtable Hold mirror. Use it out of combat."},
         {L"Rebirth", L"Opens Rennala's rebirth screen to reallocate your attributes. No Larval Tear needed. Use it out of combat."},
         {L"Boss health (%)", L"Scales the health of bosses only: main, field, dungeon and DLC bosses. Multiplies Enemy health, so with Enemy health at 100% only bosses change. Applies to bosses loaded afterwards: rest at a grace."},
-        {L"Keep characters clean (beta)", L"BETA: for now it also applies to enemies; the aim is your character only. Blood, mud and scorch marks no longer stick to characters' bodies, yours and enemies'. Splatters still appear on the ground and walls. Applies to new hits; marks already on you wear off as usual."},
+        {L"Keep characters clean (beta)", L"BETA: applies to everyone, enemies included; for your character alone use Keep your character clean. Blood, mud and scorch marks no longer stick to characters' bodies, yours and enemies'. Splatters still appear on the ground and walls. Applies to new hits; marks already on you wear off as usual."},
         {L"Hide buff effects", L"Your own buffs (incantations, sorceries, boluses, talismans and similar) no longer show particles or a glow on your body. They work exactly the same, keep their sound, and invisibility still works. Weapon buffs keep their look (see the option below). Applies to the next buff you use."},
         {L"Hide weapon buff effects", L"Greases and weapon enchantments no longer show their glow or particles on your weapon. They work exactly the same and keep their sound. Applies to the next grease or enchantment you use."},
         {L"Dodge invincibility (%) (beta)", L"BETA: makes the invincibility of rolls, backsteps and dodge skills last longer. 100% is the game's (14 frames for a light or medium roll, 13 for a heavy one); 200% doubles it. The extra time follows the dodge's own invincibility and lasts even if you act right after. Your character only."},
@@ -7046,6 +7523,12 @@ const Texts kEnglish{
         {L"Extended ranges", L"Off by default. Many sliders of this menu go further and get a Scale row (x1 to x100) under them that multiplies their value. Applies when you restart the game."},
         {L"Highlight changed options", L"Off by default. The names of options set away from the game's default are coloured, so you can see at a glance what you changed. Applies at once."},
         {L"Same ash again", L"With Several ashes at once, using a summoned spirit ash's item summons it once more instead of dismissing it, so you can have the same ash several times; each one pays its FP. Dismiss all ashes removes them. Off by default: the item dismisses that ash."},
+        {L"Deflect window (%) (beta)", L"BETA: with the Deflecting Hardtear, makes its perfect guard window last longer. 100% is the game's (6 frames when you raise your guard, fewer after several deflects in a row); 200% doubles the first window. Your character only."},
+        {L"Solid spirit ashes", L"Summoned spirit ashes (and Seluvis's puppets) lose their blue ghostly look and appear as solid characters. They work exactly the same. Applies to the next ash you summon."},
+        {L"Stack self buffs (beta)", L"BETA: your own buffs of the same kind no longer replace each other, so for example Flame, Grant Me Strength, Barrier of Gold and a Boiled Crab, or Golden Vow and an Uplifting Aromatic, all stay on at once. Using the same buff again still just refreshes it. Applies to the next buffs you use."},
+        {L"Kills before staying dead", L"With Enemies stay dead: how many times you have to kill an enemy before it stops coming back, like Dark Souls II (12 there). 1 is right away. Each save counts its kills in the same file as the list."},
+        {L"Solid ghostly characters (beta)", L"BETA: characters drawn as ghosts, such as some Evergaol bosses, spectral enemies, Melina and NPCs you summon, lose that look and appear solid. They work exactly the same. Spirit ashes have their own option above. Applies within a second."},
+        {L"Keep your character clean (beta)", L"BETA: blood, mud and scorch marks no longer stick to your character's body; enemies get them as usual. Works like the game's Soap, all the time: a mark from a hit is gone within a quarter of a second. Applies at once. Splatters still appear on the ground."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -7206,7 +7689,7 @@ const Texts kSpanish{
         {L"HUD hasta los bordes", L"En pantallas más anchas que 16:9, lleva las barras, el equipo, las runas y los demás elementos de las esquinas hasta los bordes de la pantalla. Úsalo con Permitir ultrapanorámico. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar. Desactívalo si otro mod ya coloca el HUD para ultrapanorámico."},
         {L"Escala del HUD (%)", L"Cambia el tamaño de las barras, el equipo, la brújula, las barras de jefe, las runas y los demás elementos de las esquinas, cada uno desde su esquina. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar."},
         {L"Menús hasta los bordes", L"En pantallas más anchas que 16:9, lleva el menú de pausa y los demás menús (equipo, inventario, estado, tiendas, subir de nivel, hechizos, cofre, opciones, pantallas de carga y de título) hasta los bordes y ensancha sus fondos. Reinicia el juego para aplicarlo: carga los menús una sola vez al arrancar. Desactívalo si otro mod sustituye estos menús."},
-        {L"Los enemigos no reaparecen", L"Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos; al reactivarla vuelve a aplicarse la lista. Borra el archivo de la partida para empezar de cero."},
+        {L"Los enemigos no reaparecen", L"Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos. Activarla o desactivarla durante la partida empieza la lista de cero (la anterior se guarda como .bak), así que solo cuentan los enemigos que matas con ella activa; si está activa desde que arranca el juego, la lista se conserva entre sesiones."},
         {L"Preguntas Sí/No empiezan en Sí (beta)", L"BETA: las preguntas Sí/No se abren con el cursor en Sí en vez de en No: viajar, salir, usar un objeto, etc.; con el ratón, el puntero también se coloca sobre Sí. Afecta a todas las preguntas Sí/No, también a las arriesgadas, así que comprueba antes de confirmar. Las demás ventanas, como las de cantidad de objetos, no cambian."},
         {L"Golpear enemigos derribados", L"Como en Nightreign, los enemigos que caen al suelo por un golpe crítico o un contraataque reciben daño mientras están tendidos y al levantarse. A cambio tienen superarmadura, así que tus golpes no los vuelven a aturdir, pero sí dañan su postura. Las cenizas espirituales también pueden golpearlos durante el crítico. Tú sigues protegido cuando un enemigo te agarra."},
         {L"Velocidad de salto de Torrent (%)", L"Escala la velocidad de animación de Torrent en los saltos y dobles saltos, también en los de los manantiales espirituales. Al 100 % el doble salto sale tan fácil como en el juego base, aunque la carrera vaya más rápida. Se aplica al momento."},
@@ -7227,7 +7710,7 @@ const Texts kSpanish{
         {L"Abrir el espejo", L"Abre la pantalla de apariencia del espejo de la Mesa Redonda. Úsalo fuera de combate."},
         {L"Renacer", L"Abre la pantalla de renacimiento de Rennala para redistribuir tus atributos. No necesita Lágrima larval. Úsalo fuera de combate."},
         {L"Vida de los jefes (%)", L"Escala solo la vida de los jefes: principales, de campo, de mazmorra y del DLC. Se multiplica con «Vida de enemigos», así que con «Vida de enemigos» al 100 % solo cambian los jefes. Se aplica a los jefes que se carguen después: descansa en una gracia."},
-        {L"Personajes limpios (beta)", L"BETA: por ahora también se aplica a los enemigos; el objetivo es que sea solo tu personaje. La sangre, el barro y las quemaduras ya no se pegan al cuerpo de los personajes, ni al tuyo ni al de los enemigos. Las salpicaduras siguen saliendo en el suelo y las paredes. Se aplica a los golpes nuevos; las manchas que ya tienes se van como siempre."},
+        {L"Personajes limpios (beta)", L"BETA: se aplica a todos, enemigos incluidos; para tu personaje solo, usa Mantener limpio a tu personaje. La sangre, el barro y las quemaduras ya no se pegan al cuerpo de los personajes, ni al tuyo ni al de los enemigos. Las salpicaduras siguen saliendo en el suelo y las paredes. Se aplica a los golpes nuevos; las manchas que ya tienes se van como siempre."},
         {L"Ocultar efectos de mejoras", L"Tus mejoras (encantamientos, hechizos, bolos, talismanes y similares) ya no muestran partículas ni brillo en tu cuerpo. Funcionan exactamente igual, mantienen su sonido y la invisibilidad sigue funcionando. Las mejoras del arma mantienen su aspecto (ver la opción de abajo). Se aplica a la siguiente mejora que uses."},
         {L"Ocultar efectos de mejoras de arma", L"Las grasas y los encantamientos de arma ya no muestran su brillo ni partículas en el arma. Funcionan exactamente igual y mantienen su sonido. Se aplica a la siguiente grasa o encantamiento que uses."},
         {L"Invencibilidad al esquivar (%) (beta)", L"BETA: alarga la invencibilidad de las volteretas, los pasos atrás y las habilidades de esquiva. El 100 % es la del juego (14 fotogramas en una voltereta ligera o media, 13 en una pesada); el 200 % la duplica. El tiempo extra sigue a la invencibilidad de la propia esquiva y dura aunque hagas otra acción justo después. Solo para tu personaje."},
@@ -7237,6 +7720,12 @@ const Texts kSpanish{
         {L"Rangos ampliados", L"Desactivado por defecto. Muchos deslizadores de este menú llegan más lejos y tienen debajo una fila de Escala (x1 a x100) que multiplica su valor. Se aplica al reiniciar el juego."},
         {L"Resaltar opciones cambiadas", L"Desactivado por defecto. Los nombres de las opciones que no están en el valor del juego salen en color, para ver de un vistazo qué has cambiado. Se aplica al momento."},
         {L"Repetir la misma ceniza", L"Con «Varias cenizas a la vez», usar el objeto de una ceniza ya invocada la invoca otra vez en lugar de retirarla, para tener la misma ceniza varias veces; cada una cobra sus PC. «Retirar todas las cenizas» las quita todas. Desactivada por defecto: el objeto retira esa ceniza."},
+        {L"Ventana de desvío (%) (beta)", L"BETA: con la Lágrima de desvío, alarga la ventana de la guardia perfecta. El 100 % es la del juego (6 fotogramas al alzar la guardia, menos tras varios desvíos seguidos); el 200 % duplica la primera ventana. Solo para tu personaje."},
+        {L"Cenizas sin aspecto fantasmal", L"Las cenizas espirituales invocadas (y las marionetas de Seluvis) pierden su aspecto fantasmal azul y se ven como personajes sólidos. Funcionan exactamente igual. Se aplica a la siguiente ceniza que invoques."},
+        {L"Acumular mejoras propias (beta)", L"BETA: tus mejoras del mismo tipo ya no se sustituyen entre sí; por ejemplo, Llama, dame fuerza, Barrera de oro y un Cangrejo hervido, o Voto dorado y un Aromático estimulante, siguen activas a la vez. Usar otra vez la misma mejora solo la renueva. Se aplica a las siguientes mejoras que uses."},
+        {L"Muertes antes de no reaparecer", L"Con «Los enemigos no reaparecen»: cuántas veces tienes que matar a un enemigo para que deje de volver, como en Dark Souls II (allí 12). 1 es a la primera. Cada partida cuenta las muertes en el mismo archivo que la lista."},
+        {L"Personajes fantasmales sólidos (beta)", L"BETA: los personajes que se ven como fantasmas, como algunos jefes de las cárceles eternas, enemigos espectrales, Melina y los PNJ que invocas, pierden ese aspecto y se ven sólidos. Funcionan exactamente igual. Las cenizas espirituales tienen su propia opción más arriba. Se aplica en un segundo."},
+        {L"Mantener limpio a tu personaje (beta)", L"BETA: la sangre, el barro y las quemaduras ya no se quedan en el cuerpo de tu personaje; los enemigos se manchan como siempre. Funciona como el Jabón del juego, todo el rato: una marca de un golpe desaparece en menos de un cuarto de segundo. Se aplica al momento. Las salpicaduras siguen saliendo en el suelo."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -7397,7 +7886,7 @@ const Texts kChinese{
         {L"HUD 延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将血条、装备、卢恩和其他角落元素移到屏幕边缘。请与“允许超宽屏”一起使用。需重启游戏才能生效：游戏只在启动时加载一次 HUD。如果其他模组已为超宽屏调整 HUD，请关闭此项。"},
         {L"HUD 缩放 (%)", L"调整血条、装备、指南针、头目血条、卢恩和其他角落元素的大小，每个元素以其所在角落为基准缩放。需重启游戏才能生效：游戏只在启动时加载一次 HUD。"},
         {L"菜单延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将暂停菜单和其他菜单（装备、物品栏、状态、商店、升级、法术、仓库、选项、读取画面和标题画面）移到屏幕边缘，并加宽其背景。需重启游戏才能生效：游戏只在启动时加载一次菜单。如果其他模组替换了这些菜单，请关闭此项。"},
-        {L"敌人不再复活", L"被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活；重新开启后名单会再次生效。删除该存档的文件即可重新开始。"},
+        {L"敌人不再复活", L"被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活。在游戏中开启或关闭此选项会让该存档的名单重新开始（旧名单保存为 .bak），因此只计算开启期间击杀的敌人；若从游戏启动时就已开启，名单会在多次游玩之间保留。"},
         {L"是/否询问默认选“是”（测试版）", L"测试版：是/否询问打开时光标位于“是”而不是“否”：传送、退出、使用物品等；使用鼠标时，指针也会移到“是”上。对所有是/否询问生效，包括有风险的操作，确认前请看清楚。其他窗口（如物品数量）不变。"},
         {L"可攻击倒地敌人", L"与《艾尔登法环 黑夜君临》相同，被致命一击或弹反后处决击倒在地的敌人，在倒地和起身期间会受到伤害。作为代价，敌人获得霸体，你的攻击不会再次使其硬直，但仍会削减其架势。致命一击期间，骨灰也能攻击它们。敌人抓住你时，你仍受保护。"},
         {L"灵马跳跃速度 (%)", L"缩放灵马跳跃和二段跳时的动作速度，包括借助上升气流的大跳跃。保持 100% 时，即使奔跑速度更快，二段跳也和原版一样容易。立即生效。"},
@@ -7418,7 +7907,7 @@ const Texts kChinese{
         {L"打开镜子", L"打开圆桌厅堂镜子的外观界面。请在战斗外使用。"},
         {L"重生", L"打开菈妮的重生界面以重新分配属性点。不需要幼虫之泪。请在战斗外使用。"},
         {L"头目血量 (%)", L"仅缩放头目的血量：主要头目、野外头目、地下城头目和 DLC 头目。与“敌人血量”相乘，因此“敌人血量”为 100% 时只改变头目。对之后加载的头目生效：在赐福处休息。"},
-        {L"保持角色干净（测试版）", L"测试版：目前也会作用于敌人，目标是只作用于你的角色。血迹、泥污和焦痕不再附着在角色身上，包括你和敌人。地面和墙壁上仍会出现飞溅痕迹。对新的攻击生效；已有的痕迹会照常消失。"},
+        {L"保持角色干净（测试版）", L"测试版：作用于所有角色，包括敌人；若只想让你的角色保持干净，请使用“保持你的角色干净”。血迹、泥污和焦痕不再附着在角色身上，包括你和敌人。地面和墙壁上仍会出现飞溅痕迹。对新的攻击生效；已有的痕迹会照常消失。"},
         {L"隐藏增益效果", L"你自身的增益（祷告、魔法、丸药、护符等）不再在身上显示粒子或光芒。效果完全相同，保留音效，隐身仍然有效。武器增益保持原样（见下方选项）。对你使用的下一个增益生效。"},
         {L"隐藏武器增益效果", L"油脂和武器附魔不再在武器上显示光芒或粒子。效果完全相同，保留音效。对你使用的下一个油脂或附魔生效。"},
         {L"闪避无敌时间 (%)（测试版）", L"测试版：延长翻滚、后撤步和闪避类战技的无敌时间。100% 为游戏原本的时间（轻、中翻滚 14 帧，重翻滚 13 帧）；200% 为两倍。额外时间紧接闪避本身的无敌时间，即使随后进行其他动作也会持续。仅对你的角色生效。"},
@@ -7428,6 +7917,12 @@ const Texts kChinese{
         {L"扩展范围", L"默认关闭。此菜单中的许多滑块可调范围更大，下方另有一行“倍率”（x1 至 x100）用于放大数值。重启游戏后生效。"},
         {L"高亮已更改的选项", L"默认关闭。不在游戏默认值的选项名称会以颜色显示，一眼就能看出改过什么。立即生效。"},
         {L"重复召唤同一骨灰", L"开启“同时召唤多个骨灰”时，再次使用已召唤骨灰的道具会再召唤一次，而不是解除它，这样可以同时拥有多个相同的骨灰；每次都会消耗 FP。“解除所有骨灰”可将其全部解除。默认关闭：道具会解除该骨灰。"},
+        {L"偏转判定时间 (%)（测试版）", L"测试版：使用偏转硬泪滴时，延长完美防御的判定时间。100% 为游戏原本的判定（举盾时 6 帧，连续偏转后会变短）；200% 将第一次的判定时间翻倍。仅作用于你的角色。"},
+        {L"骨灰不再呈幽灵外观", L"召唤的骨灰（以及瑟留斯的人偶）不再呈现蓝色幽灵外观，而是显示为实体角色。效果完全不变。从下一次召唤的骨灰开始生效。"},
+        {L"叠加自身增益（测试版）", L"测试版：同类的自身增益不再互相覆盖，例如“火焰，赐我力量”、“黄金屏障”和水煮螃蟹，或“黄金誓约”和振奋香药，都能同时生效。再次使用同一增益仍只会刷新时间。从下一次使用的增益开始生效。"},
+        {L"不再复活前的击杀次数", L"开启“敌人不再复活”时：敌人需要被击杀多少次才不再复活，类似《黑暗之魂 II》（该作为 12 次）。1 表示第一次击杀后即不再复活。每个存档的击杀次数与名单保存在同一个文件中。"},
+        {L"幽灵角色实体化（测试版）", L"测试版：以幽灵形态显示的角色（例如部分永恒监牢的头目、灵体敌人、梅琳娜和你召唤的 NPC）不再呈现幽灵外观，而是显示为实体。效果完全不变。骨灰有上方的单独选项。约一秒内生效。"},
+        {L"保持你的角色干净（测试版）", L"测试版：血迹、泥土和焦痕不再留在你的角色身上；敌人照常沾染。效果如同游戏中的肥皂，并且持续生效：被击中留下的痕迹会在四分之一秒内消失。立即生效。地面上的溅射痕迹仍会出现。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -7445,7 +7940,7 @@ const Layout kLayout[]{
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
     {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_jump, speed_item,
         jump_height, jump_distance}},
-    {cat_defense, {dodge_frames, parry_frames, perfect_guard, knockdown_invincible, item_super_armor}},
+    {cat_defense, {dodge_frames, parry_frames, deflect_window, perfect_guard, knockdown_invincible, item_super_armor}},
     {cat_torrent, {torrent_no_death, torrent_speed, torrent_jump_speed, torrent_jump_height,
         torrent_jump_distance}},
     {cat_dealt, {damage_dealt, dmg_physical, dmg_magic, dmg_fire, dmg_lightning, dmg_holy, weapon_scaling,
@@ -7457,9 +7952,9 @@ const Layout kLayout[]{
     {cat_status, {status_buildup, buildup_bleed, buildup_poison, buildup_rot, buildup_frost, buildup_sleep,
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
-    {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, buff_enemy}},
+    {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
     {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemies_no_attack, enemies_no_move,
-        enemies_no_ai, enemies_no_respawn, enemies_downed_vulnerable}},
+        enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable}},
     {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
@@ -7467,7 +7962,7 @@ const Layout kLayout[]{
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on}},
     {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance,
-        clean_characters, hide_buff_effects, hide_weapon_buff_effects}},
+        clean_characters, player_clean, hide_buff_effects, hide_weapon_buff_effects, solid_ashes, solid_ghosts}},
     {cat_display, {fps_unlock, fps_limit, refresh_rate, ultrawide}},
     {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default,
         extended_ranges, highlight_changed}},
@@ -7808,6 +8303,7 @@ void add_profile_page(erui::Page& root, std::string_view lang, const wchar_t* pa
 int audit(LogFn log_fn) noexcept {
     g_log = log_fn;
     for (Site* site : kSites) resolve(*site);
+    resolve(g_buddy_set_size);
     resolve_dialog_yes_reads(false);
     resolve(g_intro);
     resolve_window();
@@ -7916,6 +8412,8 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         start_thread(&enemy_speed_worker, L"enemy_speed");
         start_thread(&jump_worker, L"jump");
         start_thread(&dead_enemy_worker, L"dead_enemy");
+        start_thread(&ghost_worker, L"ghost");
+        start_thread(&clean_worker, L"clean");
         start_thread(&status_worker, L"status");
         if (g_windows) start_thread(&window_worker, L"dodge_parry");
     }

@@ -204,7 +204,9 @@ void run(const Binding& binding) {
     int applied = current;
     if (!g_target.set(binding.target, wanted, applied)) return;
     logf(L"Hotkeys: %s set %s to %d.", binding.text, binding.target, applied);
-    tone(is_toggle ? applied != 0 : applied >= current);
+    // Buttons (Dismiss all, Open mirror...) act and fall back to 0, so a
+    // toggle reports what was asked, not the value left behind.
+    tone(is_toggle ? wanted != 0 : applied >= current);
 }
 
 // The INI is checked once a second: under MO2 every file query goes through
