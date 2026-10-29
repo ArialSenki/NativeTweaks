@@ -1577,6 +1577,13 @@ enum Id : std::size_t {
     solid_ghosts,
     // Image: only your character stays clean (Nexus request)
     player_clean,
+    // Map & Travel: Melina's level-up screen anywhere (Melina companion, phase 1)
+    open_level_up,
+    // Spirit Ashes: Melina as a spirit companion (Melina companion, phase 2)
+    summon_melina,
+    melina_companion,
+    // Buffs: weapon buffs of each hand stack instead of replacing each other (Nexus request)
+    stack_weapon_buffs,
     count
 };
 
@@ -1710,6 +1717,10 @@ Option g_options[count]{
     slider(L"EnemyRespawnKills", 1, 1, 50, 1),
     toggle(L"SolidGhostCharacters"),
     toggle(L"KeepPlayerClean"),
+    toggle(L"OpenLevelUp"),
+    toggle(L"SummonMelina"),
+    toggle(L"MelinaCompanion"),
+    toggle(L"StackWeaponBuffs"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -2162,6 +2173,11 @@ struct BuffState {
     std::vector<std::uintptr_t> stack_rows{};
     std::vector<std::uint16_t> stack_original{};
     bool stack_applied{};
+    // Stack weapon buffs: weapon buffs in 162 (right hand) and 163 (left hand)
+    // go to 0 the same way.
+    std::vector<std::uintptr_t> stack_weapon_rows{};
+    std::vector<std::uint16_t> stack_weapon_original{};
+    bool stack_weapon_applied{};
     // Deflect window: msa\src\deflect.rs carries the perfect guard on.
     int deflect_applied{100};
 };
@@ -2169,6 +2185,12 @@ struct BuffState {
 BuffState g_buffs{};
 constexpr Id kBuffIds[3]{buff_weapon, buff_self, buff_enemy};
 constexpr std::uint8_t kWepChangeSelf = 3;
+// Self buffs shorter than 5 s that players expect to count (Nexus, r142):
+// Endure's poise buff, 3-3.5 s (1650/1655, and 1651/1656 when used without
+// FP); its target bits would also file it as an enemy one. The light attacks
+// lost in the first test came from Hide weapon buff effects, not from this.
+constexpr std::uint32_t kShortSelfBuffs[]{1650, 1651, 1655, 1656};
+std::uintptr_t param_row_by_id(const game::ParamTable& table, std::uint32_t id) noexcept;
 constexpr std::ptrdiff_t kSpCategory = 0x13E;
 // Deflecting Hardtear perfect guard window: 6 frames at 30 per second.
 constexpr int kDeflectWindowMs = 200;
@@ -2198,6 +2220,14 @@ void sync_buffs() noexcept {
             g_buffs.rows[category].push_back(row);
             g_buffs.original[category].push_back(duration);
         }
+        for (const std::uint32_t id : kShortSelfBuffs) {
+            const std::uintptr_t row = param_row_by_id(table, id);
+            float duration{};
+            if (!row || !game::read(row + 0x8, duration) || duration <= 0.0f) continue;
+            if (std::find(g_buffs.rows[1].begin(), g_buffs.rows[1].end(), row) != g_buffs.rows[1].end()) continue;
+            g_buffs.rows[1].push_back(row);
+            g_buffs.original[1].push_back(duration);
+        }
         wchar_t message[160]{};
         swprintf_s(message, L"Effect durations: %zu weapon, %zu self, %zu enemy SpEffectParam rows.",
             g_buffs.rows[0].size(), g_buffs.rows[1].size(), g_buffs.rows[2].size());
@@ -2209,6 +2239,14 @@ void sync_buffs() noexcept {
             g_buffs.stack_original.push_back(group);
         }
         swprintf_s(message, L"Stack self buffs: %zu self buffs in replacing groups.", g_buffs.stack_rows.size());
+        log(message);
+        for (const auto row : g_buffs.rows[0]) {
+            std::uint16_t group{};
+            if (!game::read(row + kSpCategory, group) || (group != 162 && group != 163)) continue;
+            g_buffs.stack_weapon_rows.push_back(row);
+            g_buffs.stack_weapon_original.push_back(group);
+        }
+        swprintf_s(message, L"Stack weapon buffs: %zu weapon buffs in replacing groups.", g_buffs.stack_weapon_rows.size());
         log(message);
         g_buffs.ready = true;
     }
@@ -2227,6 +2265,13 @@ void sync_buffs() noexcept {
         for (std::size_t r = 0; r < g_buffs.stack_rows.size(); ++r)
             game::write<std::uint16_t>(g_buffs.stack_rows[r] + kSpCategory, stack ? 0 : g_buffs.stack_original[r]);
         g_buffs.stack_applied = stack;
+    }
+    const bool stack_weapon = value_of(stack_weapon_buffs) != 0;
+    if (stack_weapon != g_buffs.stack_weapon_applied) {
+        for (std::size_t r = 0; r < g_buffs.stack_weapon_rows.size(); ++r)
+            game::write<std::uint16_t>(g_buffs.stack_weapon_rows[r] + kSpCategory,
+                stack_weapon ? 0 : g_buffs.stack_weapon_original[r]);
+        g_buffs.stack_weapon_applied = stack_weapon;
     }
     const int deflect = value_of(deflect_window);
     if (deflect != g_buffs.deflect_applied) {
@@ -3808,8 +3853,29 @@ void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* 
             if (table.file) state.attempted = true;
             return;
         }
+        // The effects a buff turns into or repeats (replaceSpEffectId +0x124,
+        // cycleOccurrenceSpEffectId +0x128) draw some of its visuals too
+        // (Nexus, r142: some effects still showed), up to 4 links deep.
+        std::vector<std::uintptr_t> effects = g_buffs.rows[category];
+        game::ParamTable effect_table;
+        if (game::find_param(g_statics, L"SpEffectParam", 0x390, effect_table, g_log)) {
+            std::vector<std::uintptr_t> frontier = effects;
+            for (int depth = 0; depth < 4 && !frontier.empty(); ++depth) {
+                std::vector<std::uintptr_t> next;
+                for (const auto effect : frontier)
+                    for (const std::ptrdiff_t link : {0x124, 0x128}) {
+                        std::int32_t id{};
+                        if (!game::read(effect + link, id) || id <= 0) continue;
+                        const std::uintptr_t linked = param_row_by_id(effect_table, static_cast<std::uint32_t>(id));
+                        if (!linked || std::find(effects.begin(), effects.end(), linked) != effects.end()) continue;
+                        effects.push_back(linked);
+                        next.push_back(linked);
+                    }
+                frontier = std::move(next);
+            }
+        }
         std::vector<std::int32_t> ids;
-        for (const auto effect : g_buffs.rows[category])
+        for (const auto effect : effects)
             for (const auto slot : kBuffVfxSlots) {
                 std::int32_t id{};
                 if (game::read(effect + slot, id) && id > 0) ids.push_back(id);
@@ -3842,6 +3908,52 @@ void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* 
         for (std::size_t f = 0; f < std::size(kBuffVfxFields); ++f)
             game::write<std::int32_t>(state.rows[r] + kBuffVfxFields[f],
                 want ? -1 : state.original[r * std::size(kBuffVfxFields) + f]);
+    state.applied = want;
+}
+
+// Hide weapon buff effects: the weapon buffs (g_buffs.rows[0]) lose their
+// links to SpEffectVfxParam (vfxId..vfxId7 -> -1) instead. Clearing the sfx of
+// their rows, as for self buffs, left the game spawning a stray effect on the
+// weapon (in-game test 2026-10-29, any grease: a big golden smoke wall) and
+// light attacks stopped working; the magic glow stayed on the weapon too.
+void sync_weapon_buff_vfx() noexcept {
+    auto& state = g_weapon_buff_vfx;
+    if (state.attempted) return;
+    if (!state.ready) {
+        if (g_buffs.attempted) {
+            state.attempted = true;
+            return;
+        }
+        if (!g_buffs.ready) return;
+        for (const auto effect : g_buffs.rows[0]) {
+            std::int32_t ids[std::size(kBuffVfxSlots)]{};
+            bool any = false;
+            for (std::size_t s = 0; s < std::size(kBuffVfxSlots); ++s) {
+                ids[s] = -1;
+                game::read(effect + kBuffVfxSlots[s], ids[s]);
+                any = any || ids[s] > 0;
+            }
+            if (!any) continue;
+            state.rows.push_back(effect);
+            state.original.insert(state.original.end(), std::begin(ids), std::end(ids));
+        }
+        wchar_t message[140]{};
+        swprintf_s(message, L"Hide weapon buff effects: %zu of %zu weapon buffs have visuals.",
+            state.rows.size(), g_buffs.rows[0].size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(hide_weapon_buff_effects) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        for (std::size_t s = 0; s < std::size(kBuffVfxSlots); ++s) {
+            const std::int32_t original = state.original[r * std::size(kBuffVfxSlots) + s];
+            if (original > 0) game::write<std::int32_t>(state.rows[r] + kBuffVfxSlots[s], want ? -1 : original);
+        }
     state.applied = want;
 }
 
@@ -4008,7 +4120,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_journey();
         sync_clean();
         sync_buff_vfx(g_buff_vfx, 1, hide_buff_effects, L"self buff");
-        sync_buff_vfx(g_weapon_buff_vfx, 0, hide_weapon_buff_effects, L"weapon buff");
+        sync_weapon_buff_vfx();
         sync_ghost();
         sync_ghost_all();
         sync_ghost_npc();
@@ -5568,6 +5680,8 @@ void send_hud_layout(const wchar_t* when) noexcept {
 }
 
 void set_death_hook(bool on) noexcept;  // enemy death hook, defined with dead_enemy_worker
+extern "C" std::uint8_t nt_summon_melina();  // msa\src\melina.rs
+extern "C" std::uint8_t nt_set_melina_companion(std::uint8_t enabled);
 
 void apply(Id id) noexcept {
     AcquireSRWLockExclusive(&g_patch_lock);
@@ -5599,7 +5713,7 @@ void apply(Id id) noexcept {
         wake_workers();
         if (g_param_event) SetEvent(g_param_event);
         break;
-    case player_clean: wake_workers(); break;  // clean_worker
+    case player_clean: case melina_companion: wake_workers(); break;  // clean_worker
     case pause_key:
         if (!on(id) && g_paused) {
             set_site(g_pause, false);
@@ -5651,11 +5765,19 @@ void apply(Id id) noexcept {
         else if (on(id)) log(L"Dismiss all ashes: needs Several ashes at once; nothing dismissed.");
         g_options[id].value = 0;
         break;
-    case open_mirror: case open_rebirth:
+    case summon_melina:
+        // A button: msa\src\melina.rs puts her summon trigger on the player.
+        if (on(id)) {
+            const bool queued = nt_summon_melina() != 0;
+            log(queued ? L"Summon Melina: requested." : L"Summon Melina: not available yet.");
+        }
+        g_options[id].value = 0;
+        break;
+    case open_mirror: case open_level_up: case open_rebirth:
         // Buttons like Dismiss all: the screen opens on the next game frame
         // (talk-script commands, msa\src\game_menus.rs).
         if (on(id)) {
-            const int kind = id == open_mirror ? 1 : 3;
+            const int kind = id == open_mirror ? 1 : id == open_level_up ? 2 : 3;
             const bool queued = spirit_ashes::open_game_menu(kind);
             wchar_t message[120]{};
             swprintf_s(message, L"Game menu %d: %s (last result %d).", kind,
@@ -5702,7 +5824,7 @@ void apply(Id id) noexcept {
     case equip_weight: case status_buildup: case player_poise: case enemy_poise:
     case player_poise_lock: case enemy_poise_lock: case posture_one_hit: case status_instant: case die_one_hit:
     case posture_one_hit_taken: case loot_drop: case fast_travel_anywhere:
-    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case ash_cost: case upgrade_cost:
+    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case stack_weapon_buffs: case ash_cost: case upgrade_cost:
     case ash_no_rest: case ash_anywhere: case ash_keep_after_boss:
     case weapon_bleed: case weapon_poison: case weapon_rot: case weapon_frost: case weapon_sleep:
     case dmg_physical: case dmg_magic: case dmg_fire: case dmg_lightning: case dmg_holy:
@@ -5750,7 +5872,7 @@ bool available(Id id) noexcept {
         return g_spirit_ashes_started;
     case refresh_rate: return g_fullscreen_cap.ready;
     case skip_intro: return g_intro.ready;
-    case open_mirror: case open_rebirth:
+    case open_mirror: case open_level_up: case open_rebirth: case summon_melina: case melina_companion:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case dialog_yes_default: return g_dialog_yes_data != nullptr;
     case extended_ranges: case highlight_changed: return !g_config_path.empty();
@@ -5767,7 +5889,7 @@ bool available(Id id) noexcept {
     case equip_weight: case status_buildup: case player_poise: case enemy_poise:
     case player_poise_lock: case enemy_poise_lock: case posture_one_hit: case status_instant: case die_one_hit:
     case posture_one_hit_taken: case loot_drop: case fast_travel_anywhere:
-    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case ash_cost: case upgrade_cost:
+    case buff_weapon: case buff_self: case buff_enemy: case deflect_window: case stack_buffs: case stack_weapon_buffs: case ash_cost: case upgrade_cost:
     case ash_no_rest: case ash_anywhere: case ash_keep_after_boss:
     case weapon_bleed: case weapon_poison: case weapon_rot: case weapon_frost: case weapon_sleep:
     case dmg_physical: case dmg_magic: case dmg_fire: case dmg_lightning: case dmg_holy:
@@ -6399,6 +6521,80 @@ void set_death_hook(bool on) noexcept {
         ReleaseSRWLockExclusive(&g_death_lock);
         clear_rekilled();
     }
+}
+
+// Melina companion: her model's idle animations (c2180 TAE 0 and 20) set a
+// turn speed of 0 for the whole animation (TAE event 224 SetTurnSpeed; Tiche's
+// sets 5.0 for 3.33 s), so as a spirit she could not face you and walked off
+// in a straight line (in-game log 2026-10-28: always animation 2000, distance
+// growing). The event's setter (2.7.2.0 eldenring.exe+0x407020; rcx =
+// CSChrActionFlagModule, xmm1 = speed, r8b = priority; it writes +0x84 and
+// the priority +0x91) gets 5.0 instead of 0 when the module's character
+// (+0x8) is NpcParam 21809000, the row msa\src\melina.rs makes her spirit.
+constexpr const char* kTurnSpeedPattern =
+    "48 8B D1 44 38 81 91 00 00 00 7C ? F3 0F 11 89 84 00 00 00 44 88 81 91 00 00 00";
+constexpr std::uint8_t kTurnSpeedEntry[]{0x48, 0x8B, 0xD1, 0x44, 0x38, 0x81, 0x91, 0x00, 0x00, 0x00};
+constexpr std::int32_t kMelinaSpiritNpc = 21809000;
+constexpr std::uint32_t kMelinaTurnSpeed = 0x40A00000;  // 5.0f
+
+// Melina companion is work in progress (separate mod): its hook stays off.
+constexpr bool kMelinaWip = false;
+
+void install_turn_speed_hook() noexcept {
+    std::uint8_t* site = find_unique(parse_pattern(kTurnSpeedPattern));
+    if (!site) {
+        log(L"Vanilla site 'turn speed' not found (or ambiguous); Melina may not turn.");
+        return;
+    }
+    if (std::memcmp(site, kTurnSpeedEntry, sizeof(kTurnSpeedEntry)) != 0) {
+        log(L"Vanilla turn speed code was changed by another mod; left alone.");
+        return;
+    }
+    std::uint8_t* code = alloc_near(site);
+    if (!code) {
+        log(L"Vanilla turn speed hook: no memory near the game code.");
+        return;
+    }
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_u32 = [&](std::uint32_t v) { std::memcpy(p, &v, 4); p += 4; };
+    const auto put_u64 = [&](std::uint64_t v) { std::memcpy(p, &v, 8); p += 8; };
+    put({0x50});                                       // push rax
+    put({0x48, 0x8B, 0x41, 0x08});                     // mov rax,[rcx+8] (owner ChrIns)
+    put({0x48, 0x85, 0xC0});                           // test rax,rax
+    put({0x74, 0x00});                                 // jz done
+    std::uint8_t* const no_owner = p;
+    put({0x81, 0x78, 0x60}); put_u32(static_cast<std::uint32_t>(kMelinaSpiritNpc));  // cmp dword [rax+60h],id
+    put({0x75, 0x00});                                 // jne done
+    std::uint8_t* const not_melina = p;
+    put({0x66, 0x0F, 0x7E, 0xC8});                     // movd eax,xmm1
+    put({0xA9}); put_u32(0x7FFFFFFF);                  // test eax,7FFFFFFFh (any speed but +-0)
+    put({0x75, 0x00});                                 // jnz done
+    std::uint8_t* const has_speed = p;
+    put({0xB8}); put_u32(kMelinaTurnSpeed);            // mov eax,5.0f
+    put({0x66, 0x0F, 0x6E, 0xC8});                     // movd xmm1,eax
+    no_owner[-1] = static_cast<std::uint8_t>(p - no_owner);
+    not_melina[-1] = static_cast<std::uint8_t>(p - not_melina);
+    has_speed[-1] = static_cast<std::uint8_t>(p - has_speed);
+    put({0x58});                                       // done: pop rax
+    for (const auto b : kTurnSpeedEntry) *p++ = b;     // mov rdx,rcx; cmp [rcx+91h],r8b
+    put({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});         // jmp [rip+0] -> the jl after them
+    put_u64(reinterpret_cast<std::uint64_t>(site + sizeof(kTurnSpeedEntry)));
+    FlushInstructionCache(GetCurrentProcess(), code, 128);
+    std::uint8_t patch[sizeof(kTurnSpeedEntry)]{0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(code) -
+        reinterpret_cast<std::intptr_t>(site + 5));
+    std::memcpy(patch + 1, &disp, 4);
+    if (!write_code(site, patch, sizeof(patch))) {
+        log(L"Vanilla turn speed hook could not be written.");
+        return;
+    }
+    wchar_t message[120]{};
+    swprintf_s(message, L"Vanilla turn speed hook installed at eldenring.exe+0x%llX (Melina's spirit turns).",
+        static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(game::image())));
+    log(message);
 }
 
 
@@ -7092,19 +7288,35 @@ DWORD WINAPI ghost_worker(void*) noexcept {
 // save loaded changed nothing.
 extern "C" std::uint8_t nt_set_player_clean(std::uint8_t enabled);
 
+// Switches of the msa frame tasks: Keep your character clean (clean.rs) and
+// Melina companion (melina.rs). Each asks again every second until the
+// game's task scheduler is up.
 DWORD WINAPI clean_worker(void*) noexcept {
-    bool running{};
+    struct Switch {
+        Id option;
+        std::uint8_t (*set)(std::uint8_t);
+        const wchar_t* on;
+        const wchar_t* off;
+        bool running;
+    };
+    Switch switches[]{
+        {player_clean, &nt_set_player_clean, L"Keep your character clean: on.", L"Keep your character clean: off.", false},
+    };
     perf::Loop loop(L"clean");
     for (;;) {
-        const bool want = value_of(player_clean) != 0;
-        if (want != running) {
-            if (nt_set_player_clean(want ? 1 : 0)) {
-                running = want;
-                log(want ? L"Keep your character clean: on." : L"Keep your character clean: off.");
+        bool pending = false;
+        for (auto& sw : switches) {
+            const bool want = value_of(sw.option) != 0;
+            if (want == sw.running) continue;
+            if (sw.set(want ? 1 : 0)) {
+                sw.running = want;
+                log(want ? sw.on : sw.off);
+            } else {
+                pending = true;
             }
         }
-        if (want == running) idle_wait(loop);
-        else loop.sleep(1000);  // the game's task scheduler isn't up yet
+        if (pending) loop.sleep(1000);
+        else idle_wait(loop);
     }
 }
 
@@ -7356,7 +7568,7 @@ const Texts kEnglish{
         {L"Enemies", L"Enemy health, speed, behaviour and respawns."},
         {L"Spirit Ashes", L"Summoning cost, several spirits at once, and where and when they can be called."},
         {L"Runes, Shops & Upgrades", L"Runes, item drops, shop prices, upgrades and crafting."},
-        {L"Map & Travel", L"Graces, map reveal, fast travel, and the mirror and rebirth anywhere."},
+        {L"Map & Travel", L"Graces, map reveal, fast travel, and the mirror, level up and rebirth anywhere."},
         {L"World", L"Time of day and weather."},
         {L"Camera", L"Field of view, camera behaviour and lock-on."},
         {L"Image", L"Post-processing and level of detail."},
@@ -7529,6 +7741,10 @@ const Texts kEnglish{
         {L"Kills before staying dead", L"With Enemies stay dead: how many times you have to kill an enemy before it stops coming back, like Dark Souls II (12 there). 1 is right away. Each save counts its kills in the same file as the list."},
         {L"Solid ghostly characters (beta)", L"BETA: characters drawn as ghosts, such as some Evergaol bosses, spectral enemies, Melina and NPCs you summon, lose that look and appear solid. They work exactly the same. Spirit ashes have their own option above. Applies within a second."},
         {L"Keep your character clean (beta)", L"BETA: blood, mud and scorch marks no longer stick to your character's body; enemies get them as usual. Works like the game's Soap, all the time: a mark from a hit is gone within a quarter of a second. Applies at once. Splatters still appear on the ground."},
+        {L"Level up", L"Opens the level-up screen Melina offers at a grace, to spend runes on your attributes anywhere. Use it out of combat. It can be bound to a key in [Hotkeys] of NativeTweaks.ini (OpenLevelUp = F9)."},
+        {L"Summon Melina (beta)", L"BETA: summons Melina as a spirit companion that fights beside you, using the fighting Melina the game has but never uses. Works best with Summon anywhere and Several ashes at once. She uses her own attacks with Black Knife Tiche's spirit AI."},
+        {L"Melina companion (beta)", L"BETA: Melina is always with you as a spirit companion. She is summoned again by herself whenever she is not beside you: after you rest at a grace (she sits beside you while you rest), after a loading screen or if she falls. Works best with Summon anywhere and Several ashes at once. Dismiss all ashes sends her away until she comes back."},
+        {L"Stack weapon buffs (beta)", L"BETA: buffs on the same weapon no longer replace each other, so for example a grease and an armament spell or a weapon skill buff stay on together, each with its own damage. The weapon shows one of them. Applies to the next buffs you use."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -7553,7 +7769,7 @@ const Texts kSpanish{
         {L"Enemigos", L"Vida, velocidad, comportamiento y reaparición de los enemigos."},
         {L"Cenizas espirituales", L"Coste de invocación, varias cenizas a la vez y dónde y cuándo puedes llamar a los espíritus."},
         {L"Runas, tiendas y mejoras", L"Runas, objetos que sueltan los enemigos, precios de tiendas, mejoras y fabricación."},
-        {L"Mapa y viaje", L"Gracias, mapa revelado, viaje rápido, y el espejo y el renacimiento en cualquier lugar."},
+        {L"Mapa y viaje", L"Gracias, mapa revelado, viaje rápido, y el espejo, subir de nivel y el renacimiento en cualquier lugar."},
         {L"Mundo", L"Hora del día y clima."},
         {L"Cámara", L"Campo de visión, comportamiento de la cámara y fijado de objetivo."},
         {L"Imagen", L"Posprocesado y nivel de detalle."},
@@ -7726,6 +7942,10 @@ const Texts kSpanish{
         {L"Muertes antes de no reaparecer", L"Con «Los enemigos no reaparecen»: cuántas veces tienes que matar a un enemigo para que deje de volver, como en Dark Souls II (allí 12). 1 es a la primera. Cada partida cuenta las muertes en el mismo archivo que la lista."},
         {L"Personajes fantasmales sólidos (beta)", L"BETA: los personajes que se ven como fantasmas, como algunos jefes de las cárceles eternas, enemigos espectrales, Melina y los PNJ que invocas, pierden ese aspecto y se ven sólidos. Funcionan exactamente igual. Las cenizas espirituales tienen su propia opción más arriba. Se aplica en un segundo."},
         {L"Mantener limpio a tu personaje (beta)", L"BETA: la sangre, el barro y las quemaduras ya no se quedan en el cuerpo de tu personaje; los enemigos se manchan como siempre. Funciona como el Jabón del juego, todo el rato: una marca de un golpe desaparece en menos de un cuarto de segundo. Se aplica al momento. Las salpicaduras siguen saliendo en el suelo."},
+        {L"Subir de nivel", L"Abre la pantalla de subir de nivel que ofrece Melina en una gracia, para gastar runas en tus atributos en cualquier lugar. Úsalo fuera de combate. Puedes asignarle una tecla en [Hotkeys] de NativeTweaks.ini (OpenLevelUp = F9)."},
+        {L"Invocar a Melina (beta)", L"BETA: invoca a Melina como ceniza acompañante que pelea a tu lado, usando la Melina de combate que el juego tiene sin usar. Funciona mejor con Invocar en cualquier lugar y Varias cenizas a la vez. Usa sus propios ataques con la IA de ceniza de Tiche."},
+        {L"Melina acompañante (beta)", L"BETA: Melina está siempre contigo como ceniza acompañante. Se vuelve a invocar sola cuando no está a tu lado: después de descansar en una gracia (se sienta a tu lado mientras descansas), tras una pantalla de carga o si cae. Funciona mejor con Invocar en cualquier lugar y Varias cenizas a la vez. Retirar todas las cenizas la aparta hasta que vuelva."},
+        {L"Acumular mejoras de arma (beta)", L"BETA: las mejoras de una misma arma ya no se sustituyen entre sí; por ejemplo, una grasa y un hechizo de arma o la mejora de una habilidad siguen activas a la vez, cada una con su daño. El arma muestra solo una. Se aplica a las siguientes mejoras que uses."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -7750,7 +7970,7 @@ const Texts kChinese{
         {L"敌人", L"敌人的血量、速度、行为与重生。"},
         {L"骨灰", L"召唤消耗、同时召唤多个骨灰，以及何时何地可以召唤骨灰。"},
         {L"卢恩、商店与强化", L"卢恩、道具掉落、商店价格、强化与制作。"},
-        {L"地图与传送", L"赐福、地图显示、传送，以及随时使用镜子与重生。"},
+        {L"地图与传送", L"赐福、地图显示、传送，以及随时使用镜子、升级与重生。"},
         {L"世界", L"时间与天气。"},
         {L"镜头", L"视野、镜头行为与锁定。"},
         {L"画面", L"后期处理与细节层次。"},
@@ -7923,6 +8143,10 @@ const Texts kChinese{
         {L"不再复活前的击杀次数", L"开启“敌人不再复活”时：敌人需要被击杀多少次才不再复活，类似《黑暗之魂 II》（该作为 12 次）。1 表示第一次击杀后即不再复活。每个存档的击杀次数与名单保存在同一个文件中。"},
         {L"幽灵角色实体化（测试版）", L"测试版：以幽灵形态显示的角色（例如部分永恒监牢的头目、灵体敌人、梅琳娜和你召唤的 NPC）不再呈现幽灵外观，而是显示为实体。效果完全不变。骨灰有上方的单独选项。约一秒内生效。"},
         {L"保持你的角色干净（测试版）", L"测试版：血迹、泥土和焦痕不再留在你的角色身上；敌人照常沾染。效果如同游戏中的肥皂，并且持续生效：被击中留下的痕迹会在四分之一秒内消失。立即生效。地面上的溅射痕迹仍会出现。"},
+        {L"升级", L"打开梅琳娜在赐福处提供的升级界面，可随时随地消耗卢恩提升属性。请在战斗外使用。也可以在 NativeTweaks.ini 的 [Hotkeys] 中绑定按键（OpenLevelUp = F9）。"},
+        {L"召唤梅琳娜（测试版）", L"测试版：将梅琳娜作为骨灰同伴召唤，在你身边战斗，使用游戏中存在但未使用的战斗版梅琳娜。配合“随处召唤”与“同时召唤多个骨灰”效果最佳。她使用自己的攻击动作，并采用黑刀蒂契的骨灰AI。"},
+        {L"梅琳娜同伴（测试版）", L"测试版：梅琳娜作为骨灰同伴始终陪伴你。当她不在你身边时会自动重新召唤：在赐福处休息后（你休息时她会坐在你身旁）、读取画面后或她倒下后。配合“随处召唤”与“同时召唤多个骨灰”效果最佳。“解除全部骨灰”会让她暂时离开，之后她会再次出现。"},
+        {L"叠加武器增益（测试版）", L"测试版：同一把武器上的增益不再互相覆盖，例如油脂与武器附魔法术或战技增益可同时生效，各自提供伤害。武器只显示其中一种效果。从下一次使用的增益开始生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -7952,13 +8176,15 @@ const Layout kLayout[]{
     {cat_status, {status_buildup, buildup_bleed, buildup_poison, buildup_rot, buildup_frost, buildup_sleep,
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
-    {cat_buffs, {buff_weapon, buff_weapon_forever, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
+    {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
     {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemies_no_attack, enemies_no_move,
         enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable}},
+    // Summon Melina and Melina companion (summon_melina, melina_companion) stay out
+    // of the menu: work in progress, moving to a separate mod (2026-10-28).
     {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
-    {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_rebirth}},
+    {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_level_up, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on}},
     {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance,
@@ -8249,6 +8475,9 @@ std::wstring profile_message(const wchar_t* ProfileTexts::*field) {
     return maybe_traditional(g_profile_language, profile_texts(g_profile_language).*field);
 }
 
+// The placeholder of an unavailable option (disabled, so never pressed).
+void ERUI_CALL unavailable_clicked(void*) noexcept {}
+
 void ERUI_CALL save_profile_clicked(void* target) noexcept {
     const int slot = static_cast<int>(reinterpret_cast<std::uintptr_t>(target));
     try {
@@ -8386,6 +8615,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     install_lock_range_hooks();
     install_toughness_hook();
     install_death_hook();
+    if (kMelinaWip) install_turn_speed_hook();
     resolve_chr_enable();
     g_statics = game::resolve_statics(g_log);
     load_settings();
@@ -8661,14 +8891,16 @@ void add_pages(erui::Page& parent, const char* language) noexcept {
             } catch (...) {
                 help = ok ? t.options[i].help : t.unavailable;
             }
-            if (!ok && option.kind != Kind::toggle) {
-                // An unavailable slider is shown as a disabled toggle: in game a
-                // disabled native slider row still looked active (HUD scale with
-                // RuntimePatch = 0), while disabled toggles are greyed out. The
-                // placeholder is not the option's row, so value, default and
-                // slider-text updates skip it; it has no multiplier row either.
+            if (!ok) {
+                // An unavailable option is shown as a disabled button, without a
+                // value: a disabled native slider row still looked active (HUD
+                // scale with RuntimePatch = 0), and a disabled toggle reads "On"
+                // whatever its value (Nexus, r142: greyed-out options "stuck on"
+                // with ME3). The placeholder is not the option's row, so value,
+                // default and slider-text updates skip it; it has no multiplier
+                // row either.
                 const erui::RowHandle placeholder =
-                    page.add_toggle(t.options[i].label, help, 0, nullptr, nullptr, false);
+                    page.add_button(t.options[i].label, help, &unavailable_clicked, nullptr, false);
                 live_text::track_row(placeholder, [i](const char* l) {
                     const bool complete = texts_for(l).options[i].label && texts_for(l).options[i].help;
                     const char* const code = complete ? l : "en";
