@@ -2728,7 +2728,7 @@ void start_spirit_ashes() noexcept {
         log(message);
     }
     log(g_spirit_ashes_started
-            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.5, built in) started."
+            ? L"Several ashes at once (Multiple Spirit Ashes 1.0.0, built in) started."
             : L"Several ashes at once unavailable: unsupported game version or MultipleSpiritAshes.dll is loaded.");
 }
 
