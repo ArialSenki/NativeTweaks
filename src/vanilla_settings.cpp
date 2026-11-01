@@ -1584,6 +1584,8 @@ enum Id : std::size_t {
     melina_companion,
     // Buffs: weapon buffs of each hand stack instead of replacing each other (Nexus request)
     stack_weapon_buffs,
+    // Speed: sprinting on top of Movement speed (Nexus request)
+    speed_sprint,
     count
 };
 
@@ -1721,6 +1723,7 @@ Option g_options[count]{
     toggle(L"SummonMelina"),
     toggle(L"MelinaCompanion"),
     toggle(L"StackWeaponBuffs"),
+    slider(L"SpeedSprintPercent", 100, 25, 1300, 5),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1777,6 +1780,7 @@ Scale g_scales[]{
     {speed_move, L"SpeedMoveScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_jump, L"SpeedJumpScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_item, L"SpeedItemScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_sprint, L"SpeedSprintScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {enemy_speed, L"EnemySpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_speed, L"TorrentSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_jump_speed, L"TorrentJumpSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
@@ -2158,8 +2162,9 @@ void sync_loot() noexcept {
 // on its target, such as Destined Death or a grease's "On Attack" status,
 // which stacked forever on enemies with permanent weapon buffs); enemy =
 // effectTargetOpposeTarget
-// (+0x16C bit 0); self = self or friendly target (+0x16C bits 2/1) that
-// applies to the player (+0x15F bit 3).
+// (+0x16C bit 0), unless an item or projectile of the player applies it to
+// themselves; self = self or friendly target (+0x16C bits 2/1) that applies
+// to the player (+0x15F bit 3).
 struct BuffState {
     bool attempted{};
     bool ready{};
@@ -2180,6 +2185,13 @@ struct BuffState {
     bool stack_weapon_applied{};
     // Deflect window: msa\src\deflect.rs carries the perfect guard on.
     int deflect_applied{100};
+    // Hide buff effects also covers these: consumables of any length and
+    // talismans' effects (Red-Feathered Branchsword, Ritual Sword...).
+    std::vector<std::uintptr_t> hide_extra{};
+    // Ids of every effect Hide buff effects covers (sorted), for the items
+    // that apply them.
+    std::vector<std::uint32_t> hidden_ids{};
+    std::vector<std::uint32_t> weapon_ids{};  // weapon buffs, sorted
 };
 
 BuffState g_buffs{};
@@ -2197,6 +2209,22 @@ constexpr int kDeflectWindowMs = 200;
 
 extern "C" std::uint8_t nt_set_deflect_window(std::uint32_t extra_ms);
 
+// SpEffect ids named by a param's rows (sorted, for binary search).
+std::vector<std::uint32_t> effect_ids(const wchar_t* param, std::size_t row_size,
+    std::initializer_list<std::ptrdiff_t> fields) noexcept {
+    std::vector<std::uint32_t> ids;
+    game::ParamTable table;
+    if (!game::find_param(g_statics, param, row_size, table, g_log)) return ids;
+    for (const auto row : table.rows)
+        for (const auto field : fields) {
+            std::int32_t id{};
+            if (game::read(row + field, id) && id > 0) ids.push_back(static_cast<std::uint32_t>(id));
+        }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
 void sync_buffs() noexcept {
     if (g_buffs.attempted) return;
     if (!g_buffs.ready) {
@@ -2205,17 +2233,45 @@ void sync_buffs() noexcept {
             if (table.file) g_buffs.attempted = true;
             return;
         }
-        for (const auto row : table.rows) {
+        // What the player puts on themselves from items (refId_default) and
+        // projectiles (spEffectIDForShooter): tears, cured meats, livers...
+        // also carry the enemy target bit, so they were filed as enemy effects
+        // (Nexus, r143: their visuals stayed with Hide buff effects).
+        const auto own = effect_ids(L"EquipParamGoods", 0xB0, {0x4});
+        const auto own_bullets = effect_ids(L"Bullet", 0x110, {0x60});
+        // A talisman's own effect is refId (+0x4); residentSpEffectId1-4 are extra.
+        const auto talismans = effect_ids(L"EquipParamAccessory", 0x60, {0x4, 0x4C, 0x50, 0x54, 0x58});
+        std::size_t moved{};
+        for (std::size_t i = 0; i < table.rows.size(); ++i) {
+            const auto row = table.rows[i];
+            std::uint32_t id{};
             float duration{};
             std::uint8_t weapon{}, targets{}, affiliation{};
-            if (!game::read(row + 0x8, duration) || duration < 5.0f || duration > 999.0f) continue;
+            if (!game::read(table.file + 0x40 + i * 0x18, id) || !game::read(row + 0x8, duration)) continue;
             game::read(row + 0x158, weapon);
             game::read(row + 0x16C, targets);
             game::read(row + 0x15F, affiliation);
+            const bool for_player = (targets & 0x6) && (affiliation & 0x8);
+            // Weapon buffs (greases, wepParamChange 1/2) stay out: clearing
+            // their effects' sfx brought back the golden smoke wall.
+            const bool own_source = weapon == 0 && (std::binary_search(own.begin(), own.end(), id) ||
+                std::binary_search(own_bullets.begin(), own_bullets.end(), id));
+            const bool own_buff = for_player && own_source;
+            // Some items leave out the player bit (Starlight Shards, Lulling
+            // Branch): they still only reach the user, so they are hidden too.
+            if ((own_source && (targets & 0x6) && duration > 1.0f && duration <= 999.0f) ||
+                std::binary_search(talismans.begin(), talismans.end(), id)) {
+                g_buffs.hide_extra.push_back(row);
+                g_buffs.hidden_ids.push_back(id);
+            }
+            if (duration < 5.0f || duration > 999.0f) continue;
             int category = -1;
             if (weapon && weapon != kWepChangeSelf) category = 0;
-            else if (targets & 0x1) category = 2;
-            else if ((targets & 0x6) && (affiliation & 0x8)) category = 1;
+            else if ((targets & 0x1) && !own_buff) category = 2;
+            else if (for_player) category = 1;
+            if (own_buff && (targets & 0x1) && category == 1) ++moved;
+            if (category == 1) g_buffs.hidden_ids.push_back(id);
+            if (category == 0) g_buffs.weapon_ids.push_back(id);
             if (category < 0) continue;
             g_buffs.rows[category].push_back(row);
             g_buffs.original[category].push_back(duration);
@@ -2228,9 +2284,13 @@ void sync_buffs() noexcept {
             g_buffs.rows[1].push_back(row);
             g_buffs.original[1].push_back(duration);
         }
-        wchar_t message[160]{};
-        swprintf_s(message, L"Effect durations: %zu weapon, %zu self, %zu enemy SpEffectParam rows.",
-            g_buffs.rows[0].size(), g_buffs.rows[1].size(), g_buffs.rows[2].size());
+        std::sort(g_buffs.hidden_ids.begin(), g_buffs.hidden_ids.end());
+        g_buffs.hidden_ids.erase(std::unique(g_buffs.hidden_ids.begin(), g_buffs.hidden_ids.end()),
+            g_buffs.hidden_ids.end());
+        std::sort(g_buffs.weapon_ids.begin(), g_buffs.weapon_ids.end());
+        wchar_t message[240]{};
+        swprintf_s(message, L"Effect durations: %zu weapon, %zu self (%zu items/projectiles), %zu enemy SpEffectParam rows; %zu more for Hide buff effects.",
+            g_buffs.rows[0].size(), g_buffs.rows[1].size(), moved, g_buffs.rows[2].size(), g_buffs.hide_extra.size());
         log(message);
         for (const auto row : g_buffs.rows[1]) {
             std::uint16_t group{};
@@ -2610,7 +2670,7 @@ void start_spirit_ashes() noexcept {
         log(message);
     }
     log(g_spirit_ashes_started
-            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.3, built in) started."
+            ? L"Several ashes at once (Multiple Spirit Ashes 0.2.5, built in) started."
             : L"Several ashes at once unavailable: unsupported game version or MultipleSpiritAshes.dll is loaded.");
 }
 
@@ -3820,7 +3880,8 @@ void sync_clean() noexcept {
 }
 
 // Hide buff effects (Nexus request): the self buffs that Self buff duration
-// already sorts out (g_buffs.rows[1]: 247 SpEffects in 2.7.2.0) draw their
+// already sorts out (g_buffs.rows[1]: 247 SpEffects in 2.7.2.0), plus the
+// consumables and talismans of g_buffs.hide_extra, draw their
 // particles and body glow through SpEffectParam.vfxId..vfxId7 (s32 +0x170,
 // +0x18C..+0x1A4) -> SpEffectVfxParam (row 0xA4, 123 rows). Their particle
 // effects (midstSfxId +0x0, initSfxId +0x8, finishSfxId +0x10) and material
@@ -3857,6 +3918,7 @@ void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* 
         // cycleOccurrenceSpEffectId +0x128) draw some of its visuals too
         // (Nexus, r142: some effects still showed), up to 4 links deep.
         std::vector<std::uintptr_t> effects = g_buffs.rows[category];
+        if (category == 1) effects.insert(effects.end(), g_buffs.hide_extra.begin(), g_buffs.hide_extra.end());
         game::ParamTable effect_table;
         if (game::find_param(g_statics, L"SpEffectParam", 0x390, effect_table, g_log)) {
             std::vector<std::uintptr_t> frontier = effects;
@@ -3908,6 +3970,74 @@ void sync_buff_vfx(BuffVfxState& state, int category, Id option, const wchar_t* 
         for (std::size_t f = 0; f < std::size(kBuffVfxFields); ++f)
             game::write<std::int32_t>(state.rows[r] + kBuffVfxFields[f],
                 want ? -1 : state.original[r * std::size(kBuffVfxFields) + f]);
+    state.applied = want;
+}
+
+// Hide buff effects, part 2: the burst shown while an item is used comes from
+// the item, not its buff (Nexus, Gold-Pickled Fowl Foot: castSfxId 301260,
+// fireSfxId 301261). EquipParamGoods castSfxId s32 +0x60 and fireSfxId +0x64
+// (raw: Smithbox's layout is one byte off here) go to -1 on the items whose
+// effect (refCategory u8 +0x3F = 2, refId_default +0x4) Hide buff effects
+// covers. Flasks heal instantly, so their effect is not covered and they keep it.
+// Hide weapon buff effects does the same for greases (fireSfxId 303000...).
+struct ItemUseVfxState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> rows{};
+    std::vector<std::int32_t> original{};  // 2 per row
+    bool applied{};
+};
+
+ItemUseVfxState g_item_use_vfx{};         // self buffs
+ItemUseVfxState g_weapon_item_use_vfx{};  // greases
+constexpr std::ptrdiff_t kItemUseSfx[]{0x60, 0x64};
+
+void sync_item_use_vfx(ItemUseVfxState& state, const std::vector<std::uint32_t>& ids, Id option,
+    const wchar_t* what) noexcept {
+    if (state.attempted) return;
+    if (!state.ready) {
+        if (g_buffs.attempted) {
+            state.attempted = true;
+            return;
+        }
+        if (!g_buffs.ready) return;
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"EquipParamGoods", 0xB0, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (const auto row : table.rows) {
+            std::uint8_t category{};
+            std::int32_t effect{};
+            if (!game::read(row + 0x3F, category) || category != 2 || !game::read(row + 0x4, effect) || effect <= 0 ||
+                !std::binary_search(ids.begin(), ids.end(), static_cast<std::uint32_t>(effect)))
+                continue;
+            std::int32_t sfx[std::size(kItemUseSfx)]{-1, -1};
+            bool any = false;
+            for (std::size_t f = 0; f < std::size(kItemUseSfx); ++f) {
+                game::read(row + kItemUseSfx[f], sfx[f]);
+                any = any || sfx[f] > 0;
+            }
+            if (!any) continue;
+            state.rows.push_back(row);
+            state.original.insert(state.original.end(), std::begin(sfx), std::end(sfx));
+        }
+        wchar_t message[120]{};
+        swprintf_s(message, L"Hide %s effects: %zu items show a burst when used.", what, state.rows.size());
+        log(message);
+        if (state.rows.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const bool want = value_of(option) != 0;
+    if (want == state.applied) return;
+    for (std::size_t r = 0; r < state.rows.size(); ++r)
+        for (std::size_t f = 0; f < std::size(kItemUseSfx); ++f) {
+            const std::int32_t original = state.original[r * std::size(kItemUseSfx) + f];
+            if (original > 0) game::write<std::int32_t>(state.rows[r] + kItemUseSfx[f], want ? -1 : original);
+        }
     state.applied = want;
 }
 
@@ -4096,6 +4226,8 @@ bool all_params_ready() noexcept {
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
         (g_clean.ready || g_clean.attempted) && (g_buff_vfx.ready || g_buff_vfx.attempted) &&
+        (g_item_use_vfx.ready || g_item_use_vfx.attempted) &&
+        (g_weapon_item_use_vfx.ready || g_weapon_item_use_vfx.attempted) &&
         (g_weapon_buff_vfx.ready || g_weapon_buff_vfx.attempted) && (g_ghost.ready || g_ghost.attempted) &&
         (g_ghost_all.ready || g_ghost_all.attempted) && (g_ghost_npc.ready || g_ghost_npc.attempted);
 }
@@ -4120,7 +4252,9 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_journey();
         sync_clean();
         sync_buff_vfx(g_buff_vfx, 1, hide_buff_effects, L"self buff");
+        sync_item_use_vfx(g_item_use_vfx, g_buffs.hidden_ids, hide_buff_effects, L"buff");
         sync_weapon_buff_vfx();
+        sync_item_use_vfx(g_weapon_item_use_vfx, g_buffs.weapon_ids, hide_weapon_buff_effects, L"weapon buff");
         sync_ghost();
         sync_ghost_all();
         sync_ghost_npc();
@@ -4137,6 +4271,7 @@ constexpr std::size_t kAnimCategories = 6;
 // Item use (flasks, consumables, picking up: keys 50000-59999 in 2.7.1.0) is not
 // in the generated table, so it always uses its ranges, after the table lookup.
 constexpr std::size_t kItemCategory = 5;
+constexpr int kMoveCategory = 3;
 std::vector<AnimRange> g_ranges[kAnimCategories];  // attack, spell, roll, move, jump, item
 constexpr Id kSpeedIds[kAnimCategories]{speed_attack, speed_spell, speed_roll, speed_move, speed_jump, speed_item};
 
@@ -4263,7 +4398,13 @@ bool speed_active() noexcept {
     if (value_of(speed_global) != 100) return true;
     for (const Id id : kSpeedIds)
         if (value_of(id) != 100) return true;
-    return false;
+    return value_of(speed_sprint) != 100;
+}
+
+// Sprint animations (start, loop, turns), part of the move category; Sprint
+// speed multiplies Movement speed on them.
+bool is_sprint(int key) noexcept {
+    return key >= 20200 && key <= 20230;
 }
 
 // Diagnostics for the in-game test: one line per animation change while a
@@ -4307,12 +4448,14 @@ DWORD WINAPI speed_worker(void*) noexcept {
         // The animation id is only needed when a per-action slider is set.
         bool per_action{};
         for (const Id id : kSpeedIds) per_action |= value_of(id) != 100;
+        per_action |= value_of(speed_sprint) != 100;
         if (per_action) {
             std::int32_t anim{-1};
             if (const auto anim_address = game::player_anim_id(g_statics)) game::read(anim_address, anim);
             const int key = anim >= 0 ? anim % 1000000 : -1;
             const int c = key >= 0 ? anim_category(key) : -1;
             if (c >= 0) percent = percent * value_of(kSpeedIds[c]) / 100.0f;
+            if (c == kMoveCategory && is_sprint(key)) percent = percent * value_of(speed_sprint) / 100.0f;
             if (anim != logged_anim && anim >= 0) {
                 logged_anim = anim;
                 speed_log(anim, c, percent / 100.0f);
@@ -5920,7 +6063,7 @@ bool available(Id id) noexcept {
     case max_hp: case max_fp: case max_stamina:
     case hp_regen_points: case fp_regen_points: case stamina_regen_points:
     case speed_global: case speed_attack: case speed_spell: case speed_roll: case speed_move:
-    case speed_jump: case speed_item: case enemy_speed: case no_fall_damage:
+    case speed_jump: case speed_item: case speed_sprint: case enemy_speed: case no_fall_damage:
     case status_immunity:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case set_time: case time_hour: case freeze_time:
@@ -7640,7 +7783,7 @@ const Texts kEnglish{
         {L"Fast travel anywhere", L"Allows fast travel from inside legacy dungeons and other closed areas. Nearby enemies still block it."},
         {L"Resummon without resting", L"After a spirit falls you can call it again without resting at a grace. Turning it off restores the usual limit."},
         {L"Summon anywhere", L"Every summoning monument reaches across its whole area, so you can summon wherever the game allows spirits, and ashes are no longer dismissed for walking away from it. Turning it off restores the usual reach."},
-        {L"Several ashes at once", L"Multiple Spirit Ashes, built in. Using a different spirit ash keeps the ones already summoned, each paying its FP; using a summoned ash's item again dismisses only that one with a short fade, even with too little FP. No confirmations appear, summoned ashes follow you into new areas and through doors, and each gets a compact row with its name and HP on the HUD (up to 7; the rows need the option on when the game starts). Off, summoning works as in the base game."},
+        {L"Several ashes at once", L"Multiple Spirit Ashes, built in. Using a different spirit ash keeps the ones already summoned, each paying its FP; using a summoned ash's item again dismisses only that one with a short fade, even with too little FP. No confirmations appear, summoned ashes follow you into new areas and through doors, and each gets a compact row with its name and HP on the HUD (up to 7). The HUD only changes after restarting the game: the rows appear if the option is on when the game starts, otherwise the game's own spirit panel stays (going back to the title screen is not enough). Off, summoning works as in the base game."},
         {L"Most ashes at once", L"How many spirit ashes can be summoned together with Several ashes at once. A summon with several spirits counts as one. The HUD shows up to 6; many ashes can lower performance."},
         {L"Ashes stay after a boss falls", L"Monuments tied to a boss no longer dismiss your spirit ashes when it dies, and stay usable afterwards, also in arenas of bosses you already beat. Applies after the area reloads (rest at a grace)."},
         {L"Dismiss all ashes", L"With Several ashes at once, dismisses every summoned spirit ash with a short fade. Works as a button; it can also be bound to a key in [Hotkeys] of NativeTweaks.ini (SpiritDismissAll = F5)."},
@@ -7745,6 +7888,7 @@ const Texts kEnglish{
         {L"Summon Melina (beta)", L"BETA: summons Melina as a spirit companion that fights beside you, using the fighting Melina the game has but never uses. Works best with Summon anywhere and Several ashes at once. She uses her own attacks with Black Knife Tiche's spirit AI."},
         {L"Melina companion (beta)", L"BETA: Melina is always with you as a spirit companion. She is summoned again by herself whenever she is not beside you: after you rest at a grace (she sits beside you while you rest), after a loading screen or if she falls. Works best with Summon anywhere and Several ashes at once. Dismiss all ashes sends her away until she comes back."},
         {L"Stack weapon buffs (beta)", L"BETA: buffs on the same weapon no longer replace each other, so for example a grease and an armament spell or a weapon skill buff stay on together, each with its own damage. The weapon shows one of them. Applies to the next buffs you use."},
+        {L"Sprint speed (%)", L"Sprinting only, on top of Movement speed: 200% here with Movement speed at 150% sprints at 300%. Walking and running keep Movement speed."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -7841,7 +7985,7 @@ const Texts kSpanish{
         {L"Viaje rápido en cualquier sitio", L"Permite viajar desde dentro de mazmorras legado y otras zonas cerradas. Los enemigos cercanos aún lo impiden."},
         {L"Reinvocar sin descansar", L"Tras caer una ceniza puedes volver a invocarla sin descansar en una gracia. Al desactivarlo vuelve el límite original."},
         {L"Invocar en cualquier lugar", L"Cada monumento de invocación alcanza toda su zona, así que puedes invocar donde el juego permita espíritus, y las cenizas ya no se retiran por alejarte de él. Al desactivarla vuelve el alcance original."},
-        {L"Varias cenizas a la vez", L"Multiple Spirit Ashes, integrado. Al usar otra ceniza espiritual se quedan las que ya están invocadas, y cada una cobra sus PC; volver a usar el objeto de una invocada retira solo esa con un fundido corto, aunque no tengas PC. No salen confirmaciones, las cenizas te siguen al cambiar de zona y al cruzar puertas, y cada una tiene una fila con su nombre y su vida en el HUD (hasta 7; las filas necesitan la opción activada al arrancar el juego). Desactivada, invocar funciona como en el juego original."},
+        {L"Varias cenizas a la vez", L"Multiple Spirit Ashes, integrado. Al usar otra ceniza espiritual se quedan las que ya están invocadas, y cada una cobra sus PC; volver a usar el objeto de una invocada retira solo esa con un fundido corto, aunque no tengas PC. No salen confirmaciones, las cenizas te siguen al cambiar de zona y al cruzar puertas, y cada una tiene una fila con su nombre y su vida en el HUD (hasta 7). El HUD solo cambia al reiniciar el juego: las filas salen si la opción está activada al arrancar y, si no, se queda el panel de cenizas del juego (volver al menú principal no basta). Desactivada, invocar funciona como en el juego original."},
         {L"Máximo de cenizas a la vez", L"Cuántas cenizas espirituales puedes tener invocadas juntas con «Varias cenizas a la vez». Una invocación de varios espíritus cuenta como una. El HUD muestra hasta 6; muchas cenizas pueden bajar el rendimiento."},
         {L"Las cenizas se quedan al vencer al jefe", L"Los monumentos ligados a un jefe ya no retiran tus cenizas cuando muere y siguen activos después, también en las salas de jefes que ya venciste. Se aplica al recargar la zona (descansa en una gracia)."},
         {L"Retirar todas las cenizas", L"Con «Varias cenizas a la vez», retira todas las cenizas invocadas con un fundido corto. Funciona como un botón; también puedes asignarle una tecla en [Hotkeys] de NativeTweaks.ini (SpiritDismissAll = F5)."},
@@ -7946,6 +8090,7 @@ const Texts kSpanish{
         {L"Invocar a Melina (beta)", L"BETA: invoca a Melina como ceniza acompañante que pelea a tu lado, usando la Melina de combate que el juego tiene sin usar. Funciona mejor con Invocar en cualquier lugar y Varias cenizas a la vez. Usa sus propios ataques con la IA de ceniza de Tiche."},
         {L"Melina acompañante (beta)", L"BETA: Melina está siempre contigo como ceniza acompañante. Se vuelve a invocar sola cuando no está a tu lado: después de descansar en una gracia (se sienta a tu lado mientras descansas), tras una pantalla de carga o si cae. Funciona mejor con Invocar en cualquier lugar y Varias cenizas a la vez. Retirar todas las cenizas la aparta hasta que vuelva."},
         {L"Acumular mejoras de arma (beta)", L"BETA: las mejoras de una misma arma ya no se sustituyen entre sí; por ejemplo, una grasa y un hechizo de arma o la mejora de una habilidad siguen activas a la vez, cada una con su daño. El arma muestra solo una. Se aplica a las siguientes mejoras que uses."},
+        {L"Velocidad de esprint (%)", L"Solo al esprintar, encima de «Velocidad de movimiento»: 200 % aquí con movimiento al 150 % esprinta al 300 %. Andar y correr siguen con «Velocidad de movimiento»."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -8042,7 +8187,7 @@ const Texts kChinese{
         {L"任意地点传送", L"允许在传说地下城和其他封闭区域内传送。附近有敌人时仍无法传送。"},
         {L"无需休息即可再次召唤", L"骨灰死亡后无需在赐福休息即可再次召唤。关闭后恢复原版限制。"},
         {L"随处召唤", L"每块召唤碑的范围覆盖其整个区域，只要游戏允许召唤灵体即可召唤，骨灰也不会因你远离召唤碑而被解除。关闭后恢复原版范围。"},
-        {L"同时召唤多个骨灰", L"内置 Multiple Spirit Ashes。使用另一个骨灰时，已召唤的骨灰会保留，且每个都会消耗 FP；再次使用已召唤骨灰的道具会以短暂淡出只解除该骨灰，即使 FP 不足也可以。不会弹出确认，骨灰会跟随你进入新区域和穿过门，并在 HUD 上各有一行名称和生命值（最多 7 行；这些行需要在游戏启动时开启此选项）。关闭后召唤与原版游戏相同。"},
+        {L"同时召唤多个骨灰", L"内置 Multiple Spirit Ashes。使用另一个骨灰时，已召唤的骨灰会保留，且每个都会消耗 FP；再次使用已召唤骨灰的道具会以短暂淡出只解除该骨灰，即使 FP 不足也可以。不会弹出确认，骨灰会跟随你进入新区域和穿过门，并在 HUD 上各有一行名称和生命值（最多 7 行）。HUD 仅在重新启动游戏后才会改变：游戏启动时开启此选项才会显示这些行，否则保留原版的骨灰面板（返回标题画面不够）。关闭后召唤与原版游戏相同。"},
         {L"同时召唤骨灰上限", L"开启“同时召唤多个骨灰”时，最多可同时召唤多少个骨灰。一次召唤多个灵体算作一个。HUD 最多显示 6 个；骨灰过多可能降低性能。"},
         {L"击败首领后骨灰保留", L"与首领绑定的召唤碑在首领死亡后不再解除你的骨灰，之后仍可使用，已击败首领的场地也一样。区域重新载入后生效（在赐福处休息）。"},
         {L"解除全部骨灰", L"开启“同时召唤多个骨灰”时，以短暂淡出解除所有已召唤的骨灰。像按钮一样使用；也可以在 NativeTweaks.ini 的 [Hotkeys] 中绑定按键（SpiritDismissAll = F5）。"},
@@ -8147,6 +8292,7 @@ const Texts kChinese{
         {L"召唤梅琳娜（测试版）", L"测试版：将梅琳娜作为骨灰同伴召唤，在你身边战斗，使用游戏中存在但未使用的战斗版梅琳娜。配合“随处召唤”与“同时召唤多个骨灰”效果最佳。她使用自己的攻击动作，并采用黑刀蒂契的骨灰AI。"},
         {L"梅琳娜同伴（测试版）", L"测试版：梅琳娜作为骨灰同伴始终陪伴你。当她不在你身边时会自动重新召唤：在赐福处休息后（你休息时她会坐在你身旁）、读取画面后或她倒下后。配合“随处召唤”与“同时召唤多个骨灰”效果最佳。“解除全部骨灰”会让她暂时离开，之后她会再次出现。"},
         {L"叠加武器增益（测试版）", L"测试版：同一把武器上的增益不再互相覆盖，例如油脂与武器附魔法术或战技增益可同时生效，各自提供伤害。武器只显示其中一种效果。从下一次使用的增益开始生效。"},
+        {L"冲刺速度 (%)", L"仅作用于冲刺，并与“移动速度”相乘：移动速度为 150% 时，此处设为 200% 则冲刺速度为 300%。行走和奔跑仍使用“移动速度”。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -8162,7 +8308,7 @@ const Layout kLayout[]{
         carry_max, hide_helmet}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
-    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_jump, speed_item,
+    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_sprint, speed_jump, speed_item,
         jump_height, jump_distance}},
     {cat_defense, {dodge_frames, parry_frames, deflect_window, perfect_guard, knockdown_invincible, item_super_armor}},
     {cat_torrent, {torrent_no_death, torrent_speed, torrent_jump_speed, torrent_jump_height,
