@@ -73,6 +73,10 @@ Not planned for now, but welcome if someone wants to implement them:
 - [fromsoftware-rs](https://github.com/vswarte/fromsoftware-rs) by Vincent
   Swarte and contributors, used by Multiple Spirit Ashes.
 
+## Downloads and changelog
+
+The latest build is also on the [Releases](https://github.com/ArialSenki/NativeTweaks/releases/latest) page. [CHANGELOG.md](CHANGELOG.md) lists every version, as on Nexus.
+
 ## License
 
 [MIT](LICENSE). Elden Ring is a trademark of FromSoftware / Bandai Namco. This
