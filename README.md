@@ -52,6 +52,20 @@ NativeTweaks needs the extended build of it from the
 `-DERNATIVEUI_BUILD_HOST=ON` and ship that `ERNativeUI.dll` next to
 `NativeTweaks.dll`.
 
+## Ideas for contributors
+
+Not planned for now, but welcome if someone wants to implement them:
+
+- **Search in Mod Settings:** a row that finds an option across the many pages,
+  using the native text input.
+- **A fuller status file:** other menu mods loaded, which game functions they
+  already hooked, the loader in use and unusual INI values, so one short file
+  answers most bug reports. ERNativeUI already writes a basic
+  `ERNativeUI-status.txt`.
+- **Getting ready for game patches:** on an unknown game version, look up the
+  needed addresses by pattern and write them to a file as a candidate profile,
+  to review by hand. It should never turn anything on by itself.
+
 ## Credits
 
 - [ERNativeUI](https://github.com/Flammrock/ERNativeUI) by Flammrock, the

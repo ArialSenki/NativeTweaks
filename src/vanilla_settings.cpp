@@ -30,6 +30,8 @@
 #include <cmath>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <tuple>
 #include <cstdint>
 #include <cstdio>
@@ -205,6 +207,13 @@ Site g_vignette{L"vignette",
 Site g_chromatic{L"chromatic aberration",
     "0f 11 ? 60 ? 8d ? 80 00 00 00 0f 10 ? a0 00 00 00 0f 11 ? f0 ? 8d ? b0 00 00 00 0f 10 ? 0f 11 ? 0f 10 ? 10",
     0x2F, "0f 11 ? ?", {0x66, 0x0F, 0xEF, 0xC9}};
+// Forced sharpening (Nexus request): GXAntiAliasingFilter runs SharpenFilter.ppo
+// after TempAA only if SharpenIntensity (+0x6C) is above 0; otherwise it does the
+// game's own plain copy to the same target. jbe -> always jump to that copy.
+// 2.7.2.0: 0x1ADA370.
+Site g_sharpen{L"sharpening",
+    "f3 ? 0f 10 ? 6c ? 0f 2f ? 0f 86 ? ? ? ? ? 83 ? 00 02 00 00 00 0f 84",
+    0x0A, "0f 86", {0x90, 0xE9}};
 Site g_animation{L"animation distance",
     "c7 ? ? ? 01 00 00 00 f3 ? 0f 10 ? ? ? f3 ? 0f 10 ? ? ? f3 0f 59 ? ? ? ? ? ? 0f 28 ? f3 ? 0f 5c ? ? 58",
     0x48, "f3 ? 0f 5e ? ? ?", {0x0F, 0x57, 0xC9, 0x90, 0x90, 0x90, 0x90}};
@@ -306,7 +315,7 @@ Site g_summon_range{L"summoning range",
     "44 38 ae b5 00 00 00 74 07 44 88 ae b7 00 00 00 4c 39 ae 00 01 00 00",
     0, "44 38 ae b5 00 00 00 74 07", {0xC6, 0x86, 0xB5, 0x00, 0x00, 0x00, 0x01, 0x66, 0x90}};
 
-Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic,
+Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic, &g_sharpen,
     &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
     &g_summon_area, &g_summon_area_item, &g_summon_range, &g_buddy_slot_start, &g_buddy_slot_loop};
 
@@ -598,8 +607,13 @@ void install_status_immunity_hook() noexcept {
 // then, while the option is on, zeroes the register that holds the reach:
 // nothing can be locked and a held lock drops. Same bytes in 2.7.0.0, 2.7.1.0,
 // 2.7.1.1 JP and 2.7.2.0.
+// Lock-on distance multiplies that register first. It holds the reach itself
+// in acquire and search, the squared reach in keep. NpcParam lockDist alone did
+// nothing to see in game: characters copy it when they are created.
 struct LockRangeData {
     volatile std::uint32_t on;
+    volatile float scale;
+    volatile float scale_squared;
 };
 
 LockRangeData* g_lock_range{};
@@ -611,20 +625,25 @@ struct LockRangeSite {
     std::size_t stolen;    // whole instructions, at least 14 bytes
     std::uint8_t zero[4];  // xorps reg, reg
     std::size_t zero_size;
+    std::uint8_t multiply[4];  // mulss reg, [rip+disp32], without the disp32
+    std::size_t multiply_size;
+    bool squared;              // the register holds the squared reach
 };
 
 constexpr LockRangeSite kLockRangeSites[]{
     // movzx eax,[r14+74h]; movd xmm9,eax; cvtdq2ps xmm9,xmm9; addss xmm9,[rsi+2924h];
     // stolen: and byte [rbx+90h],6Fh; xor dil,dil; movups xmm15,[r14]
     {"acquire", "41 0f b6 46 74 66 44 0f 6e c8 45 0f 5b c9 f3 44 0f 58 8e 24 29 00 00 "
-        "80 a3 90 00 00 00 6f 40 32 ff 45 0f 10 3e", 0x17, 14, {0x45, 0x0F, 0x57, 0xC9}, 4},
+        "80 a3 90 00 00 00 6f 40 32 ff 45 0f 10 3e", 0x17, 14, {0x45, 0x0F, 0x57, 0xC9}, 4,
+        {0xF3, 0x44, 0x0F, 0x59}, 4, false},
     // movups xmm4,[rsi+2930h]; addss xmm4,[rsi+2924h]; ...; stolen: addss xmm4,xmm0;
     // mulss xmm4,xmm4; movups xmm3,[rdi]; movaps xmm0,xmm7 (xmm4 = reach squared)
     {"keep", "0f 10 a6 30 29 00 00 f3 0f 58 a6 24 29 00 00 0f b6 47 74 66 0f 6e c0 0f 5b c0 "
-        "f3 0f 58 e0 f3 0f 59 e4 0f 10 1f 0f 28 c7", 0x1A, 14, {0x0F, 0x57, 0xE4}, 3},
+        "f3 0f 58 e0 f3 0f 59 e4 0f 10 1f 0f 28 c7", 0x1A, 14, {0x0F, 0x57, 0xE4}, 3,
+        {0xF3, 0x0F, 0x59}, 3, true},
     // stolen: cvtdq2ps xmm12,xmm12; addss xmm0,xmm2; addss xmm12,[rdi+2924h]
     {"search", "45 0f 5b e4 f3 0f 58 c2 f3 44 0f 58 a7 24 29 00 00 e8", 0x0, 17,
-        {0x45, 0x0F, 0x57, 0xE4}, 4},
+        {0x45, 0x0F, 0x57, 0xE4}, 4, {0xF3, 0x44, 0x0F, 0x59}, 4, false},
 };
 
 void install_lock_range_hooks() noexcept {
@@ -645,6 +664,8 @@ void install_lock_range_hooks() noexcept {
     if (!code) return;
     auto* data = reinterpret_cast<LockRangeData*>(code + 2048);
     data->on = 0;
+    data->scale = 1.0f;
+    data->scale_squared = 1.0f;
     std::uint8_t* p = code;
     const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
         for (auto b : bytes) *p++ = b;
@@ -654,6 +675,16 @@ void install_lock_range_hooks() noexcept {
         const LockRangeSite& site = kLockRangeSites[i];
         trampolines[i] = p;
         std::memcpy(p, sites[i], site.stolen); p += site.stolen;     // original instructions
+        std::memcpy(p, site.multiply, site.multiply_size); p += site.multiply_size;  // mulss reach,[scale]
+        // ModRM rip-relative: reg field of xmm4 / xmm9 / xmm12.
+        const std::uint8_t reg = i == 0 ? 1 : 4;
+        *p++ = static_cast<std::uint8_t>((reg << 3) | 5);
+        {
+            const auto after = reinterpret_cast<std::intptr_t>(p) + 4;
+            const auto* factor = site.squared ? &data->scale_squared : &data->scale;
+            const auto factor_disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(factor) - after);
+            std::memcpy(p, &factor_disp, 4); p += 4;
+        }
         put({0x9C});                                                  // pushfq
         put({0x83, 0x3D});                                            // cmp dword [on],0
         const auto next = reinterpret_cast<std::intptr_t>(p) + 4 + 1;
@@ -1586,6 +1617,21 @@ enum Id : std::size_t {
     stack_weapon_buffs,
     // Speed: sprinting on top of Movement speed (Nexus request)
     speed_sprint,
+    // Speed: walking and running on top of Movement speed; levers, doors and
+    // chests on top of Global speed (Nexus requests)
+    speed_walk,
+    speed_run,
+    speed_interact,
+    // Spells: how far the player's projectiles fly; Camera: lock-on reach (Nexus request)
+    projectile_range,
+    lock_on_distance,
+    // Image: the sharpening pass after TempAA (Nexus request)
+    sharpen_off,
+    // Enemies: Bewitching Branch on every enemy, and on bosses (Nexus request)
+    charm_all_enemies,
+    charm_bosses,
+    // Speed: the chest or door follows Interaction speed (Nexus request)
+    interaction_objects,
     count
 };
 
@@ -1724,6 +1770,15 @@ Option g_options[count]{
     toggle(L"MelinaCompanion"),
     toggle(L"StackWeaponBuffs"),
     slider(L"SpeedSprintPercent", 100, 25, 1300, 5),
+    slider(L"SpeedWalkPercent", 100, 25, 1300, 5),
+    slider(L"SpeedRunPercent", 100, 25, 1300, 5),
+    slider(L"SpeedInteractPercent", 100, 25, 1300, 5),
+    slider(L"ProjectileRangePercent", 100, 100, 500, 5),
+    slider(L"LockOnDistancePercent", 100, 100, 500, 5),
+    toggle(L"RemoveSharpening"),
+    toggle(L"CharmAllEnemies"),
+    toggle(L"CharmBosses"),
+    toggle(L"InteractionObjects"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1781,6 +1836,9 @@ Scale g_scales[]{
     {speed_jump, L"SpeedJumpScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_item, L"SpeedItemScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_sprint, L"SpeedSprintScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_walk, L"SpeedWalkScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_run, L"SpeedRunScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_interact, L"SpeedInteractScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {enemy_speed, L"EnemySpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_speed, L"TorrentSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_jump_speed, L"TorrentJumpSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
@@ -3074,13 +3132,18 @@ struct LockOnState {
     bool attempted{};
     bool ready{};
     std::vector<std::pair<std::uintptr_t, std::uint8_t>> cells{};  // address, original
-    bool applied{};
+    int applied{100};  // percent written to the cells; 0 = No lock-on
 };
 
 LockOnState g_lock_on{};
 
 void sync_lock_on() noexcept {
-    if (g_lock_range) g_lock_range->on = value_of(enemies_no_lock_on) ? 1u : 0u;
+    if (g_lock_range) {
+        g_lock_range->on = value_of(enemies_no_lock_on) ? 1u : 0u;
+        const float scale = static_cast<float>(value_of(lock_on_distance)) / 100.0f;
+        g_lock_range->scale = scale;
+        g_lock_range->scale_squared = scale * scale;
+    }
     auto& state = g_lock_on;
     if (state.attempted) return;
     if (!state.ready) {
@@ -3129,10 +3192,233 @@ void sync_lock_on() noexcept {
         }
         state.ready = true;
     }
-    const bool want = value_of(enemies_no_lock_on) != 0;
+    const int want = value_of(enemies_no_lock_on) != 0 ? 0 : g_lock_range ? 100 : value_of(lock_on_distance);
     if (want == state.applied) return;
     for (const auto& [address, original] : state.cells)
-        game::write<std::uint8_t>(address, want ? std::uint8_t{0} : original);
+        game::write<std::uint8_t>(address, static_cast<std::uint8_t>(
+            std::min(255, static_cast<int>(original) * want / 100)));
+    state.applied = want;
+}
+
+// Bewitching Branch on every enemy (Nexus request): an enemy can be charmed
+// only while it has SpEffect 90200 ("NPC: Enable Charm", the one row with
+// enableCharm), which the 3404 charmable NpcParam rows of 2.7.2.0 carry in
+// spEffectID14 (s32 +0x190). Empty slots of the other rows get it; a slot that
+// holds anything else (ERR uses it) is left alone. Friendly NPCs, phantoms and
+// objects are skipped by team (teamType u8 +0x133). The game reads the row when
+// a character spawns, so this reaches enemies that appear afterwards.
+bool excluded_team(std::uint8_t team) noexcept;
+constexpr std::size_t kNpcCharmSlot = 0x190;
+constexpr std::int32_t kEnableCharmEffect = 90200;
+struct CharmState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::pair<std::uintptr_t, std::int32_t>> enemies{};  // address, original
+    std::vector<std::pair<std::uintptr_t, std::int32_t>> bosses{};
+    bool enemies_applied{};
+    bool bosses_applied{};
+};
+
+CharmState g_charm{};
+
+void sync_charm() noexcept {
+    auto& state = g_charm;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"NpcParam", 0x2E0, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        std::size_t charmable{};
+        try {
+            for (const auto row : table.rows) {
+                std::int32_t slot{};
+                std::uint32_t hp{};
+                std::uint8_t team{};
+                if (!game::read(row + kNpcCharmSlot, slot) || !game::read(row + 0x24, hp) ||
+                    !game::read(row + 0x133, team) || hp == 0) continue;
+                if (slot == kEnableCharmEffect) {
+                    ++charmable;
+                    continue;
+                }
+                if (slot > 0) continue;
+                if (npc_row_is_boss(row) || team == 7) state.bosses.push_back({row + kNpcCharmSlot, slot});
+                else if (!excluded_team(team)) state.enemies.push_back({row + kNpcCharmSlot, slot});
+            }
+        } catch (...) {
+            state.enemies.clear();
+            state.bosses.clear();
+            state.attempted = true;
+            return;
+        }
+        // Thousands of rows carry the effect in this slot: another layout would not.
+        const bool ok = charmable >= 500;
+        wchar_t message[160]{};
+        swprintf_s(message, L"Charm: %zu rows already charmable, %zu enemies and %zu bosses can be added%s.",
+            charmable, state.enemies.size(), state.bosses.size(), ok ? L"" : L" -> options disabled");
+        log(message);
+        if (!ok) {
+            state.enemies.clear();
+            state.bosses.clear();
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const auto apply = [](const auto& cells, bool want, bool& applied) {
+        if (want == applied) return;
+        for (const auto& [address, original] : cells)
+            game::write<std::int32_t>(address, want ? kEnableCharmEffect : original);
+        applied = want;
+    };
+    apply(state.enemies, value_of(charm_all_enemies) != 0, state.enemies_applied);
+    apply(state.bosses, value_of(charm_bosses) != 0, state.bosses_applied);
+}
+
+// How far the player's projectiles fly (Nexus request): flight time
+// (BulletParam.life f32 +0x10) and the in-range distance (dist f32 +0x14,
+// beyond it a bullet uses its out-of-range speed and gravity). Rows: every
+// bullet a spell names (Magic refCategoryN = 1 -> refIdN; r151 test: spells fell
+// short), what BehaviorParam_PC fires (refType u8 +0x9 = 1, refId +0xC: weapon
+// skills), and the player's id ranges of the base game and the DLC. Enemies live
+// in 2000000-9999999 and 205000000-206999999. hitBulletId (+0x68) and
+// intervalCreateBulletId (+0xAC) are followed. Only moving bullets change (initVelocity +0x28 or maxVelocity
+// +0x34): for a bullet that stays in place, life is how long an area lasts.
+//
+// A plain percent is not enough: Glintstone Pebble flies 28 m and Lock-on
+// distance reaches 40-50 m. Real projectiles (10 m or more) are also brought up
+// to kProjectileBaseReach at the same percent, so at 500% both options reach about
+// 250 m. Shorter ones (sprays, fragments) only scale by the percent.
+constexpr float kProjectileBaseReach = 50.0f;
+constexpr float kProjectileMinReach = 10.0f;
+constexpr float kProjectileEmitterReach = 2.0f;
+// Magic: refCategory1-10 (u8) and refId1-10 (s32), not contiguous.
+constexpr std::ptrdiff_t kMagicRefCategories[]{0x1E, 0x20, 0x27, 0x2B, 0x49, 0x61, 0x64, 0x65, 0x66, 0x67};
+constexpr std::ptrdiff_t kMagicRefIds[]{0x68, 0x6C, 0x70, 0x78, 0x7C, 0x80, 0x84, 0x88, 0x8C, 0x90};
+
+bool player_bullet_id(std::int32_t id) noexcept {
+    return (id > 0 && id < 2000000) ||                 // weapon skills, Rainbow Stone, Smithscript
+        (id >= 10000000 && id <= 11999999) ||          // spells, thrown items
+        (id >= 20000000 && id <= 20099999) ||          // arrows, bolts
+        (id >= 200000000 && id <= 200999999) ||        // DLC weapon skills
+        (id >= 210000000 && id <= 210999999);          // DLC spells, thrown items
+}
+
+struct ProjectileCell {
+    std::uintptr_t life;
+    std::uintptr_t dist;  // 0 when the row has none
+    float original_life;
+    float original_dist;
+    float range;          // metres in the game's data
+};
+
+struct ProjectileRangeState {
+    bool attempted{};
+    bool ready{};
+    std::vector<ProjectileCell> cells{};
+    int applied{100};
+};
+
+ProjectileRangeState g_projectile_range{};
+
+void sync_projectile_range() noexcept {
+    auto& state = g_projectile_range;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable bullets;
+        game::ParamTable behaviors;
+        game::ParamTable magic;
+        if (!game::find_param(g_statics, L"Bullet", 0x110, bullets, g_log) ||
+            !game::find_param(g_statics, L"BehaviorParam_PC", 0x20, behaviors, g_log) ||
+            !game::find_param(g_statics, L"Magic", 0xA8, magic, g_log)) {
+            if (bullets.file && behaviors.file && magic.file) state.attempted = true;
+            return;
+        }
+        try {
+            std::unordered_map<std::int32_t, std::uintptr_t> by_id;
+            by_id.reserve(bullets.rows.size());
+            std::vector<std::int32_t> pending;
+            for (std::size_t i = 0; i < bullets.rows.size(); ++i) {
+                std::uint32_t raw_id{};
+                if (!game::read(bullets.file + 0x40 + i * 0x18, raw_id)) continue;
+                const auto id = static_cast<std::int32_t>(raw_id);
+                by_id.emplace(id, bullets.rows[i]);
+                if (player_bullet_id(id)) pending.push_back(id);
+            }
+            std::size_t spell_bullets{};
+            for (const auto row : magic.rows)
+                for (std::size_t r = 0; r < std::size(kMagicRefIds); ++r) {
+                    std::uint8_t category{};
+                    std::int32_t id{};
+                    if (game::read(row + kMagicRefCategories[r], category) && category == 1 &&
+                        game::read(row + kMagicRefIds[r], id) && id > 0) {
+                        pending.push_back(id);
+                        ++spell_bullets;
+                    }
+                }
+            wchar_t found_message[96]{};
+            swprintf_s(found_message, L"Projectile range: %zu bullet references in Magic.", spell_bullets);
+            log(found_message);
+            for (const auto row : behaviors.rows) {
+                std::uint8_t type{};
+                std::int32_t id{};
+                if (game::read(row + 0x9, type) && type == 1 && game::read(row + 0xC, id) && id > 0)
+                    pending.push_back(id);
+            }
+            std::unordered_set<std::int32_t> seen;
+            while (!pending.empty()) {
+                const std::int32_t id = pending.back();
+                pending.pop_back();
+                if (!seen.insert(id).second) continue;
+                const auto found = by_id.find(id);
+                if (found == by_id.end()) continue;
+                const std::uintptr_t row = found->second;
+                for (const std::ptrdiff_t child : {0x68, 0xAC}) {
+                    std::int32_t next{};
+                    if (game::read(row + child, next) && next > 0) pending.push_back(next);
+                }
+                float initial{}, maximum{}, life{}, dist{};
+                game::read(row + 0x28, initial);
+                game::read(row + 0x34, maximum);
+                game::read(row + 0x10, life);
+                game::read(row + 0x14, dist);
+                const float speed = std::max(initial, maximum);
+                if (speed <= 0.0f || life <= 0.0f) continue;
+                // Emitters (Glintblade Trio 0.6 m, Catch Flame 0.8 m) fire their child
+                // when they die: a longer life would only delay the spell.
+                if (life * speed < kProjectileEmitterReach) continue;
+                state.cells.push_back({row + 0x10, dist > 0.0f ? row + 0x14 : 0, life, dist, life * speed});
+            }
+        } catch (...) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        const bool ok = state.cells.size() >= 500;
+        wchar_t message[160]{};
+        swprintf_s(message, L"Projectile range: %zu moving player bullets%s.", state.cells.size(),
+            ok ? L"" : L" -> option disabled");
+        log(message);
+        if (!ok) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(projectile_range);
+    if (want == state.applied) return;
+    const float percent = static_cast<float>(want) / 100.0f;
+    // 0 at 100%, 1 at the top of the slider, so the reach grows smoothly.
+    const float blend = static_cast<float>(want - 100) / 400.0f;
+    for (const auto& cell : state.cells) {
+        float factor = percent;
+        if (cell.range >= kProjectileMinReach && cell.range < kProjectileBaseReach)
+            factor *= 1.0f + (kProjectileBaseReach / cell.range - 1.0f) * blend;
+        game::write<float>(cell.life, cell.original_life * factor);
+        if (cell.dist) game::write<float>(cell.dist, cell.original_dist * factor);
+    }
     state.applied = want;
 }
 
@@ -4224,6 +4510,7 @@ bool all_params_ready() noexcept {
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
+        (g_projectile_range.ready || g_projectile_range.attempted) && (g_charm.ready || g_charm.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
         (g_clean.ready || g_clean.attempted) && (g_buff_vfx.ready || g_buff_vfx.attempted) &&
         (g_item_use_vfx.ready || g_item_use_vfx.attempted) &&
@@ -4248,6 +4535,8 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_buddy();
         sync_immunity();
         sync_lock_on();
+        sync_projectile_range();
+        sync_charm();
         sync_charged_launch();
         sync_journey();
         sync_clean();
@@ -4394,17 +4683,46 @@ std::wstring describe_ids(std::size_t category) {
     return text;
 }
 
+// The sliders that apply on top of a category or to animations outside them.
+bool per_action_extra_speed() noexcept {
+    return value_of(speed_sprint) != 100 || value_of(speed_walk) != 100 ||
+        value_of(speed_run) != 100 || value_of(speed_interact) != 100;
+}
+
 bool speed_active() noexcept {
     if (value_of(speed_global) != 100) return true;
     for (const Id id : kSpeedIds)
         if (value_of(id) != 100) return true;
-    return value_of(speed_sprint) != 100;
+    return per_action_extra_speed();
 }
 
 // Sprint animations (start, loop, turns), part of the move category; Sprint
-// speed multiplies Movement speed on them.
+// speed multiplies Movement speed on them. Walking and running likewise.
+// a000_021xxx and 022xxx are a second family of the same moves (r151 log).
 bool is_sprint(int key) noexcept {
-    return key >= 20200 && key <= 20230;
+    return (key >= 20200 && key <= 20230) || (key >= 22200 && key <= 22230);
+}
+bool is_walk(int key) noexcept {
+    return (key >= 20000 && key <= 20099) || (key >= 21000 && key <= 21099);
+}
+bool is_run(int key) noexcept {
+    return (key >= 20100 && key <= 20199) || (key >= 22100 && key <= 22199);
+}
+// Levers, doors, chests, pick-ups. The animation table files most of them under
+// roll (a000_063000 opening a chest, r151 log), so Roll speed changed them and
+// Interaction speed did not: they count as interactions, not as rolls.
+bool is_interaction(int key) noexcept {
+    return key >= 60000 && key <= 69999;
+}
+// Resting at a Site of Grace keeps its speed. The game's fade to black, on its own
+// clock, hides the cut from lying down (068000) to sitting (068010). At x2 the cut
+// came before the fade and showed (r151 test, seen at 200%, not at 100%).
+bool is_rest(int key) noexcept {
+    return key >= 68000 && key <= 68999;
+}
+// Getting up from it (both sitting variants) has no such cut.
+bool is_rest_stand_up(int key) noexcept {
+    return key == 68012 || key == 68022;
 }
 
 // Diagnostics for the in-game test: one line per animation change while a
@@ -4448,14 +4766,19 @@ DWORD WINAPI speed_worker(void*) noexcept {
         // The animation id is only needed when a per-action slider is set.
         bool per_action{};
         for (const Id id : kSpeedIds) per_action |= value_of(id) != 100;
-        per_action |= value_of(speed_sprint) != 100;
+        per_action |= per_action_extra_speed();
         if (per_action) {
             std::int32_t anim{-1};
             if (const auto anim_address = game::player_anim_id(g_statics)) game::read(anim_address, anim);
             const int key = anim >= 0 ? anim % 1000000 : -1;
-            const int c = key >= 0 ? anim_category(key) : -1;
+            const bool interaction = key >= 0 && is_interaction(key);
+            const int c = key >= 0 && !interaction ? anim_category(key) : -1;
             if (c >= 0) percent = percent * value_of(kSpeedIds[c]) / 100.0f;
             if (c == kMoveCategory && is_sprint(key)) percent = percent * value_of(speed_sprint) / 100.0f;
+            if (c == kMoveCategory && is_walk(key)) percent = percent * value_of(speed_walk) / 100.0f;
+            if (c == kMoveCategory && is_run(key)) percent = percent * value_of(speed_run) / 100.0f;
+            if (interaction && (!is_rest(key) || is_rest_stand_up(key)))
+                percent = percent * value_of(speed_interact) / 100.0f;
             if (anim != logged_anim && anim >= 0) {
                 logged_anim = anim;
                 speed_log(anim, c, percent / 100.0f);
@@ -4465,6 +4788,189 @@ DWORD WINAPI speed_worker(void*) noexcept {
         float current{};
         if (game::read(speed_address, current) && current != target) game::write(speed_address, target);
         touched = true;
+    }
+}
+
+// Chests, doors and levers keep their speed while the player follows Interaction
+// speed, because each dynamic asset has its own animator (2.7.2.0, from the code):
+// CSWorldGeomDynamicIns+0x4C8. Its update (0x1AC010) multiplies the frame time by
+// +0xC0, or by +0x78 while +0xC0 is 1. The animator is { u32 slots at +0, slot
+// array at +8 (stride 0x68), slot time f32 +0x28, slot state u32 +0x4C }, built by
+// 0x1AB720, which sets +0x74 to 5 (used below to tell an animator from what follows
+// a plain asset). Nothing else writes +0x78. No link from the interaction to its
+// object was found, so during the interaction every asset whose animation has just
+// started follows it; what starts elsewhere at that moment only speeds up briefly.
+// Lifts must keep their speed: AssetGeometryParam isMoveObj (bit 1 of +0x3C, row
+// at CSWorldGeomIns+0x20). The map of loaded blocks is at CSWorldGeomMan+0x18
+// (head +0x20: MSVC tree, value +0x28), each block's assets at +0x288 (first +0x290).
+constexpr float kObjectStartedSeconds = 0.6f;
+// a000_060810, the Stonesword Key statue, lasts 14 s at x2 and its object starts
+// late, so 3 s of scanning missed it. Long enough for that, bounded all the same.
+constexpr ULONGLONG kObjectScanMs = 30000;
+// The object often outlasts the player: the statue's a000_060810 ends in 2.4 s at
+// x2 with the statue still moving, and putting it back then undid the speed (r151
+// log). Objects keep it until their animation ends, at most this long after the
+// player's. What the statue starts afterwards is picked up in the same time.
+constexpr ULONGLONG kObjectHoldMs = 15000;
+constexpr int kStatueAnimation = 60810;
+
+struct SpedObject {
+    std::uintptr_t geom;
+    std::uintptr_t animator;
+};
+
+template <class Visit>
+void for_each_asset(std::uintptr_t man, Visit&& visit) noexcept {
+    std::uintptr_t head{};
+    if (!game::read(man + 0x20, head) || !head) return;
+    std::uintptr_t root{};
+    if (!game::read(head + 0x8, root)) return;
+    std::uintptr_t stack[64];
+    std::size_t depth{};
+    std::size_t blocks{};
+    if (root && root != head) stack[depth++] = root;
+    while (depth > 0 && blocks < 1024) {
+        const std::uintptr_t node = stack[--depth];
+        ++blocks;
+        std::uintptr_t left{}, right{}, block{};
+        game::read(node, left);
+        game::read(node + 0x10, right);
+        if (left && left != head && depth < std::size(stack)) stack[depth++] = left;
+        if (right && right != head && depth < std::size(stack)) stack[depth++] = right;
+        if (!game::read(node + 0x28, block) || !block) continue;
+        std::uintptr_t first{}, last{};
+        if (!game::read(block + 0x290, first) || !game::read(block + 0x298, last) || last < first) continue;
+        const std::size_t count = std::min<std::size_t>((last - first) / sizeof(void*), 16384);
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uintptr_t geom{};
+            if (game::read(first + i * sizeof(void*), geom) && geom) visit(geom);
+        }
+    }
+}
+
+// The animator of a dynamic asset, or 0 for any other asset.
+std::uintptr_t asset_animator(std::uintptr_t geom) noexcept {
+    const auto base = reinterpret_cast<std::uintptr_t>(game::image());
+    std::uintptr_t table{}, animator{};
+    if (!game::read(geom, table) || table < base || table >= base + 0x6000000) return 0;
+    if (!game::read(geom + 0x4C8, animator) || !animator) return 0;
+    std::uint32_t slots{}, marker{};
+    if (!game::read(animator, slots) || slots == 0 || slots > 32) return 0;
+    if (!game::read(animator + 0x74, marker) || marker != 5) return 0;
+    return animator;
+}
+
+bool asset_animation_just_started(std::uintptr_t animator) noexcept {
+    std::uint32_t slots{};
+    std::uintptr_t array{};
+    if (!game::read(animator, slots) || !game::read(animator + 0x8, array) || !array) return false;
+    for (std::uint32_t i = 0; i < slots && i < 32; ++i) {
+        const std::uintptr_t slot = array + i * 0x68;
+        std::uint32_t state{};
+        float elapsed{-1.0f};
+        if (game::read(slot + 0x4C, state) && state != 0 && game::read(slot + 0x28, elapsed) &&
+            elapsed >= 0.0f && elapsed < kObjectStartedSeconds)
+            return true;
+    }
+    return false;
+}
+
+bool asset_is_lift(std::uintptr_t geom) noexcept {
+    std::uintptr_t row{};
+    std::uint8_t flags{};
+    if (!game::read(geom + 0x20, row) || !row || !game::read(row + 0x3C, flags)) return true;  // unknown: leave it
+    return (flags & 0x2) != 0;
+}
+
+bool asset_animation_running(std::uintptr_t animator) noexcept {
+    std::uint32_t slots{};
+    std::uintptr_t array{};
+    if (!game::read(animator, slots) || !game::read(animator + 0x8, array) || !array) return false;
+    for (std::uint32_t i = 0; i < slots && i < 32; ++i) {
+        std::uint32_t state{};
+        if (game::read(array + i * 0x68 + 0x4C, state) && state != 0) return true;
+    }
+    return false;
+}
+
+// Puts one object back, unless it is gone or its memory now holds something else.
+void restore_object(const SpedObject& object) noexcept {
+    std::uintptr_t animator{};
+    if (game::read(object.geom + 0x4C8, animator) && animator == object.animator &&
+        asset_animator(object.geom) == animator)
+        game::write<float>(animator + 0x78, 1.0f);
+}
+
+DWORD WINAPI object_speed_worker(void*) noexcept {
+    std::vector<SpedObject> sped;
+    std::uintptr_t man_slot{};
+    bool interacting{};
+    bool scan_after{};
+    int last_key{};
+    ULONGLONG started{};
+    ULONGLONG hold_until{};
+    int log_lines{};
+    perf::Loop loop(L"object_speed");
+    const auto scan = [&](int key, float factor) noexcept {
+        if (!man_slot) man_slot = game::find_singleton("CSWorldGeomMan", g_log);
+        std::uintptr_t man{};
+        if (!man_slot || !game::read(man_slot, man) || !man) return;
+        try {
+            for_each_asset(man, [&](std::uintptr_t geom) {
+                const std::uintptr_t animator = asset_animator(geom);
+                if (!animator || !asset_animation_just_started(animator) || asset_is_lift(geom)) return;
+                for (const auto& object : sped)
+                    if (object.geom == geom) return;
+                sped.push_back({geom, animator});
+                game::write<float>(animator + 0x78, factor);
+                if (g_log && g_diagnostics && log_lines < 40) {
+                    ++log_lines;
+                    wchar_t message[120]{};
+                    swprintf_s(message, L"Interaction objects: a000_%06d sped up an asset x%.2f.", key, factor);
+                    g_log(message);
+                }
+            });
+        } catch (...) {
+        }
+    };
+    for (;;) {
+        const bool wanted = value_of(interaction_objects) != 0 && value_of(speed_interact) != 100;
+        if (!wanted && sped.empty()) {
+            interacting = false;
+            scan_after = false;
+            idle_wait(loop);
+            continue;
+        }
+        loop.sleep(50);
+        std::int32_t anim{-1};
+        const auto anim_address = game::player_anim_id(g_statics);
+        if (anim_address) game::read(anim_address, anim);
+        const int key = anim >= 0 ? anim % 1000000 : -1;
+        const bool now = wanted && key >= 0 && is_interaction(key) && !is_rest(key);
+        const ULONGLONG tick = GetTickCount64();
+        const float factor = static_cast<float>(value_of(speed_interact)) / 100.0f;
+        if (now) {
+            if (!interacting) {
+                interacting = true;
+                started = tick;
+            }
+            last_key = key;
+            if (tick - started <= kObjectScanMs) scan(key, factor);
+            continue;
+        }
+        if (interacting) {
+            interacting = false;
+            hold_until = tick + kObjectHoldMs;
+            scan_after = last_key == kStatueAnimation;
+        }
+        const bool holding = wanted && tick < hold_until;
+        if (holding && scan_after) scan(last_key, factor);
+        if (!holding) scan_after = false;
+        for (std::size_t i = sped.size(); i-- > 0;) {
+            if (holding && asset_animation_running(sped[i].animator)) continue;
+            restore_object(sped[i]);
+            sped.erase(sped.begin() + static_cast<std::ptrdiff_t>(i));
+        }
     }
 }
 
@@ -5841,6 +6347,7 @@ void apply(Id id) noexcept {
     case camera_rotate_off: set_site(g_camera_rotate, on(id)); break;
     case camera_reset_off: set_site(g_camera_reset, on(id)); break;
     case vignette_off: set_site(g_vignette, on(id)); break;
+    case sharpen_off: set_site(g_sharpen, on(id)); break;
     case chromatic_off: set_site(g_chromatic, on(id)); break;
     case animation_distance: set_site(g_animation, on(id)); break;
     case rune_loss_off: set_site(g_rune_loss, on(id)); break;
@@ -5978,6 +6485,7 @@ void apply(Id id) noexcept {
     case buff_weapon_forever: case buff_self_forever: case perfect_guard:
     case knockback_dealt: case knockback_taken:
     case weapon_effects_enemies: case enemies_no_immunity: case enemies_no_lock_on: case flask_hp: case flask_fp:
+    case projectile_range: case lock_on_distance: case charm_all_enemies: case charm_bosses:
     case spell_stamina_cost: case spell_one_slot: case spell_no_requirements: case carry_max:
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance:
@@ -6003,6 +6511,7 @@ bool available(Id id) noexcept {
     case camera_rotate_off: return g_camera_rotate.ready;
     case camera_reset_off: return g_camera_reset.ready;
     case vignette_off: return g_vignette.ready;
+    case sharpen_off: return g_sharpen.ready;
     case chromatic_off: return g_chromatic.ready;
     case animation_distance: return g_animation.ready;
     case rune_loss_off: return g_rune_loss.ready;
@@ -6043,6 +6552,7 @@ bool available(Id id) noexcept {
     case buff_weapon_forever: case buff_self_forever: case perfect_guard:
     case knockback_dealt: case knockback_taken:
     case weapon_effects_enemies: case enemies_no_immunity: case enemies_no_lock_on: case flask_hp: case flask_fp:
+    case projectile_range: case lock_on_distance: case charm_all_enemies: case charm_bosses:
     case spell_stamina_cost: case spell_one_slot: case spell_no_requirements: case skill_fp_cost: case carry_max:
     case shop_price: case craft_free: case weapon_requirements: case upgrade_free: case hide_helmet:
     case charged_launch: case launch_all: case launch_distance: case boss_hp:
@@ -6063,7 +6573,9 @@ bool available(Id id) noexcept {
     case max_hp: case max_fp: case max_stamina:
     case hp_regen_points: case fp_regen_points: case stamina_regen_points:
     case speed_global: case speed_attack: case speed_spell: case speed_roll: case speed_move:
-    case speed_jump: case speed_item: case speed_sprint: case enemy_speed: case no_fall_damage:
+    case speed_jump: case speed_item: case speed_sprint: case speed_walk: case speed_run: case speed_interact:
+    case interaction_objects:
+    case enemy_speed: case no_fall_damage:
     case status_immunity:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case set_time: case time_hour: case freeze_time:
@@ -7889,6 +8401,15 @@ const Texts kEnglish{
         {L"Melina companion (beta)", L"BETA: Melina is always with you as a spirit companion. She is summoned again by herself whenever she is not beside you: after you rest at a grace (she sits beside you while you rest), after a loading screen or if she falls. Works best with Summon anywhere and Several ashes at once. Dismiss all ashes sends her away until she comes back."},
         {L"Stack weapon buffs (beta)", L"BETA: buffs on the same weapon no longer replace each other, so for example a grease and an armament spell or a weapon skill buff stay on together, each with its own damage. The weapon shows one of them. Applies to the next buffs you use."},
         {L"Sprint speed (%)", L"Sprinting only, on top of Movement speed: 200% here with Movement speed at 150% sprints at 300%. Walking and running keep Movement speed."},
+        {L"Walk speed (%)", L"Walking only, on top of Movement speed."},
+        {L"Run speed (%)", L"Running only, on top of Movement speed."},
+        {L"Interaction speed (%)", L"Pulling levers, opening doors and chests, picking things up, getting up from a Site of Grace. Multiplies the overall speed. Sitting down keeps its speed. Only your character speeds up: the chest or door itself and the effects around it keep their speed."},
+        {L"Projectile range (%)", L"How far your spells, arrows and thrown items fly before they vanish. Their speed and damage do not change. Use the same value as Lock-on distance so they reach what you lock on to: at 500% both reach about 250 m. Some spells arc down and can still hit the ground first."},
+        {L"Lock-on distance (%)", L"How far away you can lock on to enemies and keep them locked. No lock-on wins over this."},
+        {L"Remove forced sharpening", L"Turns off the sharpening filter the game applies after anti-aliasing. The image looks softer, with fewer halos on edges."},
+        {L"Bewitching on all enemies (beta)", L"BETA: Bewitching Branches also work on enemies the game makes immune, such as Black Knights or skeletons. Reaches enemies that appear after you turn it on: rest at a grace. Some may not fight back well while charmed."},
+        {L"Bewitching on bosses (beta)", L"BETA: Bewitching Branches also work on bosses. A charmed boss can stall its phases or a scripted fight for up to 3 minutes. Rest at a grace after changing it."},
+        {L"Objects follow interaction speed (beta)", L"BETA: chests, doors and levers also move at Interaction speed. Lifts keep their speed. Effects around them do not change. Other objects that start moving at that same moment can speed up briefly. Off by default."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -8091,6 +8612,15 @@ const Texts kSpanish{
         {L"Melina acompañante (beta)", L"BETA: Melina está siempre contigo como ceniza acompañante. Se vuelve a invocar sola cuando no está a tu lado: después de descansar en una gracia (se sienta a tu lado mientras descansas), tras una pantalla de carga o si cae. Funciona mejor con Invocar en cualquier lugar y Varias cenizas a la vez. Retirar todas las cenizas la aparta hasta que vuelva."},
         {L"Acumular mejoras de arma (beta)", L"BETA: las mejoras de una misma arma ya no se sustituyen entre sí; por ejemplo, una grasa y un hechizo de arma o la mejora de una habilidad siguen activas a la vez, cada una con su daño. El arma muestra solo una. Se aplica a las siguientes mejoras que uses."},
         {L"Velocidad de esprint (%)", L"Solo al esprintar, encima de «Velocidad de movimiento»: 200 % aquí con movimiento al 150 % esprinta al 300 %. Andar y correr siguen con «Velocidad de movimiento»."},
+        {L"Velocidad al andar (%)", L"Solo al andar, encima de «Velocidad de movimiento»."},
+        {L"Velocidad al correr (%)", L"Solo al correr, encima de «Velocidad de movimiento»."},
+        {L"Velocidad de interacción (%)", L"Tirar de palancas, abrir puertas y cofres, recoger objetos, levantarse de una gracia. Se multiplica por la velocidad general. Sentarse sigue a su velocidad. Solo acelera a tu personaje: el cofre o la puerta y los efectos de alrededor siguen a su velocidad."},
+        {L"Alcance de proyectiles (%)", L"Hasta dónde llegan tus hechizos, flechas y objetos arrojadizos antes de desaparecer. Su velocidad y su daño no cambian. Usa el mismo valor que en «Distancia de fijado» para que lleguen a lo que fijas: al 500 % ambas llegan a unos 250 m. Algunos hechizos caen en arco y aun así pueden tocar antes el suelo."},
+        {L"Distancia de fijado (%)", L"A qué distancia puedes fijar a los enemigos y mantenerlos fijados. «Sin fijar objetivo» tiene prioridad."},
+        {L"Quitar enfoque forzado", L"Desactiva el filtro de enfoque que el juego aplica tras el antialiasing. La imagen se ve más suave, con menos halos en los bordes."},
+        {L"Embrujar a todos los enemigos (beta)", L"BETA: las Ramas embrujadoras también funcionan con enemigos que el juego hace inmunes, como Caballeros negros o esqueletos. Afecta a los enemigos que aparezcan después de activarla: descansa en una gracia. Algunos pueden no luchar bien mientras están embrujados."},
+        {L"Embrujar a los jefes (beta)", L"BETA: las Ramas embrujadoras también funcionan con los jefes. Un jefe embrujado puede bloquear sus fases o un combate con guion hasta 3 minutos. Descansa en una gracia después de cambiarla."},
+        {L"Objetos a velocidad de interacción (beta)", L"BETA: cofres, puertas y palancas también van a la velocidad de interacción. Los ascensores no cambian. Los efectos de alrededor tampoco. Otros objetos que empiecen a moverse en ese momento pueden acelerarse un instante. Apagada por defecto."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -8293,6 +8823,15 @@ const Texts kChinese{
         {L"梅琳娜同伴（测试版）", L"测试版：梅琳娜作为骨灰同伴始终陪伴你。当她不在你身边时会自动重新召唤：在赐福处休息后（你休息时她会坐在你身旁）、读取画面后或她倒下后。配合“随处召唤”与“同时召唤多个骨灰”效果最佳。“解除全部骨灰”会让她暂时离开，之后她会再次出现。"},
         {L"叠加武器增益（测试版）", L"测试版：同一把武器上的增益不再互相覆盖，例如油脂与武器附魔法术或战技增益可同时生效，各自提供伤害。武器只显示其中一种效果。从下一次使用的增益开始生效。"},
         {L"冲刺速度 (%)", L"仅作用于冲刺，并与“移动速度”相乘：移动速度为 150% 时，此处设为 200% 则冲刺速度为 300%。行走和奔跑仍使用“移动速度”。"},
+        {L"行走速度 (%)", L"仅作用于行走，并与“移动速度”相乘。"},
+        {L"奔跑速度 (%)", L"仅作用于奔跑，并与“移动速度”相乘。"},
+        {L"互动速度 (%)", L"拉拉杆、开门、开宝箱、拾取物品、从赐福起身。与整体速度相乘。坐下保持原速。只加快你的角色：宝箱、门以及周围的特效保持原速。"},
+        {L"投射物射程 (%)", L"你的法术、箭矢和投掷物消失前能飞多远。速度和伤害不变。与“锁定距离”设为相同数值即可打到锁定的目标：500% 时两者都约为 250 米。部分法术呈弧线下坠，仍可能先落地。"},
+        {L"锁定距离 (%)", L"可以锁定敌人并保持锁定的最远距离。“禁用锁定”优先。"},
+        {L"移除强制锐化", L"关闭游戏在抗锯齿之后应用的锐化滤镜。画面更柔和，边缘光晕更少。"},
+        {L"魅惑所有敌人（测试版）", L"测试版：魅惑树枝也对游戏设为免疫的敌人生效，例如黑骑士或骷髅。只影响开启后出现的敌人：请在赐福处休息。部分敌人被魅惑时可能无法正常战斗。"},
+        {L"魅惑头目（测试版）", L"测试版：魅惑树枝也对头目生效。被魅惑的头目可能使其阶段或脚本战斗停滞最多 3 分钟。更改后请在赐福处休息。"},
+        {L"物体跟随互动速度（测试版）", L"测试版：宝箱、门和拉杆也按互动速度运动。升降机保持原速。周围的特效不变。同一时刻开始运动的其他物体可能短暂加速。默认关闭。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -8308,13 +8847,14 @@ const Layout kLayout[]{
         carry_max, hide_helmet}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
-    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_sprint, speed_jump, speed_item,
+    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_walk, speed_run, speed_sprint,
+        speed_jump, speed_item, speed_interact, interaction_objects,
         jump_height, jump_distance}},
     {cat_defense, {dodge_frames, parry_frames, deflect_window, perfect_guard, knockdown_invincible, item_super_armor}},
     {cat_torrent, {torrent_no_death, torrent_speed, torrent_jump_speed, torrent_jump_height,
         torrent_jump_distance}},
     {cat_dealt, {damage_dealt, dmg_physical, dmg_magic, dmg_fire, dmg_lightning, dmg_holy, weapon_scaling,
-        knockback_dealt, charged_launch, launch_all, launch_distance, one_hit_kill}},
+        knockback_dealt, charged_launch, launch_all, launch_distance, one_hit_kill, projectile_range}},
     {cat_taken, {damage_taken, taken_physical, taken_magic, taken_fire, taken_lightning, taken_holy,
         knockback_taken, die_one_hit}},
     {cat_poise, {player_poise, player_poise_lock, posture_taken, posture_one_hit_taken, posture_dealt,
@@ -8323,7 +8863,8 @@ const Layout kLayout[]{
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
-    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemies_no_attack, enemies_no_move,
+    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, charm_all_enemies, charm_bosses,
+        enemies_no_attack, enemies_no_move,
         enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable}},
     // Summon Melina and Melina companion (summon_melina, melina_companion) stay out
     // of the menu: work in progress, moving to a separate mod (2026-10-28).
@@ -8332,8 +8873,9 @@ const Layout kLayout[]{
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
     {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_level_up, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
-    {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on}},
-    {cat_image, {vignette_off, chromatic_off, aa_off, motion_blur_off, dof_off, animation_distance,
+    {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on,
+        lock_on_distance}},
+    {cat_image, {vignette_off, chromatic_off, sharpen_off, aa_off, motion_blur_off, dof_off, animation_distance,
         clean_characters, player_clean, hide_buff_effects, hide_weapon_buff_effects, solid_ashes, solid_ghosts}},
     {cat_display, {fps_unlock, fps_limit, refresh_rate, ultrawide}},
     {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default,
@@ -8786,6 +9328,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         start_thread(&regen_worker, L"regen");
         start_thread(&fall_worker, L"fall");
         start_thread(&enemy_speed_worker, L"enemy_speed");
+        start_thread(&object_speed_worker, L"object_speed");
         start_thread(&jump_worker, L"jump");
         start_thread(&dead_enemy_worker, L"dead_enemy");
         start_thread(&ghost_worker, L"ghost");
