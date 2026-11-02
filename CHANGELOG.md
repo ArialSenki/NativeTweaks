@@ -2,6 +2,10 @@
 
 Same entries as the [Nexus page](https://www.nexusmods.com/eldenring/mods/11339). Newest first.
 
+## r153
+
+- Changed: Boss health goes up to 2000% (x20) without Extended ranges (it stopped at 1000%). Nexus request.
+
 ## r152
 
 - Fixed with Solid Uncapper: the help line showing two texts on top of each other (Nexus report, thanks for the log).

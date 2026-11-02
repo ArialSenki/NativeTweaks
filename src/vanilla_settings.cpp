@@ -1814,7 +1814,7 @@ Scale g_scales[]{
     {posture_taken, L"PostureDamageTakenScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {status_buildup, L"StatusBuildupScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {enemy_hp, L"EnemyHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
-    {boss_hp, L"BossHpScale", 10, 1000, 10, 0, ERUI_INVALID_ROW},
+    {boss_hp, L"BossHpScale", 10, 2000, 10, 0, ERUI_INVALID_ROW},
     {enemy_poise, L"EnemyPoiseScale", 0, 500, 10, 0, ERUI_INVALID_ROW},
     {runes_gained, L"RunesGainedScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
     {loot_drop, L"LootDropScale", 0, 1000, 10, 0, ERUI_INVALID_ROW},
