@@ -31,11 +31,17 @@ void set_image(void* module) noexcept {
 
 namespace {
 
+// Only access violations: a guard-page hit must reach its owner (stack
+// growth, anti-tamper), so it is passed on.
+int access_violation_only(unsigned long code) noexcept {
+    return code == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
 bool copy_guarded(void* destination, const void* source, std::size_t size) noexcept {
     __try {
         std::memcpy(destination, source, size);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (access_violation_only(GetExceptionCode())) {
         // Each fault goes through the kernel and every exception handler in
         // the process, so PerfLog counts them.
         perf::count_fault();
@@ -110,6 +116,8 @@ std::uintptr_t rip_target(const std::uint8_t* hit, std::size_t disp_at, std::siz
 // 2.7.2.1 (Japanese 1.17.2) is to 2.7.2.0 what 2.7.1.1 is to 2.7.1.0: same
 // section layout, and the code at every address checked is the same; only
 // some read-only data (17 vtables) sits a few bytes away (24-10, offline).
+// 2.7.0.0 (1.17) keeps the 2.7.1.0 section layout and the structure offsets used
+// here (checked offline, 05-11; the option patterns still prove themselves).
 bool game_has_2_7_1_layout() noexcept {
     wchar_t path[MAX_PATH]{};
     if (!GetModuleFileNameW(static_cast<HMODULE>(game::image()), path, MAX_PATH)) return false;
@@ -122,7 +130,8 @@ bool game_has_2_7_1_layout() noexcept {
     UINT length{};
     if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) || !info) return false;
     return info->dwFileVersionMS == ((2u << 16) | 7u) &&
-        (info->dwFileVersionLS == ((1u << 16) | 0u) || info->dwFileVersionLS == ((1u << 16) | 1u) ||
+        (info->dwFileVersionLS == ((0u << 16) | 0u) ||
+         info->dwFileVersionLS == ((1u << 16) | 0u) || info->dwFileVersionLS == ((1u << 16) | 1u) ||
          info->dwFileVersionLS == ((2u << 16) | 0u) || info->dwFileVersionLS == ((2u << 16) | 1u));
 }
 
@@ -168,7 +177,7 @@ Statics resolve_statics(LogFn log) noexcept {
         wchar_t message[256]{};
         swprintf_s(message,
             L"Vanilla statics: WorldChrMan=+0x%llX ChrDbgFlags=+0x%llX Regulation=+0x%llX GameDataMan=+0x%llX "
-            L"GameMan=+0x%llX, game 2.7.1.0/2.7.1.1/2.7.2.0/2.7.2.1 layout=%ls.",
+            L"GameMan=+0x%llX, game 2.7.0.0/2.7.1.0/2.7.1.1/2.7.2.0/2.7.2.1 layout=%ls.",
             static_cast<unsigned long long>(s.world_chr_man ? s.world_chr_man - base : 0),
             static_cast<unsigned long long>(s.chr_dbg_flags ? s.chr_dbg_flags - base : 0),
             static_cast<unsigned long long>(s.regulation_manager ? s.regulation_manager - base : 0),
@@ -368,7 +377,7 @@ void scan_singletons() noexcept {
 const char* singleton_name(const SingletonEntry& e) noexcept {
     __try {
         return g_get_name ? g_get_name(reinterpret_cast<const void*>(e.reflection)) : nullptr;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (access_violation_only(GetExceptionCode())) {
         return nullptr;
     }
 }
@@ -435,10 +444,26 @@ std::ptrdiff_t find_chr_vector(const Statics& s, LogFn log) noexcept {
     std::size_t best_count{};
     // A std::vector is {begin, end, capacity}; the one holding every loaded
     // character is the largest whose sampled elements all look like ChrIns.
+    // The window is copied once, a page at a time, instead of three guarded
+    // reads per offset (audit 2026-11-08: about 49 000 reads per try).
+    constexpr std::size_t kWindow = 0x20000 + 16;
+    static thread_local std::vector<std::uintptr_t> words;
+    words.assign(kWindow / 8, 0);
+    std::vector<bool> page_ok((kWindow + 0xFFF) / 0x1000, false);
+    for (std::size_t page = 0; page < page_ok.size(); ++page) {
+        const std::size_t at = page * 0x1000;
+        const std::size_t size = (std::min<std::size_t>)(0x1000, kWindow - at);
+        page_ok[page] = safe_read(manager + at, reinterpret_cast<std::uint8_t*>(words.data()) + at, size);
+    }
+    const auto word = [&](std::size_t at, std::uintptr_t& out) {
+        if (!page_ok[at / 0x1000] || !page_ok[(at + 7) / 0x1000]) return false;
+        out = words[at / 8];
+        return true;
+    };
     for (std::ptrdiff_t offset = 0; offset < 0x20000; offset += 8) {
         std::uintptr_t begin{}, end{}, capacity{};
-        if (!read(manager + offset, begin) || !read(manager + offset + 8, end) ||
-            !read(manager + offset + 16, capacity)) continue;
+        const auto o = static_cast<std::size_t>(offset);
+        if (!word(o, begin) || !word(o + 8, end) || !word(o + 16, capacity)) continue;
         if (begin < 0x10000 || end <= begin || capacity < end || (end - begin) % 8) continue;
         const std::size_t count = (end - begin) / 8;
         if (count < 8 || count > 5000 || count <= best_count) continue;
@@ -456,7 +481,10 @@ std::ptrdiff_t find_chr_vector(const Statics& s, LogFn log) noexcept {
         wchar_t message[128]{};
         swprintf_s(message, L"Character list: WorldChrMan+0x%llX, %zu characters.",
             static_cast<unsigned long long>(best), best_count);
-        log(best ? message : L"Character list not found yet.");
+        static bool not_found_logged = false;
+        if (best) log(message);
+        else if (!not_found_logged) log(L"Character list not found yet.");
+        not_found_logged = !best;
     }
     return best;
 }

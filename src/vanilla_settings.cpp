@@ -26,6 +26,7 @@
 #pragma comment(lib, "synchronization.lib")  // WaitOnAddress
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <map>
@@ -315,7 +316,43 @@ Site g_summon_range{L"summoning range",
     "44 38 ae b5 00 00 00 74 07 44 88 ae b7 00 00 00 4c 39 ae 00 01 00 00",
     0, "44 38 ae b5 00 00 00 74 07", {0xC6, 0x86, 0xB5, 0x00, 0x00, 0x00, 0x01, 0x66, 0x90}};
 
+// Craft in combat (Nexus request, skar450). The game asks one "in combat"
+// check (CSSound+0x328 state; 0xDAA5E0 in 2.7.2.0) from five places; logged
+// with the pause menu open in combat (r158-test29-dev), three of them answer
+// for it: the crafting kit's own test (0x913400: call; test al,al; sete al),
+// a "can use" flag (sete dl; 0x5111FC) and the menus' combat state with its
+// timer (0x76B197; jz past it when out of combat). Each call there becomes
+// xor eax,eax ("not in combat"). The map's (0x9C4E94) and the message-600
+// one (0x7EFF7C, "cannot open the map in combat") are left alone. The idea
+// of patching the first is from Erd-Tools (Nordgaren; no code taken).
+// All unique in 2.7.0.0 to 2.7.2.1 (0x912F50 / 0x510F7C / 0x76ACE7 in
+// 2.7.0.0 and 2.7.1.x).
+Site g_craft_combat{L"craft in combat",
+    "48 83 ec 28 48 8b 0d ? ? ? ? 48 85 c9 75 ? 48 8d 0d ? ? ? ? e8 ? ? ? ? 4c 8b c8 4c 8d 05 ? ? ? ? "
+    "ba b4 00 00 00 48 8d 0d ? ? ? ? e8 ? ? ? ? 48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 0f 94 c0 48 83 c4 28 c3",
+    0x3E, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+Site g_craft_combat_flag{L"craft in combat (flag)",
+    "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 0f 94 c2 eb 02 32 d2 f6 c3 01 74 07 83 e3 fe",
+    0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+Site g_craft_combat_menu{L"craft in combat (menu state)",
+    "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 74 67 f3 0f 10 47 0c f3 0f 11 44 24 40 8b 44 24 40 a9 ff ff 7f 00 c6 47 08 01",
+    0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+
+// Map in combat (user, 14-11): the other two places that ask the same "in
+// combat" check. Opening the map shows message 600 ("cannot open the map in
+// combat"; 0x7EFF7C), and the open map closes when a fight starts (0x9C4E94:
+// in combat -> close). Their call becomes xor eax,eax there too. The same
+// idea as Erd-Tools' map in combat (Nordgaren; no code taken). Unique in
+// 2.7.0.0 to 2.7.2.1 (0x7EFACC / 0x9C49E4 in 2.7.0.0 and 2.7.1.x).
+Site g_map_combat_open{L"map in combat (open)",
+    "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 74 2e c7 45 50 58 02 00 00 c7 45 54 02 00 00 00",
+    0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+Site g_map_combat_close{L"map in combat (close)",
+    "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 75 ? 38 83 ? ? ? ? 75 ? 83 e6 fe",
+    0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+
 Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic, &g_sharpen,
+    &g_craft_combat, &g_craft_combat_flag, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close,
     &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
     &g_summon_area, &g_summon_area_item, &g_summon_range, &g_buddy_slot_start, &g_buddy_slot_loop};
 
@@ -598,6 +635,306 @@ void install_status_immunity_hook() noexcept {
     swprintf_s(message, L"Vanilla status immunity hook installed at eldenring.exe+0x%llX.",
         static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(game::image())));
     log(message);
+}
+
+// Camera shake (Nexus request, BeastBlood1885). TAE events 144/145 ("Rumble
+// Cam") and cutscenes start a rumble with RumbleMan::Play (0x567BC0 in
+// 2.7.2.0; rcx = RumbleMan, edx = rumble id, r8 = position, r9 = falloff).
+// It looks the id up in default.rumblebnd and takes a RumbleIns slot, which
+// shakes the camera and, with Rumble on, the controller. While the option is
+// on the trampoline returns at once, so no rumble starts; rumbles already
+// playing end normally. The same function also drives controller vibration,
+// which the option turns off with it. Unique in 2.7.0.0 to 2.7.2.1.
+struct CameraShakeData {
+    volatile std::uint32_t on;
+    volatile std::uint32_t blocked;
+};
+
+CameraShakeData* g_camera_shake{};
+
+constexpr const char* kRumblePlayPattern =
+    "89 54 24 10 53 56 41 56 48 83 ec 40 48 8b d9 49 8b f1 48 8b 89 ? ? 00 00 4d 8b f0 48 85 c9 0f 84";
+
+void install_camera_shake_hook() noexcept {
+    std::uint8_t* site = find_unique(parse_pattern(kRumblePlayPattern));
+    if (!site) {
+        log(L"Vanilla site 'rumble play' not found (or ambiguous); Disable camera shake is unavailable.");
+        return;
+    }
+    constexpr std::size_t kStolen = 15;  // mov [rsp+10h],edx; push rbx; push rsi; push r14; sub rsp,40h; mov rbx,rcx
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(
+        nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return;
+    g_camera_shake = reinterpret_cast<CameraShakeData*>(code + 128);
+    g_camera_shake->on = 0;
+    g_camera_shake->blocked = 0;
+
+    std::uint8_t* p = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) {
+        for (auto b : bytes) *p++ = b;
+    };
+    const auto put_rel = [&](const volatile void* data, std::size_t instruction_tail) {
+        const auto next = reinterpret_cast<std::intptr_t>(p) + 4 + instruction_tail;
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(data) - next);
+        std::memcpy(p, &disp, 4);
+        p += 4;
+    };
+    put({0x83, 0x3D}); put_rel(&g_camera_shake->on, 1); put({0x00});        // cmp dword [on],0
+    put({0x74, 0x0A});                                                       // je original
+    put({0xF0, 0xFF, 0x05}); put_rel(&g_camera_shake->blocked, 0);          // lock inc [blocked]
+    put({0x31, 0xC0});                                                       // xor eax,eax (no RumbleIns)
+    put({0xC3});                                                             // ret (no rumble)
+    std::memcpy(p, site, kStolen); p += kStolen;                             // original prologue
+    put({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});                               // jmp [rip+0]
+    const std::uint64_t resume = reinterpret_cast<std::uint64_t>(site + kStolen);
+    std::memcpy(p, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), code, 128);
+
+    std::uint8_t jump[kStolen]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const auto trampoline = reinterpret_cast<std::uint64_t>(code);
+    std::memcpy(jump + 6, &trampoline, 8);
+    jump[14] = 0x90;
+    if (!write_code(site, jump, sizeof(jump))) {
+        g_camera_shake = nullptr;
+        log(L"Vanilla rumble hook could not be written; Disable camera shake is unavailable.");
+        return;
+    }
+    wchar_t message[128]{};
+    swprintf_s(message, L"Vanilla rumble hook installed at eldenring.exe+0x%llX.",
+        static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(game::image())));
+    log(message);
+}
+
+// Ragdoll on death (beta; user request, 13-11). Death animations of human
+// characters (model c0000: you, NPCs, invaders) fade the body out with TAE
+// event 193 (SetOpacityKeyframe). Player Ragdoll Physics (Dweet and
+// HonorKnight26, Nexus 2284) swaps those events for 228 (RagdollReviveTime,
+// parameters 0) in c0000.anibnd; here the same happens in memory: the 193
+// handler (reached only from CSChrTaeAnimEvent's dispatcher) is hooked and,
+// for a dead c0000 character whose event fades to opacity 0, the 228 handler
+// runs instead with zero parameters. Tested in game with the RagdollTest
+// experiment (13-11). Both handlers are unique in 2.7.0.0 to 2.7.2.1.
+constexpr const char* kOpacityEventPattern =
+    "48 89 74 24 20 57 48 83 ec 40 48 8b 42 20 48 8b 72 08 f3 0f 10 52 14 48 8b 79 18 48 8d 4c 24 58 "
+    "f3 0f 10 40 08 f3 0f 5c 00 f3 0f 5c 10 f3 0f 10 1d ? ? ? ? 48 8d 44 24 50 0f 29 74 24 30 "
+    "f3 0f 10 76 04 f3 0f 5c 36";
+constexpr const char* kRagdollEventPattern =
+    "48 89 5c 24 18 48 89 74 24 20 57 48 83 ec 20 48 8b 79 18 48 8b da 48 8b 72 08 48 8b 87 90 01 00 00 "
+    "48 8b 48 28 e8 ? ? ? ? 84 c0 75 ? 48 8b 43 20 48 8d 4c 24 38 f3 0f 10 53 14 48 8b d6 "
+    "f3 0f 10 1d ? ? ? ? c7 44 24 38 00 00 80 3f";
+
+using TaeEventHandler = void(__fastcall*)(void* owner, void* event);
+TaeEventHandler g_opacity_original{};  // copied prologue, then back into the 193 handler
+TaeEventHandler g_ragdoll_event{};     // handler of event 228
+volatile long g_ragdoll_on{};
+volatile long g_ragdoll_count{};
+alignas(16) float g_ragdoll_zero[4]{};
+
+// The event's owner has the ChrIns at +0x18: +0x64 model number (0 = c0000),
+// +0x190 modules, the first of which (data) keeps HP at +0x138.
+bool dead_human(void* owner) noexcept {
+    std::uintptr_t chr{}, modules{}, data{};
+    std::int32_t model{-1}, hp{1};
+    return game::read(reinterpret_cast<std::uintptr_t>(owner) + 0x18, chr) && chr &&
+        game::read(chr + 0x64, model) && model == 0 && game::read(chr + 0x190, modules) && modules &&
+        game::read(modules, data) && data && game::read(data + 0x138, hp) && hp <= 0;
+}
+
+// Keep bodies, defined with its other hooks below (after g_statics).
+volatile long g_keep_bodies_on{};
+volatile long g_bodies_kept{};
+bool keep_dead_body(std::uintptr_t chr) noexcept;
+
+void __fastcall ragdoll_opacity_event(void* owner, void* event) noexcept {
+    if (g_ragdoll_on || g_keep_bodies_on) {
+        const auto address = reinterpret_cast<std::uintptr_t>(event);
+        std::uintptr_t params{}, chr{};
+        float to{1.0f};
+        std::int32_t model{-1};
+        // Fades end at 0, or at 0.01 for Maliketh (c2110; the only death
+        // animation between 0.001 and 0.2 in the 429 models, 13-11).
+        if (game::read(address + 8, params) && params && game::read(params + 4, to) && to <= 0.02f &&
+            game::read(reinterpret_cast<std::uintptr_t>(owner) + 0x18, chr) && chr &&
+            game::read(chr + 0x64, model)) {
+            if (g_ragdoll_on && model == 0 && dead_human(owner)) {
+                // A copy of the event with zero parameters: the 228 handler reads
+                // +0x08 (parameters), +0x14 (time) and +0x20 (start and end).
+                alignas(16) std::uint8_t copy[0x40];
+                if (game::safe_read(address, copy, sizeof(copy))) {
+                    float* zero = g_ragdoll_zero;
+                    std::memcpy(copy + 8, &zero, sizeof(zero));
+                    InterlockedIncrement(&g_ragdoll_count);
+                    g_ragdoll_event(owner, copy);
+                    return;
+                }
+            }
+            // Bosses whose death fades them with their own event 193
+            // (Malenia c2120, Placidusax c4750, Godrick c4520; log 13-11):
+            // the fade is skipped and the body keeps the animation's last pose.
+            if (g_keep_bodies_on && model != 0 && keep_dead_body(chr)) {
+                // The animation is not frozen (animation_speed = 0 in r158-test7
+                // to test9): it stopped death scenes such as Godfrey's halfway,
+                // with their effect; the small shift at the end is better.
+                InterlockedIncrement(&g_bodies_kept);
+                return;
+            }
+        }
+    }
+    g_opacity_original(owner, event);
+}
+
+void install_ragdoll_hook() noexcept {
+    std::uint8_t* site = find_unique(parse_pattern(kOpacityEventPattern));
+    std::uint8_t* ragdoll = find_unique(parse_pattern(kRagdollEventPattern));
+    if (!site || !ragdoll) {
+        log(L"Vanilla sites 'opacity event' / 'ragdoll event' not found (or ambiguous); Ragdoll on death is unavailable.");
+        return;
+    }
+    constexpr std::size_t kStolen = 14;  // mov [rsp+20h],rsi; push rdi; sub rsp,40h; mov rax,[rdx+20h]
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(
+        nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return;
+    std::memcpy(code, site, kStolen);                                       // original prologue
+    const std::uint8_t jump_back[6]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};   // jmp [rip+0]
+    std::memcpy(code + kStolen, jump_back, sizeof(jump_back));
+    const std::uint64_t resume = reinterpret_cast<std::uint64_t>(site + kStolen);
+    std::memcpy(code + kStolen + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), code, 64);
+    g_opacity_original = reinterpret_cast<TaeEventHandler>(code);
+    g_ragdoll_event = reinterpret_cast<TaeEventHandler>(ragdoll);
+
+    std::uint8_t jump[kStolen]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const auto detour = reinterpret_cast<std::uint64_t>(&ragdoll_opacity_event);
+    std::memcpy(jump + 6, &detour, 8);
+    if (!write_code(site, jump, sizeof(jump))) {
+        g_ragdoll_event = nullptr;
+        log(L"Vanilla opacity event hook could not be written; Ragdoll on death is unavailable.");
+        return;
+    }
+    wchar_t message[160]{};
+    swprintf_s(message, L"Vanilla opacity event hook installed at eldenring.exe+0x%llX (ragdoll event +0x%llX).",
+        static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(game::image())),
+        static_cast<unsigned long long>(ragdoll - reinterpret_cast<std::uint8_t*>(game::image())));
+    log(message);
+}
+
+// Giving items (r157 item spawner). MapItemMan::ItemGib (0x5618B0 in 2.7.2.0)
+// puts up to 10 items in the player's inventory, the same way picking one up
+// does: rcx = MapItemMan ([0x3D6EAE0]), rdx = list {u32 count; entries of
+// 16 bytes: item id (category << 28 | param id), quantity, -1, Ash of War id
+// or -1}, r8 = {-1, 0, 0, 0}, r9d = 0. _RequestRegistGetItem calls it the same
+// way. Categories: 0 weapon, 1 armour, 2 talisman, 4 goods, 8 Ash of War.
+using ItemGibFn = void(__fastcall*)(void*, void*, void*, int);
+struct ItemGibEntry {
+    std::uint32_t id;
+    std::uint32_t quantity;
+    std::int32_t relay;
+    std::int32_t gem;
+};
+struct ItemGibList {
+    std::uint32_t count;
+    ItemGibEntry entries[10];
+};
+ItemGibFn g_item_gib{};
+void** g_map_item_man{};
+
+constexpr const char* kItemGibPattern =
+    "40 55 56 57 41 54 41 55 41 56 41 57 48 8d ac 24 ? ? ? ? 48 81 ec ? ? ? ? 48 c7 45 ? fe ff ff ff "
+    "48 89 9c 24 ? ? ? ? 48 8b 05 ? ? ? ? 48 33 c4 48 89 85 ? ? ? ? 44 89 4c 24 ? 4d 8b f8 4c 89 44 24 ? "
+    "4c 8b e9 33 ff 89 7c 24 ? 8b 02 83 f8 0a";
+// new MapItemManImpl (0x1C0 bytes), then mov [MapItemMan],rax
+constexpr const char* kMapItemManPattern =
+    "ba 08 00 00 00 b9 c0 01 00 00 e8 ? ? ? ? 48 89 45 ? 48 85 c0 74 0a 48 8b c8 e8 ? ? ? ? eb 03 49 8b c6 48 89 05";
+
+// While one of our shops is open, the game's GetSellValue (0x68BA00 in
+// 2.7.2.0) returns 0, as Glorious Merchant (MIT) does: the shop hides a row
+// that costs less than the item sells for, so with it any price shows,
+// free included, and no param changes. Pattern from that mod (-29 to the
+// entry); 15 bytes stolen: mov [rsp+8],rbx; mov [rsp+10h],rsi; mov [rsp+18h],rdi.
+volatile std::uint32_t* g_shop_sell_zero{};
+
+void install_sell_value_hook() noexcept {
+    std::uint8_t* hit = find_unique(parse_pattern("83 cb ff 41 8b c0 c1 e8 1c 48 8b f1 83 f8 0f"));
+    if (!hit) {
+        log(L"Vanilla site 'sell value' not found (or ambiguous); item shop prices stay at the sell value.");
+        return;
+    }
+    std::uint8_t* site = hit - 29;
+    static constexpr std::uint8_t kPrologue[]{0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x48, 0x89, 0x7C, 0x24, 0x18};
+    if (std::memcmp(site, kPrologue, sizeof(kPrologue)) != 0) {
+        log(L"Item shop: GetSellValue is not as expected (another mod?); prices stay at the sell value.");
+        return;
+    }
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return;
+    auto* flag = reinterpret_cast<volatile std::uint32_t*>(code + 256);
+    *flag = 0;
+    std::uint8_t* q = code;
+    const auto put = [&](std::initializer_list<std::uint8_t> bytes) { for (auto b : bytes) *q++ = b; };
+    const auto rel = [&](const volatile void* data, std::size_t tail) {
+        const auto next = reinterpret_cast<std::intptr_t>(q) + 4 + tail;
+        const auto disp = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(data) - next);
+        std::memcpy(q, &disp, 4); q += 4;
+    };
+    put({0x83, 0x3D}); rel(flag, 1); put({0x00});  // cmp dword [flag],0
+    put({0x74, 0x03});                             // je original
+    put({0x31, 0xC0});                             // xor eax,eax
+    put({0xC3});                                   // ret
+    std::memcpy(q, site, sizeof(kPrologue)); q += sizeof(kPrologue);
+    put({0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
+    const std::uint64_t resume = reinterpret_cast<std::uint64_t>(site + sizeof(kPrologue));
+    std::memcpy(q, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), code, 128);
+    std::uint8_t jump[15]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const auto target = reinterpret_cast<std::uint64_t>(code);
+    std::memcpy(jump + 6, &target, 8);
+    jump[14] = 0x90;
+    if (!write_code(site, jump, sizeof(jump))) {
+        log(L"Item shop: GetSellValue hook could not be written; prices stay at the sell value.");
+        return;
+    }
+    g_shop_sell_zero = flag;
+    wchar_t message[100]{};
+    swprintf_s(message, L"Vanilla sell value hook installed at eldenring.exe+0x%llX.",
+        static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(game::image())));
+    log(message);
+}
+
+void resolve_item_gib() noexcept {
+    std::uint8_t* gib = find_unique(parse_pattern(kItemGibPattern));
+    std::uint8_t* man = find_unique(parse_pattern(kMapItemManPattern));
+    if (!gib || !man) {
+        log(L"Vanilla site 'item gib' not found (or ambiguous); giving items is unavailable.");
+        return;
+    }
+    std::uint8_t* store = man + 37;  // mov [rip+disp32],rax
+    std::int32_t disp{};
+    std::memcpy(&disp, store + 3, 4);
+    g_map_item_man = reinterpret_cast<void**>(store + 7 + disp);
+    g_item_gib = reinterpret_cast<ItemGibFn>(gib);
+    wchar_t message[160]{};
+    const auto base = reinterpret_cast<std::uint8_t*>(game::image());
+    swprintf_s(message, L"Vanilla item gib found at eldenring.exe+0x%llX (MapItemMan at +0x%llX).",
+        static_cast<unsigned long long>(gib - base),
+        static_cast<unsigned long long>(reinterpret_cast<std::uint8_t*>(g_map_item_man) - base));
+    log(message);
+}
+
+bool give_items(const ItemGibEntry* items, std::uint32_t count) noexcept {
+    if (!g_item_gib || !g_map_item_man || count == 0 || count > 10) return false;
+    void* man = *g_map_item_man;
+    if (!man) return false;
+    ItemGibList list{};
+    list.count = count;
+    for (std::uint32_t i = 0; i < count; ++i) list.entries[i] = items[i];
+    std::int32_t unk[4]{-1, 0, 0, 0};
+    __try {
+        g_item_gib(man, &list, unk, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log(L"Item gib raised an exception.");
+        return false;
+    }
+    return true;
 }
 
 // No lock-on range hooks. The player's lock-on update (0x717560 in 2.7.2.0,
@@ -1393,6 +1730,72 @@ bool write_jump(std::uint8_t* site, const std::uint8_t* target) noexcept {
     return write_code(site, jump, sizeof(jump));
 }
 
+#ifdef NT_DEV_COMBAT_TRACE
+// Development builds only (Craft in combat research, 14-11): every place that
+// asks the game's "in combat" check (CSSound+0x328 state; 0xDAA5E0 in
+// 2.7.2.0) is logged once per answer, with its return address. Opening the
+// pause menu in combat then shows which caller greys out Item Crafting.
+using InCombatFn = bool(__fastcall*)(void* sound);
+InCombatFn g_in_combat_original{};
+SRWLOCK g_combat_trace_lock = SRWLOCK_INIT;
+std::uintptr_t g_combat_trace_seen[256]{};
+std::size_t g_combat_trace_count{};
+
+bool __fastcall in_combat_trace(void* sound) noexcept {
+    const bool result = g_in_combat_original(sound);
+    const auto image = reinterpret_cast<std::uintptr_t>(game::image());
+    const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+    const std::uintptr_t key = ((caller - image) << 1) | (result ? 1 : 0);
+    bool fresh = true;
+    AcquireSRWLockExclusive(&g_combat_trace_lock);
+    for (std::size_t i = 0; i < g_combat_trace_count; ++i)
+        if (g_combat_trace_seen[i] == key) { fresh = false; break; }
+    if (fresh && g_combat_trace_count < std::size(g_combat_trace_seen)) g_combat_trace_seen[g_combat_trace_count++] = key;
+    else fresh = false;
+    ReleaseSRWLockExclusive(&g_combat_trace_lock);
+    if (fresh) {
+        void* frames[4]{};
+        const USHORT count = RtlCaptureStackBackTrace(1, 4, frames, nullptr);
+        wchar_t message[200]{};
+        int used = swprintf_s(message, L"Combat trace: in combat = %d, asked from +0x%llX, via", result ? 1 : 0,
+            static_cast<unsigned long long>(caller - image));
+        for (USHORT i = 1; i < count && used > 0 && used < 160; ++i) {
+            const auto a = reinterpret_cast<std::uintptr_t>(frames[i]);
+            const int wrote = a >= image && a < image + 0x6000000
+                ? swprintf_s(message + used, std::size(message) - used, L" +0x%llX", static_cast<unsigned long long>(a - image))
+                : swprintf_s(message + used, std::size(message) - used, L" ?");
+            if (wrote <= 0) break;
+            used += wrote;
+        }
+        log(message);
+    }
+    return result;
+}
+
+void install_combat_trace() noexcept {
+    std::uint8_t* site = find_unique(parse_pattern("48 8b 89 28 03 00 00 48 85 c9 0f 85 ? ? ? ? 32 c0 c3"));
+    if (!site) {
+        log(L"Combat trace: the in-combat check was not found.");
+        return;
+    }
+    std::uint8_t* code = alloc_near(site);
+    if (!code) return;
+    // trampoline: mov rcx,[rcx+328h] (7 bytes, no RIP operand), then back
+    std::memcpy(code, site, 7);
+    const std::uint8_t jump_abs[6]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    std::memcpy(code + 7, jump_abs, 6);
+    const std::uint64_t resume = reinterpret_cast<std::uint64_t>(site + 7);
+    std::memcpy(code + 13, &resume, 8);
+    // near stub the 5-byte jump lands on: jmp [rip+0] -> in_combat_trace
+    std::memcpy(code + 64, jump_abs, 6);
+    const auto detour = reinterpret_cast<std::uint64_t>(&in_combat_trace);
+    std::memcpy(code + 70, &detour, 8);
+    FlushInstructionCache(GetCurrentProcess(), code, 128);
+    g_in_combat_original = reinterpret_cast<InCombatFn>(code);
+    log(write_jump(site, code + 64) ? L"Combat trace: on (development build)." : L"Combat trace: could not hook.");
+}
+#endif
+
 void install_downed_hook(std::uintptr_t world_chr_man) noexcept {
     if (g_downed || !g_downed_site || !world_chr_man) return;
     std::uint8_t* site = g_downed_site;
@@ -1523,7 +1926,7 @@ enum Id : std::size_t {
     rune_loss_off, runes_gained, loot_drop, ash_cost, upgrade_cost, pause_key, set_time, time_hour, freeze_time,
     set_weather, weather_type, all_graces, reveal_map, fast_travel_anywhere,
     // Spirit ashes
-    ash_no_rest, ash_anywhere, ash_multiple, ash_max_active, ash_keep_after_boss, ash_dismiss_all, ash_extra_cost,
+    ash_no_rest, ash_anywhere, ash_multiple, ash_keep_after_boss, ash_dismiss_all, ash_extra_cost,
     ash_damage_per_ash,
     // Performance & display
     fps_unlock, fps_limit, ultrawide, refresh_rate,
@@ -1596,6 +1999,8 @@ enum Id : std::size_t {
     extended_ranges, highlight_changed,
     // Spirits: the same ash again with its item instead of dismissing it
     ash_repeat,
+    // Spirits: where ashes fight freely, without warps (MSA area follow)
+    ash_free_fighting,
     // Damage taken: longer Deflecting Hardtear perfect guard (Nexus request)
     deflect_window,
     // Image: spirit ashes without their ghostly look (Nexus request)
@@ -1632,6 +2037,31 @@ enum Id : std::size_t {
     charm_bosses,
     // Speed: the chest or door follows Interaction speed (Nexus request)
     interaction_objects,
+    // Poise: the poise change of New Game+ 2 and later (Nexus request)
+    ng_poise,
+    // Camera: no camera shake (or controller rumble) from attacks and events (Nexus request)
+    camera_shake_off,
+    // Equipment: drop or discard any item, key items optional (Nexus request)
+    drop_any,
+    drop_key_items,
+    // Item shop (F11): upgrade level of weapons and spirit ashes, price
+    shop_weapon_level, shop_spirit_level, shop_item_price,
+    // Enemies: NPC Spawner built in (r158), started at game start when on
+    npc_spawner,
+    // Image: human characters fall limp and stay instead of fading at death
+    ragdoll_death,
+    // Image: bosses' bodies stay instead of fading or dissolving after death
+    keep_bodies,
+    // Movement & Speed: weapon skills (Ashes of War) apart from attacks (Nexus request)
+    speed_skill,
+    // Survival: the Deathbed Dress healing aura without wearing it (Nexus request)
+    healing_aura,
+    // Runes, Shops & Upgrades: more crafting materials from each pick-up (Nexus request)
+    materials_found,
+    // Runes, Shops & Upgrades: the crafting menu opens in combat too (Nexus request)
+    craft_in_combat,
+    // Map & Travel: the map opens and stays open in combat
+    map_in_combat,
     count
 };
 
@@ -1699,7 +2129,7 @@ Option g_options[count]{
     toggle(L"SetWeather"), slider(L"WeatherType", 4, 0, 15, 1, L""),
     toggle(L"ShowAllGraces"), toggle(L"RevealMap"), toggle(L"FastTravelAnywhere"),
     toggle_on(L"SpiritResummonWithoutRest"), toggle_on(L"SpiritSummonFarFromStones"),
-    toggle_on(L"SpiritMultipleAshes"), slider(L"SpiritMaxActiveAshes", 8, 2, 100, 1, L""),
+    toggle_on(L"SpiritMultipleAshes"),
     toggle_on(L"SpiritKeepAfterBoss"), toggle(L"SpiritDismissAll"),
     slider(L"SpiritExtraAshCostPercent", 100, 0, 200, 10), slider(L"SpiritDamageLossPerExtraAsh", 0, 0, 20, 1),
     toggle(L"UnlockFps"), slider(L"FpsLimit", 120, 30, 360, 10, L" FPS"), toggle(L"AllowUltrawide"),
@@ -1759,6 +2189,7 @@ Option g_options[count]{
     toggle(L"KnockdownInvincible"), toggle(L"ItemSuperArmor"),
     general_toggle(L"ExtendedRanges"), general_toggle(L"HighlightChangedOptions"),
     toggle(L"SpiritRepeatSameAsh"),
+    slider(L"SpiritFreeFighting", 0, 0, 2, 1, L""),  // off by default (user, 08-11)
     slider(L"DeflectWindowPercent", 100, 100, 500, 25),
     toggle(L"SolidSpiritAshes"),
     toggle(L"StackSelfBuffs"),
@@ -1779,6 +2210,21 @@ Option g_options[count]{
     toggle(L"CharmAllEnemies"),
     toggle(L"CharmBosses"),
     toggle(L"InteractionObjects"),
+    slider(L"NgPoisePercent", 100, 0, 100, 5),
+    toggle(L"DisableCameraShake"),
+    toggle(L"DropAnyItem"),
+    toggle(L"DropKeyItems"),
+    slider(L"ItemShopWeaponLevel", 0, 0, 25, 1),
+    slider(L"ItemShopSpiritLevel", 0, 0, 10, 1),
+    slider(L"ItemShopPricePercent", 100, 0, 500, 25),
+    toggle(L"NpcSpawner"),  // off by default; read once at startup (start_npc_spawner)
+    toggle(L"RagdollOnDeath"),
+    toggle(L"KeepBodies"),
+    slider(L"SpeedSkillPercent", 100, 25, 1300, 5),
+    slider(L"HealingAuraHp", 0, 0, 250, 1, L"/s"),  // at most 256 positions (r158-test22: 501 broke the menu)
+    slider(L"MaterialsFoundPercent", 100, 100, 1000, 25),
+    toggle(L"CraftInCombat"),
+    toggle(L"MapInCombat"),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -1830,6 +2276,7 @@ Scale g_scales[]{
     {camera_distance, L"CameraDistanceScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
     {speed_global, L"SpeedGlobalScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_attack, L"SpeedAttackScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    {speed_skill, L"SpeedSkillScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_spell, L"SpeedSpellScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_roll, L"SpeedRollScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {speed_move, L"SpeedMoveScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
@@ -1861,12 +2308,266 @@ int value_of(Id id) noexcept {
 // Game state: debug flags, params, speed, regeneration
 
 game::Statics g_statics{};
+
+// Keep bodies (beta; user, 13-11; "Keep boss bodies" in r158-test3/4). Bosses already fall with a ragdoll (event
+// 228 is in their own TAE), but their bodies go away by two other paths, both
+// blocked here for dead characters only (tested with the RagdollTest
+// experiment on a summoned Godrick Soldier, 13-11):
+//  1. a timed fade-out, 0x3EE360 in 2.7.2.0 (chr, duration, start opacity,
+//     flag): +0x240 opacity = start when 0..1, +0x1C7 bit 7 = flag, +0x244
+//     rate = (0 - opacity) / duration. It is short and starts with a
+//     relative jump, so it is replaced as a whole (same result when it runs);
+//  2. SpEffect 295190 (vfx 57050), applied about 4.4 s after death: it
+//     dissolves the body (+0x248) and the game removes it about 10 s later.
+//     ChrIns::ApplySpEffect (0x3E8DC0: chr, id, dont_sync; fromsoftware-rs
+//     chr_ins_apply_speffect) does not apply it.
+//  3. the fade-to-0 event 193 of bosses whose death animation fades them
+//     (Malenia, Placidusax, Godrick): skipped in ragdoll_opacity_event, so
+//     that hook serves both options.
+// You, spirit ashes and allies summoned with you (team 47) and ghostly
+// characters (phantom types or a ghost look) keep fading as in the game.
+// Both functions are unique in 2.7.0.0 to 2.7.2.1. The hooks go in the first
+// time the option is turned on.
+constexpr const char* kTimedFadePattern =
+    "0f 57 db 0f 2f d3 72 15 f3 0f 10 05 ? ? ? ? 0f 2f c2 72 08 f3 0f 11 91 40 02 00 00 "
+    "f3 0f 5c 99 40 02 00 00 80 a1 c7 01 00 00 7f 41 c0 e1 07 44 08 89 c7 01 00 00 "
+    "f3 0f 5e d9 f3 0f 11 99 44 02 00 00 c3";
+constexpr const char* kApplySpEffectPattern =
+    "48 8b c4 48 89 58 08 48 89 70 10 57 48 81 ec c0 00 00 00 0f 28 05 ? ? ? ? 48 8b f1 0f 28 0d ? ? ? ? "
+    "48 8d 48 88 0f 29 40 a8 41 0f b6 d8 0f 29 48 b8 0f 57 c0 0f 28 0d ? ? ? ? 8b fa 0f 29 40 c8 "
+    "0f 29 48 d8 66 c7 40 e8 00 00 e8";
+constexpr std::int32_t kDissolveSpEffect = 295190;
+constexpr std::uint8_t kSummonTeam = 47;  // spirit ashes and other allies summoned with you
+
+using ApplySpEffectFn = std::uint64_t(__fastcall*)(void* chr, std::int32_t id, bool dont_sync);
+std::uint8_t* g_timed_fade_site{};
+std::uint8_t* g_apply_speffect_site{};
+ApplySpEffectFn g_apply_speffect_original{};
+bool g_keep_bodies_hooked{};
+
+// Models whose bodies keep fading: Torrent (c8000), which comes back when
+// summoned again. Two-phase bosses are not listed: in the real fights their
+// event removes the first phase (Rykard, Godfrey, Maliketh, Malenia; 13-11);
+// only a summoned Malenia, with no event, leaves her first phase's armour.
+constexpr std::int32_t kKeepFadingModels[]{8000};
+
+// Characters seen alive (HP > 0) since Keep bodies was turned on. Only their
+// bodies are kept: a boss phase that waits with 0 HP until its event brings
+// it in (Malenia's second phase, in the flower) is not dead, and skipping its
+// fade-to-0 left it as a column of petals (user, 13-11). Filled from the
+// SpEffect hook, which sees every fighting character, and from these checks.
+// Each one keeps the parts of its model it showed alive and, once kept, when
+// it died: 6 s later (its fall over) bodies_worker freezes it and puts those
+// parts back, as NPC Spawner does with its own (tested there with Malenia,
+// 13-11): death animations hide parts of the model (Malenia's second phase
+// kept only its flowers, a first phase only its armour), and an unfrozen body
+// without its place's event plays its death fade again and again.
+struct BodyState {
+    std::uint32_t alive_mask{};
+    bool mask_known{};
+    ULONGLONG dead_since{};  // GetTickCount64 when first kept, 0 while alive
+    bool settled{};
+};
+SRWLOCK g_seen_alive_lock = SRWLOCK_INIT;
+std::unordered_map<std::uintptr_t, BodyState> g_seen_alive;
+volatile long g_bodies_pending{};  // kept bodies not settled yet
+volatile long g_bodies_worker{};
+
+// The parts its model shows (bit n = part n; NpcParam modelDispMask at
+// creation): ChrIns+0x3C8 and +0x138 of its CSChrModelIns (ChrIns+0x50),
+// found by NPC Spawner comparing two Malenia rows (2.7.2.0). Only when both
+// hold the same mask.
+bool model_mask(std::uintptr_t chr, std::uint32_t& mask) noexcept {
+    std::uintptr_t ins{};
+    std::uint32_t a{}, b{};
+    if (!game::read(chr + 0x50, ins) || ins < 0x10000 || (ins & 7) || !game::read(chr + 0x3C8, a) ||
+        !game::read(ins + 0x138, b) || a != b)
+        return false;
+    mask = a;
+    return true;
+}
+
+// Puts `mask` back in the four places that hold the model's parts
+// ([ModelIns+0x18]+0x160 and [ModelIns+0x130]+0x18 too); a place is only
+// written when it holds this model's current or alive mask.
+bool restore_model_parts(std::uintptr_t chr, std::uint32_t mask) noexcept {
+    std::uintptr_t ins{};
+    std::uint32_t current{};
+    if (!game::read(chr + 0x50, ins) || ins < 0x10000 || (ins & 7) || !game::read(chr + 0x3C8, current) ||
+        current == mask)
+        return false;
+    std::uintptr_t places[4]{chr + 0x3C8, ins + 0x138, 0, 0};
+    std::uintptr_t inner{};
+    if (game::read(ins + 0x18, inner) && inner > 0x10000 && !(inner & 7)) places[2] = inner + 0x160;
+    if (game::read(ins + 0x130, inner) && inner > 0x10000 && !(inner & 7)) places[3] = inner + 0x18;
+    bool wrote{};
+    for (const std::uintptr_t place : places) {
+        std::uint32_t value{};
+        if (!place || !game::read(place, value) || (value != current && value != mask)) continue;
+        wrote = game::write<std::uint32_t>(place, mask) || wrote;
+    }
+    return wrote;
+}
+
+void note_alive(std::uintptr_t chr) noexcept {
+    std::uint32_t mask{};
+    const bool known = model_mask(chr, mask);
+    AcquireSRWLockExclusive(&g_seen_alive_lock);
+    try {
+        if (g_seen_alive.size() > 8192) g_seen_alive.clear();  // addresses are reused; keeps it small
+        BodyState& state = g_seen_alive[chr];
+        if (state.dead_since && !state.settled) InterlockedDecrement(&g_bodies_pending);
+        if (known) {
+            state.alive_mask = mask;
+            state.mask_known = true;
+        }
+        state.dead_since = 0;
+        state.settled = false;
+    } catch (...) {
+    }
+    ReleaseSRWLockExclusive(&g_seen_alive_lock);
+}
+
+bool seen_alive(std::uintptr_t chr) noexcept {
+    AcquireSRWLockShared(&g_seen_alive_lock);
+    const bool seen = g_seen_alive.count(chr) != 0;
+    ReleaseSRWLockShared(&g_seen_alive_lock);
+    return seen;
+}
+
+void note_kept(std::uintptr_t chr) noexcept {
+    AcquireSRWLockExclusive(&g_seen_alive_lock);
+    const auto it = g_seen_alive.find(chr);
+    if (it != g_seen_alive.end() && !it->second.dead_since) {
+        it->second.dead_since = GetTickCount64();
+        it->second.settled = false;
+        InterlockedIncrement(&g_bodies_pending);
+    }
+    ReleaseSRWLockExclusive(&g_seen_alive_lock);
+}
+
+bool chr_alive(std::uintptr_t chr) noexcept {
+    std::uintptr_t modules{}, data{};
+    std::int32_t hp{0};
+    return chr && game::read(chr + 0x190, modules) && modules && game::read(modules, data) && data &&
+        game::read(data + 0x138, hp) && hp > 0;
+}
+
+bool keep_dead_body(std::uintptr_t chr) noexcept {
+    std::uintptr_t modules{}, data{}, manager{}, player{};
+    std::int32_t hp{1}, type{-1}, look{-1}, model{-1};
+    std::uint8_t team{};
+    if (!chr || !game::read(chr + 0x190, modules) || !modules || !game::read(modules, data) || !data ||
+        !game::read(data + 0x138, hp))
+        return false;
+    if (hp > 0) {
+        note_alive(chr);
+        return false;
+    }
+    if (!seen_alive(chr)) return false;
+    if (!game::read(chr + 0x64, model) ||
+        std::find(std::begin(kKeepFadingModels), std::end(kKeepFadingModels), model) != std::end(kKeepFadingModels))
+        return false;
+    if (game::read(g_statics.world_chr_man, manager) && manager &&
+        game::read(manager + game::kPlayerIns, player) && player == chr)
+        return false;
+    if (!game::read(chr + 0x6C, team) || team == kSummonTeam) return false;
+    // chrType +0x68 (fromsoftware-rs ChrType): 1 white phantom, 2 duelist,
+    // 3-4 ghosts, 8 gray, 15-21 invaders, blue phantoms and NPC signs.
+    if (!game::read(chr + 0x68, type) || (type >= 1 && type <= 4) || type == 8 || (type >= 15 && type <= 21))
+        return false;
+    // phantomParamOverride +0x540: a ghost look (999 is Solid ghostly characters').
+    if (game::read(chr + 0x540, look) && look > 0) return false;
+    note_kept(chr);
+    return true;
+}
+
+void __fastcall timed_fade(std::uint8_t* chr, float duration, float start, std::uint8_t flag) noexcept {
+    if (g_keep_bodies_on && keep_dead_body(reinterpret_cast<std::uintptr_t>(chr))) {
+        InterlockedIncrement(&g_bodies_kept);
+        return;
+    }
+    float& opacity = *reinterpret_cast<float*>(chr + 0x240);
+    if (start >= 0.0f && start <= 1.0f) opacity = start;
+    chr[0x1C7] = static_cast<std::uint8_t>((chr[0x1C7] & 0x7F) | ((flag & 1) << 7));
+    *reinterpret_cast<float*>(chr + 0x244) = (0.0f - opacity) / duration;
+}
+
+std::uint64_t __fastcall apply_speffect_detour(void* chr, std::int32_t id, bool dont_sync) noexcept {
+    if (g_keep_bodies_on) {
+        const auto address = reinterpret_cast<std::uintptr_t>(chr);
+        if (id == kDissolveSpEffect) {
+            if (keep_dead_body(address)) {
+                InterlockedIncrement(&g_bodies_kept);
+                return 0;
+            }
+        } else if (chr_alive(address)) {
+            note_alive(address);
+        }
+    }
+    return g_apply_speffect_original(chr, id, dont_sync);
+}
+
+void resolve_keep_bodies() noexcept {
+    g_timed_fade_site = find_unique(parse_pattern(kTimedFadePattern));
+    g_apply_speffect_site = find_unique(parse_pattern(kApplySpEffectPattern));
+    if (!g_timed_fade_site || !g_apply_speffect_site) {
+        g_timed_fade_site = g_apply_speffect_site = nullptr;
+        log(L"Vanilla sites 'timed fade' / 'apply SpEffect' not found (or ambiguous); Keep bodies is unavailable.");
+    }
+}
+
+DWORD WINAPI bodies_worker(void*) noexcept;
+
+bool install_keep_bodies() noexcept {
+    if (g_keep_bodies_hooked) return true;
+    if (!g_timed_fade_site || !g_apply_speffect_site) return false;
+    constexpr std::size_t kStolen = 19;  // mov rax,rsp; mov [rax+8],rbx; mov [rax+10h],rsi; push rdi; sub rsp,0C0h
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(
+        nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return false;
+    std::memcpy(code, g_apply_speffect_site, kStolen);
+    const std::uint8_t jump_back[6]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};  // jmp [rip+0]
+    std::memcpy(code + kStolen, jump_back, sizeof(jump_back));
+    const std::uint64_t resume = reinterpret_cast<std::uint64_t>(g_apply_speffect_site + kStolen);
+    std::memcpy(code + kStolen + 6, &resume, 8);
+    FlushInstructionCache(GetCurrentProcess(), code, 64);
+    g_apply_speffect_original = reinterpret_cast<ApplySpEffectFn>(code);
+
+    const auto jump_to = [](const void* target) {
+        std::array<std::uint8_t, 14> jump{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+        const auto address = reinterpret_cast<std::uint64_t>(target);
+        std::memcpy(jump.data() + 6, &address, 8);
+        return jump;
+    };
+    const auto fade_jump = jump_to(reinterpret_cast<const void*>(&timed_fade));
+    const auto apply_jump = jump_to(reinterpret_cast<const void*>(&apply_speffect_detour));
+    if (!write_code(g_timed_fade_site, fade_jump.data(), fade_jump.size())) {
+        log(L"Keep bodies: the timed fade could not be replaced.");
+        return false;
+    }
+    if (!write_code(g_apply_speffect_site, apply_jump.data(), apply_jump.size())) {
+        log(L"Keep bodies: the SpEffect hook could not be written; only the timed fade is kept off.");
+    }
+    g_keep_bodies_hooked = true;
+    if (!InterlockedExchange(&g_bodies_worker, 1)) {
+        if (const HANDLE thread = CreateThread(nullptr, 0, &bodies_worker, nullptr, 0, nullptr)) CloseHandle(thread);
+    }
+    wchar_t message[160]{};
+    swprintf_s(message, L"Keep bodies: timed fade replaced at eldenring.exe+0x%llX, ApplySpEffect hooked at +0x%llX.",
+        static_cast<unsigned long long>(g_timed_fade_site - reinterpret_cast<std::uint8_t*>(game::image())),
+        static_cast<unsigned long long>(g_apply_speffect_site - reinterpret_cast<std::uint8_t*>(game::image())));
+    log(message);
+    return true;
+}
 HANDLE g_param_event{};
 
 // ChrDbgFlags byte offsets.
 struct FlagBinding { Id id; std::ptrdiff_t offset; };
 constexpr FlagBinding kFlags[]{
-    {no_death, 0x1}, {torrent_no_death, 0x2}, {one_hit_kill, 0x3}, {infinite_items, 0x4},
+    // +0x3 (every hit kills) is no longer used for One-hit kills (r157): it
+    // also killed with 0-damage contact, e.g. rolling into an enemy.
+    {no_death, 0x1}, {torrent_no_death, 0x2}, {infinite_items, 0x4},
     {infinite_stamina, 0x5}, {infinite_fp, 0x6}, {infinite_arrows, 0x7},
     {enemies_no_attack, 0xE}, {enemies_no_move, 0xF}, {enemies_no_ai, 0x10},
     {skill_fp_cost, 0x12},  // "skills without FP": set while Skill FP cost is 0%
@@ -1904,18 +2605,12 @@ struct ParamField {
 };
 
 constexpr ParamField kParamFields[]{
-    {damage_dealt, L"AtkParam_Pc", 0x1C8, 0x3E, FieldType::u16, dmg_physical},   // physical correction
-    {damage_dealt, L"AtkParam_Pc", 0x1C8, 0x40, FieldType::u16, dmg_magic},      // magic
-    {damage_dealt, L"AtkParam_Pc", 0x1C8, 0x42, FieldType::u16, dmg_fire},       // fire
-    {damage_dealt, L"AtkParam_Pc", 0x1C8, 0x44, FieldType::u16, dmg_lightning},  // lightning
-    {damage_dealt, L"AtkParam_Pc", 0x1C8, 0x186, FieldType::u16, dmg_holy},      // holy
-    // NPC attacks use flat damage; their correction fields (+0x3E..) are empty
-    // (18 of 12855 rows in 2.7.1.0). atkPhys / Mag / Fire / Thun, then atkDark.
-    {damage_taken, L"AtkParam_Npc", 0x1C8, 0x50, FieldType::u16, taken_physical},
-    {damage_taken, L"AtkParam_Npc", 0x1C8, 0x52, FieldType::u16, taken_magic},
-    {damage_taken, L"AtkParam_Npc", 0x1C8, 0x54, FieldType::u16, taken_fire},
-    {damage_taken, L"AtkParam_Npc", 0x1C8, 0x56, FieldType::u16, taken_lightning},
-    {damage_taken, L"AtkParam_Npc", 0x1C8, 0x188, FieldType::u16, taken_holy},
+    // Damage dealt left AtkParam_Pc in r157: humanoid NPCs and invaders share
+    // those rows, so they hit harder too. It is the player's own SpEffect row
+    // now (atk*DmgCorrectRate), see sync_damage_cut.
+    // Damage taken is no longer an AtkParam_Npc scale (r157): humanoid NPCs and
+    // invaders attack with AtkParam_Pc, so it missed them (Nexus report). It is
+    // the player's own SpEffect row now, see sync_damage_cut.
     {stamina_cost, L"BehaviorParam_PC", 0x20, 0x14, FieldType::i32},
     // Magic (2.7.1.0 scan): FP +0x10 and stamina +0x12 per cast, then the
     // charged cast at +0x5C / +0x5E; memory slots u8 +0x21 (1-3);
@@ -1997,6 +2692,7 @@ struct ParamState {
     int applied_percent{100};
     std::vector<bool> boss{};  // enemy_hp: rows that are bosses
     int applied_boss_percent{100};
+    std::vector<double> price_floor{};  // shop_price: lowest price on sale, by row
 };
 
 // Boss health (Nexus request): NpcParam rows are bosses when npcType
@@ -2011,6 +2707,65 @@ bool npc_row_is_boss(std::uintptr_t row) noexcept {
     return type == 1 || (flags & 0x1);
 }
 
+// The game stops a character's maximum health at 524287 (2^19 - 1, seen in game)
+// but keeps the larger value in max_uncapped_hp, and the health bar is drawn
+// against that one: x100 left a boss looking almost dead at full health. Rows
+// stop here too, so enemy x boss health can never wrap to a negative value.
+constexpr std::int32_t kMaxCharacterHp = 524287;
+
+// Our ShopLineupParam block (prefix + table + index), while it is the live one.
+std::uintptr_t g_shop_block_begin{}, g_shop_block_end{};
+std::uintptr_t g_shop_table{};  // the table the holder points at
+std::uintptr_t g_shop_holder{};
+
+// The item shop's F11 entry (register_item_shop_talk).
+bool g_talk_registered = false;
+int g_talk_tries = 0;
+
+// Shop prices: the game hides what costs less than it sells for (Nexus report:
+// Kale at 10% lost exactly the 8 rows below their sellValue). Runes-only rows
+// (costType +0x18 = 0, no mtrlId +0x8) get that price as a floor; alteration
+// rows, which need a material, stay on sale below it in the regulation. 0% is
+// hidden too (tested), so it gets the floor as well; rows free in the regulation
+// (Enia's forging) stay free.
+// equipType +0x17 selects the table; weapons in shops can carry an upgrade level.
+// Returns false until the tables exist. An empty result means no floors.
+bool shop_price_floors(const game::ParamTable& shops, std::vector<double>& floors) noexcept {
+    constexpr struct { const wchar_t* name; std::size_t size; std::size_t sell; } kTables[]{
+        {L"EquipParamWeapon", 0x298, 0x20}, {L"EquipParamProtector", 0x1A0, 0x20},
+        {L"EquipParamAccessory", 0x60, 0x18}, {L"EquipParamGoods", 0xB0, 0x14}, {L"EquipParamGem", 0x60, 0x20}};
+    try {
+        floors.clear();
+        std::unordered_map<std::int32_t, std::int32_t> sell[std::size(kTables)];
+        for (std::size_t t = 0; t < std::size(kTables); ++t) {
+            game::ParamTable table;
+            if (!game::find_param(g_statics, kTables[t].name, kTables[t].size, table, g_log)) return table.file != 0;
+            sell[t].reserve(table.rows.size());
+            for (std::size_t r = 0; r < table.rows.size(); ++r) {
+                std::int32_t id{}, value{};
+                if (game::read(table.file + 0x40 + r * 0x18, id) && game::read(table.rows[r] + kTables[t].sell, value))
+                    sell[t].emplace(id, value);
+            }
+        }
+        std::vector<double> result(shops.rows.size(), 0.0);
+        for (std::size_t r = 0; r < shops.rows.size(); ++r) {
+            std::int32_t equip{}, material{};
+            std::uint8_t type{0xFF}, cost{0xFF};
+            if (!game::read(shops.rows[r], equip) || !game::read(shops.rows[r] + 0x8, material) ||
+                !game::read(shops.rows[r] + 0x17, type) || !game::read(shops.rows[r] + 0x18, cost) ||
+                cost != 0 || material >= 0 || type >= std::size(kTables))
+                continue;
+            auto found = sell[type].find(equip);
+            if (found == sell[type].end() && type == 0) found = sell[type].find(equip - equip % 100);
+            if (found != sell[type].end() && found->second > 0) result[r] = found->second;
+        }
+        floors = std::move(result);
+    } catch (...) {
+        floors.clear();
+    }
+    return true;
+}
+
 // Infinite poise overrides the poise sliders with a value no hit can deplete.
 constexpr int kLockedPercent = -1;
 constexpr double kLockedPoise = 1000000.0;
@@ -2022,7 +2777,6 @@ constexpr double kMaxPoiseDamage = 32767.0;
 // Instant status effects: buildup x30, like poise. Die in one hit: enemy attack
 // power x1000; the u16 fields stop at 65535.
 constexpr int kInstantStatusPercent = 3000;
-constexpr int kOneHitDeathPercent = 100000;
 
 // Set once the AtkParam SpEffect slots are confirmed (see sync_weapon_effects).
 bool g_atk_layout_ok{};
@@ -2033,7 +2787,6 @@ int target_percent(const ParamField& field) noexcept {
     if (field.id == posture_dealt && value_of(posture_one_hit)) return kOneHitPosturePercent;
     if (field.id == posture_taken && value_of(posture_one_hit_taken)) return kOneHitPosturePercent;
     if (field.id == status_buildup && value_of(status_instant)) return kInstantStatusPercent;
-    if (field.id == damage_taken && value_of(die_one_hit)) return kOneHitDeathPercent;
     if ((field.id == knockback_dealt || field.id == knockback_taken) &&
         !g_atk_layout_ok) return 100;
     if (field.lock != count) return value_of(field.lock) ? kLockedPercent : 100;
@@ -2099,6 +2852,13 @@ void sync_params() noexcept {
                 if (table.file) state.attempted = true;
                 continue;
             }
+            if (field.id == shop_price) {
+                // the item shop prices its own rows (audit 2026-11-08)
+                table.rows.erase(std::remove_if(table.rows.begin(), table.rows.end(), [](std::uintptr_t row) {
+                    return row >= g_shop_block_begin && row < g_shop_block_end;
+                }), table.rows.end());
+                if (!shop_price_floors(table, state.price_floor)) continue;
+            }
             state.table = std::move(table);
             state.original.clear();
             state.original.reserve(state.table.rows.size());
@@ -2132,6 +2892,9 @@ void sync_params() noexcept {
             double scaled = state.original[r] < 0 ? state.original[r] : state.original[r] * percent / 100.0;
             if (boss_percent != 100 && r < state.boss.size() && state.boss[r] && scaled > 0)
                 scaled = scaled * boss_percent / 100.0;
+            if (field.id == enemy_hp) scaled = std::min<double>(scaled, kMaxCharacterHp);
+            if (r < state.price_floor.size() && state.original[r] > 0 && scaled < state.price_floor[r])
+                scaled = state.price_floor[r];
             // The game wraps poise damage past 32767 (x100 broke nothing in game), so
             // extended ranges stop at the strongest value that still counts.
             if (field.id == posture_dealt || field.id == posture_taken)
@@ -2141,6 +2904,20 @@ void sync_params() noexcept {
         }
         state.applied_percent = percent;
         state.applied_boss_percent = boss_percent;
+        if (field.id == enemy_hp && g_diagnostics) {
+            double boss_max{}, written_max{};
+            std::size_t bosses{};
+            for (std::size_t r = 0; r < state.table.rows.size(); ++r) {
+                if (r >= state.boss.size() || !state.boss[r]) continue;
+                ++bosses;
+                boss_max = std::max(boss_max, state.original[r]);
+                written_max = std::max(written_max, read_field(state.table.rows[r] + field.offset, field.type));
+            }
+            wchar_t message[200]{};
+            swprintf_s(message, L"Boss health: enemy %d%%, boss %d%%, %zu rows, largest %.0f -> %.0f.",
+                percent, boss_percent, bosses, boss_max, written_max);
+            log(message);
+        }
         if (field.id == posture_dealt || field.id == posture_taken || field.id == damage_taken ||
             field.id == status_buildup) {
             double original_max{};
@@ -2696,7 +3473,7 @@ bool build_buddy_set_size() noexcept {
 
 spirit_ashes::Settings spirit_ash_settings() noexcept {
     // No cap on ashes (0): the spirit set's 500 bodies are the limit, and the
-    // game has 94 ashes. ash_max_active stays defined for old INI files only.
+    // game has 94 ashes.
     return {value_of(ash_multiple) != 0, 0u, g_diagnostics,
         true, true, true, true, true, g_spirit_hud_rows, static_cast<std::uint32_t>(value_of(ash_extra_cost)),
         static_cast<std::uint32_t>(value_of(ash_damage_per_ash)), value_of(ash_repeat) != 0};
@@ -2704,10 +3481,14 @@ spirit_ashes::Settings spirit_ash_settings() noexcept {
 
 // First thing in initialize(): its HUD movie hook has to be in before the game
 // opens the HUD, so its options are read here, ahead of load_settings().
+bool g_npc_spawner_built_in{};   // NPC Spawner is linked in (msa feature npc-spawner)
+bool g_npc_spawner_standalone{};  // NpcSpawner.dll is there: the built-in copy stays off
+bool g_npc_spawner_started{};     // started without a provider: add_npc_spawner_pages adds its pages
+
 void start_spirit_ashes() noexcept {
     if (!g_config_path.empty())
         g_spirit_hud_rows = GetPrivateProfileIntW(L"SpiritAshes", L"HudRows", 1, g_config_path.c_str()) != 0;
-    for (const Id id : {ash_multiple, ash_max_active, ash_extra_cost, ash_damage_per_ash, ash_repeat}) {
+    for (const Id id : {ash_multiple, ash_extra_cost, ash_damage_per_ash, ash_repeat}) {
         Option& option = g_options[id];
         if (!g_config_path.empty())
             option.value = clamp_value(option, static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key,
@@ -2716,7 +3497,23 @@ void start_spirit_ashes() noexcept {
     HMODULE self{};
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
         reinterpret_cast<LPCWSTR>(&start_spirit_ashes), &self);
-    g_spirit_ashes_started = self && spirit_ashes::start(self, spirit_ash_settings());
+    // The standalone MultipleSpiritAshes.dll may load after NativeTweaks: if
+    // it is in the same folder, the built-in copy and its engine patches
+    // (spirit set size, slot search) stay off from the start, or the two race
+    // for the same code (08-11 log: "creation code not found" on one start,
+    // "spirit slots not found" on another).
+    bool standalone = GetModuleHandleW(L"MultipleSpiritAshes.dll") != nullptr;
+    if (!standalone && self) {
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(self, path, MAX_PATH);
+        if (length && length < MAX_PATH) {
+            std::wstring file(path, length);
+            file = file.substr(0, file.find_last_of(L"\\/") + 1) + L"MultipleSpiritAshes.dll";
+            standalone = GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+    }
+    if (standalone) log(L"MultipleSpiritAshes.dll is next to NativeTweaks: the built-in Several ashes at once stays off.");
+    g_spirit_ashes_started = !standalone && self && spirit_ashes::start(self, spirit_ash_settings());
     // The spirit set is created once, when the game builds WorldChrMan: its
     // size can only be raised here, before that (see kBuddySetCapacity).
     if (g_spirit_ashes_started && value_of(ash_multiple) != 0) {
@@ -2730,6 +3527,40 @@ void start_spirit_ashes() noexcept {
     log(g_spirit_ashes_started
             ? L"Several ashes at once (Multiple Spirit Ashes 1.0.0, built in) started."
             : L"Several ashes at once unavailable: unsupported game version or MultipleSpiritAshes.dll is loaded.");
+}
+
+// NPC Spawner (built in, r158): it starts here, early in initialize(), and only
+// when its option is on; the standalone NpcSpawner.dll wins. It has no Mod
+// Settings provider of its own: its pages go into NativeTweaks' menu right
+// after Vanilla Settings (add_npc_spawner_pages; user, 13-11: other providers
+// would only come after every NativeTweaks row). Its F11 row stays.
+void start_npc_spawner() noexcept {
+    g_npc_spawner_built_in = npc_spawner::built_in();
+    if (!g_npc_spawner_built_in) return;
+    Option& option = g_options[npc_spawner];
+    if (!g_config_path.empty())
+        option.value = clamp_value(option, static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key,
+            option.fallback, g_config_path.c_str())));
+    HMODULE self{};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&start_npc_spawner), &self);
+    wchar_t path[MAX_PATH]{};
+    const DWORD length = self ? GetModuleFileNameW(self, path, MAX_PATH) : 0;
+    if (!length || length >= MAX_PATH) return;
+    std::wstring folder(path, length);
+    folder.resize(folder.find_last_of(L"\\/"));
+    g_npc_spawner_standalone = npc_spawner::standalone_present(folder);
+    if (g_npc_spawner_standalone) {
+        log(L"NpcSpawner.dll is loaded or next to NativeTweaks: the built-in NPC Spawner stays off.");
+        return;
+    }
+    if (option.value == 0) {
+        log(L"NPC Spawner (built in) is off.");
+        return;
+    }
+    g_npc_spawner_started = npc_spawner::start_hosted(folder, self);
+    log(g_npc_spawner_started ? L"NPC Spawner (built in) started: F11 > NPC Spawner."
+                              : L"NPC Spawner (built in) could not start.");
 }
 
 // Weapon effects (beta): each toggle adds an on-hit SpEffect to your attacks
@@ -2746,6 +3577,20 @@ constexpr WeaponEffect kWeaponEffects[]{
     {weapon_frost, 0x1A8, L"frostbite"}, {weapon_sleep, 0x338, L"sleep"},
 };
 constexpr std::size_t kWeaponEffectCount = std::size(kWeaponEffects);
+// Param tables rebuilt with rows of ours (append_param_rows): row pointers
+// taken before a rebuild point into the old copy.
+int g_param_appends{};
+std::vector<std::uint8_t*> append_param_rows(const wchar_t* name, std::size_t row_size,
+    const std::vector<std::pair<std::int32_t, const std::uint8_t*>>& added, bool& retry) noexcept;
+// The game's status SpEffects chosen below may also land on the attacker
+// itself or on its allies (effectTargetSelf/Friend +0x15F bits 0/1,
+// effectTargetFriendlyTarget/SelfTarget +0x16C bits 1/2): bleed 6401 and
+// poison 106000 do, so rolling into an enemy put them on the player (user,
+// 08-11). The slots get copies of ours instead: for the player's attacks
+// they cannot reach a player character either (effectTargetPlayer, bit 3;
+// humanoid NPCs share those rows), for enemies' attacks only opponents.
+constexpr std::int32_t kPlayerEffectCopyId = 1999990110;  // + status
+constexpr std::int32_t kEnemyEffectCopyId = 1999990120;   // + status
 constexpr std::size_t kAtkSlots = 5;
 constexpr std::size_t kAtkSlotOffset = 0x18;
 constexpr std::size_t kWeaponSlots = 3;
@@ -2757,8 +3602,21 @@ struct WeaponEffectState {
     game::ParamTable attacks{};
     std::vector<std::int32_t> original{};  // kAtkSlots per row
     std::int32_t effect[kWeaponEffectCount]{};  // SpEffect id, 0 when not found
+    std::int32_t player_effect[kWeaponEffectCount]{};  // our copies (or effect)
+    std::int32_t enemy_effect[kWeaponEffectCount]{};
     game::ParamTable npc_attacks{};             // enemies, NPCs and spirit ashes
     std::vector<std::int32_t> npc_original{};
+    // Rows that get the effects: they deal damage and hit the other side
+    // (Nexus report 08-11: rolling into an enemy applied the status through
+    // the no-damage impact rows, and flask or self-buff rows could too).
+    std::vector<char> eligible{};
+    std::vector<char> npc_eligible{};
+    // Player rows with no damage and no effect of their own (impact, push,
+    // contact when rolling into an enemy): while weapon effects are on, their
+    // disableHitSpEffect (+0x7E bit 2) is set, so the weapon's own effect
+    // slots (spEffectBehaviorId, where effects 3-5 go) do not apply on them.
+    std::vector<std::uintptr_t> contact_rows{};
+    bool contact_blocked{};
     std::uint32_t applied_mask{};
     std::uint32_t applied_npc_mask{};
     // Weapon slots (r135): with three or more effects on, the first two go to
@@ -2846,15 +3704,40 @@ std::int32_t effect_buildup(const EffectIndex& index, std::int32_t id, std::size
 // 2.7.2.0) switches on the row's stateInfo (+0x156) and reads that status's
 // column alone, so a combined row with every buildup applied just its own
 // status (r135 test).
+// AtkParam rows that deal damage (any damage correction or flat damage:
+// +0x3E..+0x44, +0x186, +0x50..+0x56, +0x188) and hit opponents
+// (opposeTarget, byte +0x81 bit 0) but not the attacker itself (selfTarget,
+// bit 2). Impact, push, flask and self-buff rows are left out.
+std::vector<char> damaging_attack_rows(const game::ParamTable& table) {
+    std::vector<char> eligible(table.rows.size(), 0);
+    for (std::size_t r = 0; r < table.rows.size(); ++r) {
+        std::uint16_t damage[6]{};
+        std::uint16_t flat[6]{};
+        std::uint8_t targets{};
+        if (!game::read(table.rows[r] + 0x3E, damage[0]) || !game::read(table.rows[r] + 0x40, damage[1]) ||
+            !game::read(table.rows[r] + 0x42, damage[2]) || !game::read(table.rows[r] + 0x44, damage[3]) ||
+            !game::read(table.rows[r] + 0x186, damage[4]) || !game::read(table.rows[r] + 0x50, flat[0]) ||
+            !game::read(table.rows[r] + 0x52, flat[1]) || !game::read(table.rows[r] + 0x54, flat[2]) ||
+            !game::read(table.rows[r] + 0x56, flat[3]) || !game::read(table.rows[r] + 0x188, flat[4]) ||
+            !game::read(table.rows[r] + 0x81, targets)) continue;
+        bool deals{};
+        for (int k = 0; k < 5; ++k) deals = deals || damage[k] || flat[k];
+        eligible[r] = deals && (targets & 0x1) && !(targets & 0x4);
+    }
+    return eligible;
+}
+
 void fill_effect_slots(const game::ParamTable& table, const std::vector<std::int32_t>& original,
     std::uint32_t mask, const std::int32_t (&ids)[kWeaponEffectCount],
-    std::size_t slot_offset = kAtkSlotOffset, std::size_t slot_count = kAtkSlots) noexcept {
+    std::size_t slot_offset = kAtkSlotOffset, std::size_t slot_count = kAtkSlots,
+    const std::vector<char>* eligible = nullptr) noexcept {
     if (slot_count > kAtkSlots || original.size() != table.rows.size() * slot_count) return;
+    if (eligible && eligible->size() != table.rows.size()) eligible = nullptr;
     for (std::size_t r = 0; r < table.rows.size(); ++r) {
         std::int32_t slots[kAtkSlots]{};
         std::memcpy(slots, &original[r * slot_count], slot_count * sizeof(std::int32_t));
         std::size_t next{};
-        for (std::size_t s = 0; s < kWeaponEffectCount; ++s) {
+        for (std::size_t s = 0; s < kWeaponEffectCount && (!eligible || (*eligible)[r]); ++s) {
             if (!(mask & (1u << s))) continue;
             while (next < slot_count && slots[next] > 0) ++next;
             if (next == slot_count) break;
@@ -2945,6 +3828,7 @@ void sync_weapon_effects() noexcept {
                 count_effect_refs(npc_attacks, kAtkSlotOffset, kAtkSlots, index, npc_refs)) {
                 state.npc_attacks = std::move(npc_attacks);
                 read_effect_slots(state.npc_attacks, state.npc_original);
+                state.npc_eligible = damaging_attack_rows(state.npc_attacks);
             }
             game::ParamTable weapons;
             if (game::find_param(g_statics, L"EquipParamWeapon", 0x298, weapons, g_log)) {
@@ -2970,8 +3854,62 @@ void sync_weapon_effects() noexcept {
                     kSourceNames[source], refs.size());
                 log(message);
             }
+            {
+                std::vector<std::vector<std::uint8_t>> copies;
+                std::vector<std::pair<std::int32_t, const std::uint8_t*>> added;
+                copies.reserve(kWeaponEffectCount * 2);
+                for (int pass = 0; pass < 2; ++pass)
+                    for (std::size_t s = 0; s < kWeaponEffectCount; ++s) {
+                        if (state.effect[s] <= 0) continue;
+                        const auto found = std::lower_bound(index.begin(), index.end(),
+                            std::make_pair(state.effect[s], std::uintptr_t{0}));
+                        if (found == index.end() || found->first != state.effect[s]) continue;
+                        std::vector<std::uint8_t> row(0x390);
+                        if (!game::safe_read(found->second, row.data(), row.size())) continue;
+                        row[0x15F] = static_cast<std::uint8_t>(row[0x15F] & ~(pass == 0 ? 0x0B : 0x03));
+                        row[0x16C] = static_cast<std::uint8_t>(row[0x16C] & ~0x06);
+                        copies.push_back(std::move(row));
+                        added.push_back({(pass == 0 ? kPlayerEffectCopyId : kEnemyEffectCopyId) +
+                            static_cast<std::int32_t>(s), copies.back().data()});
+                    }
+                bool retry{};
+                const bool made = !append_param_rows(L"SpEffectParam", 0x390, added, retry).empty();
+                for (std::size_t s = 0; s < kWeaponEffectCount; ++s) {
+                    state.player_effect[s] = made && state.effect[s] > 0 ? kPlayerEffectCopyId + static_cast<std::int32_t>(s)
+                                                                         : state.effect[s];
+                    state.enemy_effect[s] = made && state.effect[s] > 0 ? kEnemyEffectCopyId + static_cast<std::int32_t>(s)
+                                                                        : state.effect[s];
+                }
+                log(made ? L"Weapon effects: copies that reach opponents only are in use (player: no players, no self)."
+                         : L"Weapon effects: copies could not be added; the game's own effects are used.");
+            }
             state.attacks = std::move(attacks);
             read_effect_slots(state.attacks, state.original);
+            state.eligible = damaging_attack_rows(state.attacks);
+            for (std::size_t r = 0; r < state.attacks.rows.size(); ++r) {
+                if (state.eligible[r]) continue;
+                bool own_effect{};
+                for (std::size_t k = 0; k < kAtkSlots; ++k) own_effect = own_effect || state.original[r * kAtkSlots + k] > 0;
+                std::uint8_t flags{};
+                if (own_effect || !game::read(state.attacks.rows[r] + 0x7E, flags) || (flags & 0x4)) continue;
+                std::uint16_t damage[5]{};
+                bool deals{};
+                for (const std::size_t o : {0x3E, 0x40, 0x42, 0x44, 0x186, 0x50, 0x52, 0x54, 0x56, 0x188}) {
+                    std::uint16_t v{};
+                    deals = deals || (game::read(state.attacks.rows[r] + o, v) && v);
+                }
+                (void)damage;
+                if (!deals) state.contact_rows.push_back(state.attacks.rows[r]);
+            }
+            {
+                const auto count = [](const std::vector<char>& v) {
+                    return static_cast<unsigned long long>(std::count(v.begin(), v.end(), 1));
+                };
+                wchar_t message[200]{};
+                swprintf_s(message, L"Weapon effects: %llu of %zu player attacks and %llu of %zu enemy attacks deal damage to opponents.",
+                    count(state.eligible), state.eligible.size(), count(state.npc_eligible), state.npc_eligible.size());
+                log(message);
+            }
         } catch (...) {
             state.attempted = true;
             return;
@@ -2987,16 +3925,32 @@ void sync_weapon_effects() noexcept {
     const std::uint32_t npc_mask = value_of(weapon_effects_enemies) ? mask : 0;
     std::uint32_t attack_mask = mask, weapon_mask = 0;
     if (!state.weapon_original.empty()) split_effects(mask, attack_mask, weapon_mask);
-    if (attack_mask != state.applied_mask) fill_effect_slots(state.attacks, state.original, attack_mask, state.effect);
+    if (attack_mask != state.applied_mask)
+        fill_effect_slots(state.attacks, state.original, attack_mask, state.player_effect, kAtkSlotOffset, kAtkSlots,
+            &state.eligible);
     if (weapon_mask != state.applied_weapon_mask) {
-        fill_effect_slots(state.weapons, state.weapon_original, weapon_mask, state.effect, kWeaponSlotOffset,
+        fill_effect_slots(state.weapons, state.weapon_original, weapon_mask, state.player_effect, kWeaponSlotOffset,
             kWeaponSlots);
         wchar_t message[160]{};
         swprintf_s(message, L"Weapon effects: attack slots mask %u, weapon slots mask %u.", attack_mask, weapon_mask);
         log(message);
     }
     if (npc_mask != state.applied_npc_mask)
-        fill_effect_slots(state.npc_attacks, state.npc_original, npc_mask, state.effect);
+        fill_effect_slots(state.npc_attacks, state.npc_original, npc_mask, state.enemy_effect, kAtkSlotOffset, kAtkSlots,
+            &state.npc_eligible);
+    const bool block_contact = mask != 0;
+    if (block_contact != state.contact_blocked) {
+        for (const std::uintptr_t row : state.contact_rows) {
+            std::uint8_t flags{};
+            if (!game::read(row + 0x7E, flags)) continue;
+            game::write<std::uint8_t>(row + 0x7E, block_contact ? (flags | 0x4) : (flags & ~0x4));
+        }
+        state.contact_blocked = block_contact;
+        wchar_t message[120]{};
+        swprintf_s(message, L"Weapon effects: %zu contact rows %ls hit effects.", state.contact_rows.size(),
+            block_contact ? L"without" : L"back to their");
+        log(message);
+    }
     state.applied_mask = attack_mask;
     state.applied_weapon_mask = weapon_mask;
     state.applied_npc_mask = npc_mask;
@@ -3010,6 +3964,16 @@ void sync_weapon_effects() noexcept {
 // before use. While the option is on, each 999 becomes that column's median,
 // so the enemy can be afflicted like a typical one.
 constexpr std::size_t kResistColumns[]{0x108, 0x10A, 0x10C, 0x10E, 0x126, 0x128, 0x1E0};
+// r156 (Nexus report: gargoyles and Erdtree Avatars stayed immune): about 2000
+// NpcParam rows also carry resident SpEffects that the status check walks
+// (+0x4FAE40 in 2.7.2.0): 90000 poison, 90010 rot, 90020 bleed, 90040
+// frostbite and 90300 sleep, each with one disable bit (SpEffectParam
+// disablePoison/Disease/Blood +0x163, disableFreeze +0x259, disableSleep
+// +0x15F). While the option is on that bit is cleared. Death blight (90030) and
+// madness (90060) stay, as above. Each bit is checked at load.
+struct DisableBit { std::uint32_t id; std::ptrdiff_t offset; std::uint8_t mask; };
+constexpr DisableBit kNpcDisableEffects[]{
+    {90000, 0x163, 0x04}, {90010, 0x163, 0x08}, {90020, 0x163, 0x10}, {90040, 0x259, 0x08}, {90300, 0x15F, 0x80}};
 struct ImmunityState {
     bool attempted{};
     bool ready{};
@@ -3017,6 +3981,7 @@ struct ImmunityState {
     std::vector<std::size_t> columns{};
     std::vector<std::uint16_t> medians{};
     std::vector<std::pair<std::uintptr_t, std::size_t>> immune_cells{};  // address, column
+    std::vector<std::pair<std::uintptr_t, std::uint8_t>> disable_bits{};  // address, mask
     bool applied{};
 };
 
@@ -3102,8 +4067,18 @@ void sync_immunity() noexcept {
             state.attempted = true;
             return;
         }
-        wchar_t cells[120]{};
-        swprintf_s(cells, L"Enemy immunities: %zu immune values found.", state.immune_cells.size());
+        game::ParamTable effects;
+        if (game::find_param(g_statics, L"SpEffectParam", 0x390, effects, g_log)) {
+            for (const auto& bit : kNpcDisableEffects) {
+                const std::uintptr_t row = param_row_by_id(effects, bit.id);
+                std::uint8_t flags{};
+                if (row && game::read(row + bit.offset, flags) && (flags & bit.mask))
+                    state.disable_bits.push_back({row + bit.offset, bit.mask});
+            }
+        }
+        wchar_t cells[160]{};
+        swprintf_s(cells, L"Enemy immunities: %zu immune values and %zu of %zu immunity effects found.",
+            state.immune_cells.size(), state.disable_bits.size(), std::size(kNpcDisableEffects));
         log(cells);
         state.ready = true;
     }
@@ -3112,6 +4087,11 @@ void sync_immunity() noexcept {
     // Only the cells that were 999 when the table loaded are touched.
     for (const auto& [address, column] : state.immune_cells)
         game::write<std::uint16_t>(address, want ? state.medians[column] : kImmune);
+    for (const auto& [address, mask] : state.disable_bits) {
+        std::uint8_t flags{};
+        if (!game::read(address, flags)) continue;
+        game::write<std::uint8_t>(address, static_cast<std::uint8_t>(want ? flags & ~mask : flags | mask));
+    }
     state.applied = want;
 }
 
@@ -4502,16 +5482,1478 @@ void sync_ghost_npc() noexcept {
     state.applied = want;
 }
 
+// New Game+ poise (Nexus request: "after NG+2 they get a massive reduction"):
+// ClearCountCorrectParam rows 2-7, and 102-107, carry SuperArmorDamageRate
+// (f32 +0x64), x0.95 at NG+2 down to x0.6 at NG+7 (2.7.2.0 regulation); the
+// other cycles have none. 100% keeps the game's value and 0% makes it 1, the
+// first playthrough's. World difficulty does not use this column.
+constexpr std::ptrdiff_t kNgPoiseOffset = 0x64;
+struct NgPoiseState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::pair<std::uintptr_t, float>> cells{};  // address, game value
+    int applied = -1;
+};
+NgPoiseState g_ng_poise{};
+
+void sync_ng_poise() noexcept {
+    auto& state = g_ng_poise;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable correct;
+        if (!game::find_param(g_statics, L"ClearCountCorrectParam", 0x80, correct, g_log)) {
+            if (correct.file) state.attempted = true;
+            return;
+        }
+        for (const std::uint32_t base : {0u, 100u})
+            for (std::uint32_t cycle = 2; cycle <= kJourneyMax; ++cycle) {
+                const std::uintptr_t row = param_row_by_id(correct, base + cycle);
+                float rate{};
+                if (row && game::read(row + kNgPoiseOffset, rate) && rate > 0.0f && rate < 1.0f)
+                    state.cells.push_back({row + kNgPoiseOffset, rate});
+            }
+        wchar_t message[120]{};
+        swprintf_s(message, L"New Game+ poise: %zu cycle rows found.", state.cells.size());
+        log(message);
+        if (state.cells.empty()) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(ng_poise);
+    if (want == state.applied) return;
+    for (const auto& [address, original] : state.cells)
+        game::write<float>(address, 1.0f - (1.0f - original) * static_cast<float>(want) / 100.0f);
+    state.applied = want;
+}
+
+// Drop or discard any item (Nexus request, FJKarl: items that pile up and
+// cannot be removed). isDrop and isDiscard are bits in the five EquipParam
+// tables (offsets from the Smithbox ER defs, regulation 2.7.2.0; the row
+// sizes match the ones used above). The first option sets both bits on every
+// item except key items (goodsType 1) and Great Runes (15); the second adds
+// those too, and flasks: the menu offers no Leave or Discard for an
+// isAutoEquip item, so that bit is cleared while it is on. The bare body
+// rows are left alone. Turning them off puts each bit back as the game had it.
+struct DropBitsCell {
+    std::uintptr_t address;
+    std::uint8_t mask;      // isDrop | isDiscard in that byte (or isAutoEquip)
+    std::uint8_t original;  // the game's bits under mask
+    std::uint8_t unlocked;  // the bits under mask while the option is on
+    bool key;               // key item, Great Rune or flask
+};
+struct DropAnyState {
+    bool attempted{};
+    bool ready{};
+    std::vector<DropBitsCell> cells{};
+    int applied = -1;
+};
+DropAnyState g_drop_any{};
+
+void sync_drop_any() noexcept {
+    auto& state = g_drop_any;
+    if (state.attempted) return;
+    if (!state.ready) {
+        struct Table {
+            const wchar_t* name;
+            std::size_t row_size;
+            std::size_t drop_byte;
+            std::uint8_t drop_bit;
+            std::size_t discard_byte;
+            std::uint8_t discard_bit;
+        };
+        static constexpr Table kTables[]{
+            {L"EquipParamGoods", 0xB0, 0x6F, 0, 0x49, 3},
+            {L"EquipParamWeapon", 0x298, 0x109, 2, 0x109, 1},
+            {L"EquipParamProtector", 0x1A0, 0xE3, 1, 0xE3, 0},
+            {L"EquipParamAccessory", 0x60, 0x40, 4, 0x40, 3},
+            {L"EquipParamGem", 0x60, 0x34, 1, 0x34, 0},
+        };
+        std::size_t tables{};
+        std::size_t keys{};
+        state.cells.clear();  // a pass that stopped at an unloaded table starts over
+        for (const Table& table : kTables) {
+            game::ParamTable param;
+            if (!game::find_param(g_statics, table.name, table.row_size, param, g_log)) {
+                if (!param.file) return;  // regulation not loaded yet: try again later
+                continue;
+            }
+            ++tables;
+            const bool goods = table.row_size == 0xB0;
+            // the bare head, body, arms and legs are not items
+            std::uintptr_t bare[4]{};
+            if (table.row_size == 0x1A0)
+                for (std::uint32_t i = 0; i < 4; ++i) bare[i] = param_row_by_id(param, 10000 + i * 100);
+            for (const std::uintptr_t row : param.rows) {
+                if (!row || std::find(std::begin(bare), std::end(bare), row) != std::end(bare)) continue;
+                bool key = false;
+                if (goods) {
+                    std::uint8_t type{};
+                    std::uint8_t auto_equip{};
+                    if (game::read(row + 0x3E, type)) key = type == 1 || type == 15;
+                    // Flasks carry isAutoEquip (+0x49 bit 0): the menu offers no
+                    // Leave or Discard for them even with both bits set, so with
+                    // key items on that bit is cleared too. The menu still keeps
+                    // the last flask; clearing isSuppleItem (bit 7) did not
+                    // change that (r156-test10), so it is left alone.
+                    if (game::read(row + 0x49, auto_equip) && (auto_equip & 1)) {
+                        key = true;
+                        state.cells.push_back({row + 0x49, 1, 1, 0, true});
+                    }
+                    if (key) ++keys;
+                }
+                const auto add = [&](std::size_t offset, std::uint8_t mask) {
+                    std::uint8_t value{};
+                    if (!game::read(row + offset, value)) return;
+                    if ((value & mask) == mask) return;  // already allowed
+                    state.cells.push_back({row + offset, mask, static_cast<std::uint8_t>(value & mask), mask, key});
+                };
+                if (table.drop_byte == table.discard_byte) {
+                    add(table.drop_byte, static_cast<std::uint8_t>((1u << table.drop_bit) | (1u << table.discard_bit)));
+                } else {
+                    add(table.drop_byte, static_cast<std::uint8_t>(1u << table.drop_bit));
+                    add(table.discard_byte, static_cast<std::uint8_t>(1u << table.discard_bit));
+                }
+            }
+        }
+        wchar_t message[180]{};
+        swprintf_s(message, L"Drop any item: %zu locked drop/discard flags in %zu of 5 equipment params (%zu key items or Great Runes).",
+            state.cells.size(), tables, keys);
+        log(message);
+        if (tables == 0) {
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(drop_any) ? (value_of(drop_key_items) ? 2 : 1) : 0;
+    if (want == state.applied) return;
+    for (const auto& cell : state.cells) {
+        std::uint8_t value{};
+        if (!game::read(cell.address, value)) continue;
+        const bool unlock = want == 2 || (want == 1 && !cell.key);
+        const std::uint8_t bits = unlock ? cell.unlocked : cell.original;
+        game::write<std::uint8_t>(cell.address, static_cast<std::uint8_t>((value & ~cell.mask) | bits));
+    }
+    state.applied = want;
+}
+
+// Item shop (r157 test). Every named item gets a free, unlimited row in an
+// enlarged ShopLineupParam, and each category opens as a shop with the
+// talk command OpenRegularShop(first, last) (msa\src\game_menus.rs). The
+// vanilla table has 1296 rows, so the Hub builds a new PARAM file (header,
+// row table, data, type name) with the original rows plus its own, ids
+// 1700000-2499999 (unused in vanilla), and points the table's holder at it
+// before any other option reads the table. Names come from the game's
+// MsgRepository (LookupEntry, categories patch / base / DLC1 / DLC2).
+using MsgLookupFn = const wchar_t*(__fastcall*)(void*, std::uint32_t, std::uint32_t, std::int32_t);
+MsgLookupFn g_msg_lookup{};
+void** g_msg_repository{};
+std::uint8_t* g_goods_name_getter{};  // GetGoodsName(repo, id), 0xD13430 in 2.7.2.0
+
+constexpr const char* kMsgLookupPattern =
+    "3b 51 10 73 29 44 3b 41 14 73 23 48 8b 41 08 8b d2 48 8b 0c d0 48 85 c9 74 14 41 8b c0 48 8b 0c c1 48 85 c9 74 08 41 8b d1 e9";
+// mov rcx,[MsgRepository]; mov edx,ebx; call GetGoodsName; add rsp,30h; pop rbx; ret
+constexpr const char* kMsgRepositoryPattern = "48 8b 0d ? ? ? ? 8b d3 e8 ? ? ? ? 48 83 c4 30 5b c3";
+
+// LookupEntry is found through the goods-name getter that the repository
+// pattern calls (its first call is LookupEntry), not by its own prologue:
+// other mods hook it (NPC Spawner), and calling a hooked entry still works.
+void resolve_msg_lookup() noexcept {
+    std::uint8_t* repo = find_unique(parse_pattern(kMsgRepositoryPattern));
+    if (!repo) {
+        log(L"Vanilla site 'message repository' not found (or ambiguous); the item shop is unavailable.");
+        return;
+    }
+    std::int32_t disp{};
+    std::memcpy(&disp, repo + 3, 4);
+    void** repository = reinterpret_cast<void**>(repo + 7 + disp);
+    std::int32_t rel{};
+    std::memcpy(&rel, repo + 10, 4);
+    std::uint8_t* getter = repo + 14 + rel;
+    std::uint8_t* lookup = nullptr;
+    // getter: mov [rsp+8],rbx; push rdi; sub rsp,20h; ...; lea r8d,[rdx+6Fh]; call LookupEntry
+    for (int i = 0; i < 0x30 && !lookup; ++i) {
+        if (getter[i] == 0xE8 && i >= 4 && getter[i - 4] == 0x44 && getter[i - 3] == 0x8D) {
+            std::memcpy(&rel, getter + i + 1, 4);
+            lookup = getter + i + 5 + rel;
+        }
+    }
+    const auto base = reinterpret_cast<std::uint8_t*>(game::image());
+    bool plausible = false;
+    if (lookup) {
+        // the original entry, or another mod's jump on it
+        const std::vector<int> original = parse_pattern(kMsgLookupPattern);
+        bool same = true;
+        for (std::size_t i = 0; i < original.size() && same; ++i)
+            same = original[i] < 0 || lookup[i] == static_cast<std::uint8_t>(original[i]);
+        plausible = same || lookup[0] == 0xE9 || (lookup[0] == 0xFF && lookup[1] == 0x25);
+    }
+    if (!plausible) {
+        log(L"Vanilla site 'message lookup' not found; the item shop is unavailable.");
+        return;
+    }
+    g_msg_repository = repository;
+    g_msg_lookup = reinterpret_cast<MsgLookupFn>(lookup);
+    g_goods_name_getter = getter;
+    wchar_t message[160]{};
+    swprintf_s(message, L"Vanilla message lookup at eldenring.exe+0x%llX%s (MsgRepository at +0x%llX).",
+        static_cast<unsigned long long>(lookup - base), lookup[0] == 0x3B ? L"" : L", hooked by another mod",
+        static_cast<unsigned long long>(reinterpret_cast<std::uint8_t*>(repository) - base));
+    log(message);
+}
+
+const wchar_t* msg_lookup_guarded(void* repo, std::uint32_t category, std::int32_t id) noexcept {
+    __try {
+        return g_msg_lookup(repo, 0, category, id);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+bool item_name(std::initializer_list<std::uint32_t> categories, std::int32_t id, std::wstring& out,
+    int* found = nullptr) noexcept {
+    if (!g_msg_lookup || !g_msg_repository) return false;
+    void* repo = *g_msg_repository;
+    if (!repo) return false;
+    int index = -1;
+    for (const std::uint32_t category : categories) {
+        ++index;
+        const wchar_t* text = msg_lookup_guarded(repo, category, id);
+        if (!text || !text[0]) continue;
+        std::size_t length = 0;
+        while (length < 128 && text[length]) ++length;
+        std::wstring name(text, length);
+        if (name.empty() || name[0] == L'?' || name == L"NULL" || name.rfind(L"[ERROR]", 0) == 0) continue;
+        out = std::move(name);
+        if (found) *found = static_cast<int>(category >= 300 ? 2 : 1);  // 3xx/4xx: Shadow of the Erdtree
+        return true;
+    }
+    return false;
+}
+
+// Shop groups, in menu order, inside one shop per section (base game and
+// Shadow of the Erdtree apart). Sections are the list of F11 > Item Shop:
+// shields, staves and seals sit with the weapons and notes with the key
+// items, close to Glorious Merchant's layout; the game's "item type" sort
+// puts a gap between groups. Shields/Staves/Notes sections stay empty.
+enum ShopSection : int {
+    sec_weapons, sec_shields, sec_catalysts, sec_ammo, sec_armour, sec_talismans, sec_spirits,
+    sec_sorceries, sec_incantations, sec_gems, sec_items, sec_materials, sec_key, sec_notes, sec_tarnished, sec_count
+};
+struct ShopText { const wchar_t* en; const wchar_t* es; const wchar_t* zh; };
+constexpr ShopText kShopSections[sec_count]{
+    {L"Weapons", L"Armas", L"武器"},
+    {L"Shields", L"Escudos", L"盾牌"},
+    {L"Staves and seals", L"Bastones y sellos", L"手杖与圣印记"},
+    {L"Arrows and bolts", L"Flechas y virotes", L"箭矢与弩箭"},
+    {L"Armour sets", L"Conjuntos de armadura", L"防具套装"},
+    {L"Talismans", L"Talismanes", L"护符"},
+    {L"Spirit ashes", L"Cenizas de espíritu", L"骨灰"},
+    {L"Sorceries", L"Hechizos", L"魔法"},
+    {L"Incantations", L"Encantamientos", L"祷告"},
+    {L"Ashes of War", L"Cenizas de guerra", L"战灰"},
+    {L"Consumables", L"Consumibles", L"消耗品"},
+    {L"Materials", L"Materiales", L"材料"},
+    {L"Key items and notes", L"Objetos clave y notas", L"重要道具与笔记"},
+    {L"Notes and paintings", L"Notas y cuadros", L"笔记与画作"},
+    {L"Tarnished Edition", L"Tarnished Edition", L"褪色者版"},
+};
+struct ShopGroupDef { ShopSection section; ShopText text; };
+constexpr ShopGroupDef kShopGroups[]{
+    // 0-35 weapons by wepType (kShopWeaponTypes below)
+    {sec_weapons, {L"Daggers", L"Dagas", L"短剑"}},
+    {sec_weapons, {L"Straight swords", L"Espadas rectas", L"直剑"}},
+    {sec_weapons, {L"Light greatswords", L"Espadones ligeros", L"轻型大剑"}},
+    {sec_weapons, {L"Greatswords", L"Espadones", L"大剑"}},
+    {sec_weapons, {L"Colossal swords", L"Espadas colosales", L"特大剑"}},
+    {sec_weapons, {L"Thrusting swords", L"Espadas perforantes", L"刺剑"}},
+    {sec_weapons, {L"Heavy thrusting swords", L"Espadas perforantes pesadas", L"重刺剑"}},
+    {sec_weapons, {L"Curved swords", L"Espadas curvas", L"曲剑"}},
+    {sec_weapons, {L"Curved greatswords", L"Espadones curvos", L"大曲剑"}},
+    {sec_weapons, {L"Backhand blades", L"Hojas invertidas", L"逆刃刀"}},
+    {sec_weapons, {L"Katanas", L"Katanas", L"刀"}},
+    {sec_weapons, {L"Great katanas", L"Grandes katanas", L"大太刀"}},
+    {sec_weapons, {L"Twinblades", L"Espadas dobles", L"双头剑"}},
+    {sec_weapons, {L"Axes", L"Hachas", L"斧"}},
+    {sec_weapons, {L"Greataxes", L"Grandes hachas", L"大斧"}},
+    {sec_weapons, {L"Hammers", L"Martillos", L"槌"}},
+    {sec_weapons, {L"Flails", L"Mayales", L"连枷"}},
+    {sec_weapons, {L"Great hammers", L"Grandes martillos", L"大槌"}},
+    {sec_weapons, {L"Colossal weapons", L"Armas colosales", L"特大武器"}},
+    {sec_weapons, {L"Spears", L"Lanzas", L"矛"}},
+    {sec_weapons, {L"Great spears", L"Grandes lanzas", L"大矛"}},
+    {sec_weapons, {L"Halberds", L"Alabardas", L"斧枪"}},
+    {sec_weapons, {L"Reapers", L"Guadañas", L"镰刀"}},
+    {sec_weapons, {L"Whips", L"Látigos", L"鞭子"}},
+    {sec_weapons, {L"Fists", L"Puños", L"拳头"}},
+    {sec_weapons, {L"Hand-to-hand arts", L"Artes cuerpo a cuerpo", L"格斗术"}},
+    {sec_weapons, {L"Claws", L"Garras", L"钩爪"}},
+    {sec_weapons, {L"Beast claws", L"Garras de bestia", L"兽爪"}},
+    {sec_weapons, {L"Perfume bottles", L"Frascos de perfume", L"香水瓶"}},
+    {sec_weapons, {L"Throwing blades", L"Hojas arrojadizas", L"投掷刃"}},
+    {sec_weapons, {L"Torches", L"Antorchas", L"火把"}},
+    {sec_weapons, {L"Light bows", L"Arcos ligeros", L"小弓"}},
+    {sec_weapons, {L"Bows", L"Arcos", L"长弓"}},
+    {sec_weapons, {L"Greatbows", L"Grandes arcos", L"大弓"}},
+    {sec_weapons, {L"Crossbows", L"Ballestas", L"弩"}},
+    {sec_weapons, {L"Ballistas", L"Balistas", L"弩炮"}},
+    // 36-39 shields
+    {sec_weapons, {L"Small shields", L"Escudos pequeños", L"小盾"}},
+    {sec_weapons, {L"Medium shields", L"Escudos medianos", L"中盾"}},
+    {sec_weapons, {L"Greatshields", L"Escudos grandes", L"大盾"}},
+    {sec_weapons, {L"Thrusting shields", L"Escudos perforantes", L"刺盾"}},
+    // 40-41 catalysts
+    {sec_weapons, {L"Glintstone staves", L"Bastones de piedra brillante", L"手杖"}},
+    {sec_weapons, {L"Sacred seals", L"Sellos sagrados", L"圣印记"}},
+    // 42-45 ammunition
+    {sec_ammo, {L"Arrows", L"Flechas", L"箭"}},
+    {sec_ammo, {L"Greatarrows", L"Grandes flechas", L"大箭"}},
+    {sec_ammo, {L"Bolts", L"Virotes", L"弩箭"}},
+    {sec_ammo, {L"Ballista bolts", L"Virotes de balista", L"弩炮箭"}},
+    // 46-51
+    {sec_armour, {L"Armour sets", L"Conjuntos de armadura", L"防具套装"}},
+    {sec_talismans, {L"Talismans", L"Talismanes", L"护符"}},
+    {sec_spirits, {L"Spirit ashes", L"Cenizas de espíritu", L"骨灰"}},
+    {sec_sorceries, {L"Sorceries", L"Hechizos", L"魔法"}},
+    {sec_incantations, {L"Incantations", L"Encantamientos", L"祷告"}},
+    {sec_gems, {L"Ashes of War", L"Cenizas de guerra", L"战灰"}},
+    // 52-60 items
+    {sec_items, {L"Flasks and physick", L"Frascos y physick", L"圣杯瓶与露滴"}},
+    {sec_items, {L"Crystal tears", L"Lágrimas de cristal", L"结晶露滴"}},
+    {sec_items, {L"Food and boluses", L"Comida y bolos", L"食物与药丸"}},
+    {sec_items, {L"Pots", L"Vasijas", L"壶"}},
+    {sec_items, {L"Aromatics and spraymists", L"Aromáticos y vaporizadores", L"香料与喷雾"}},
+    {sec_items, {L"Throwing items", L"Objetos arrojadizos", L"投掷物"}},
+    {sec_items, {L"Greases", L"Grasas", L"油脂"}},
+    {sec_items, {L"Tools and other items", L"Herramientas y otros", L"工具与其他"}},
+    {sec_items, {L"Runes", L"Runas", L"卢恩"}},
+    // 61-68 materials
+    {sec_materials, {L"Crafting: animal parts", L"Fabricación: partes de animales", L"制作：动物素材"}},
+    {sec_materials, {L"Crafting: plants", L"Fabricación: plantas", L"制作：植物素材"}},
+    {sec_materials, {L"Crafting: stones and others", L"Fabricación: piedras y otros", L"制作：石头与其他"}},
+    {sec_materials, {L"Smithing stones", L"Piedras de forja", L"锻造石"}},
+    {sec_materials, {L"Somber smithing stones", L"Piedras de forja sombrías", L"失色锻造石"}},
+    {sec_materials, {L"Gloveworts", L"Glovewort", L"手套花"}},
+    {sec_materials, {L"Seeds, tears and fragments", L"Semillas, lágrimas y fragmentos", L"种子、露滴与碎片"}},
+    {sec_materials, {L"Other upgrade materials", L"Otros materiales de mejora", L"其他强化材料"}},
+    // 69-77 key items
+    {sec_key, {L"Keys", L"Llaves", L"钥匙"}},
+    {sec_key, {L"Quest items", L"Objetos de misión", L"任务道具"}},
+    {sec_key, {L"Cookbooks", L"Recetarios", L"制作笔记"}},
+    {sec_key, {L"Maps", L"Mapas", L"地图"}},
+    {sec_key, {L"Bell bearings", L"Campanas", L"铃珠"}},
+    {sec_key, {L"Scrolls and prayerbooks", L"Pergaminos y libros de plegarias", L"卷轴与祷告书"}},
+    {sec_key, {L"Remembrances", L"Recuerdos", L"追忆"}},
+    {sec_key, {L"Great Runes", L"Grandes Runas", L"大卢恩"}},
+    {sec_key, {L"Other key items", L"Otros objetos clave", L"其他重要道具"}},
+    // 78-80 notes
+    {sec_key, {L"Paintings", L"Cuadros", L"画作"}},
+    {sec_key, {L"Notes and messages", L"Notas y mensajes", L"笔记与讯息"}},
+    {sec_key, {L"Tutorials", L"Tutoriales", L"教学"}},
+    // 81 the Tarnished Edition's own items, in their own shop (user, r157-test26)
+    {sec_tarnished, {L"Tarnished Edition", L"Tarnished Edition", L"褪色者版"}},
+};
+constexpr int kShopTarnished = 81;
+constexpr int kShopGroupCount = static_cast<int>(sizeof(kShopGroups) / sizeof(kShopGroups[0]));
+// wepType of groups 0-45 (EquipParamWeapon +0x1A6), in group order
+constexpr std::uint16_t kShopWeaponTypes[46]{
+    1, 3, 93, 5, 7, 15, 16, 9, 11, 92, 13, 94, 14, 17, 19, 21, 24, 23, 41, 25, 28, 29, 31, 39, 35, 88, 37, 95, 89, 91, 87,
+    50, 51, 53, 55, 56, 65, 67, 69, 90, 57, 61, 81, 83, 85, 86};
+constexpr int kShopArmour = 46, kShopTalismans = 47, kShopSpirits = 48, kShopSorceries = 49,
+    kShopIncantations = 50, kShopGems = 51;
+constexpr std::int32_t kShopRange = 4000;  // rows per shop (section x 2 + DLC)
+
+int shop_goods_group(std::uint8_t type, std::uint8_t sort_group, const std::wstring& name) noexcept {
+    switch (type) {
+    case 5: case 17: return kShopSorceries;
+    case 16: case 18: return kShopIncantations;
+    case 7: case 8: return kShopSpirits;
+    case 9: return 52;
+    case 10: return 53;
+    case 11: return 55;
+    case 3: return 75;
+    case 15: return 76;
+    case 2:
+        if (sort_group == 10 || sort_group == 15) return 61;
+        if (sort_group == 20 || sort_group == 25) return 62;
+        return 63;
+    case 14:
+        if (sort_group == 20 || sort_group == 25) return 64;
+        if (sort_group == 30 || sort_group == 35) return 65;
+        if (sort_group == 40 || sort_group == 45) return 66;
+        if (sort_group == 10 || sort_group == 15) return 67;
+        return 68;
+    case 12:
+        if (sort_group == 20 || sort_group == 25) return 80;
+        if (name.find(L"Painting") != std::wstring::npos) return 78;
+        return 79;
+    case 1:
+        switch (sort_group) {
+        case 10: case 15: return 76;
+        case 40: case 45: return 69;
+        case 50: case 55: return 70;
+        case 60: case 65: return 71;
+        case 70: case 75: return 72;
+        case 80: case 85: case 90: case 95: return 73;
+        case 100: case 105: return 74;
+        default: return 77;
+        }
+    case 0:
+        switch (sort_group) {
+        case 10: case 15: return 52;
+        case 20: case 25: return 54;
+        case 30: case 35: return 55;
+        case 40: case 45: return 56;
+        case 50: case 55: return 57;
+        case 70: case 75: return 58;
+        case 100: case 105: return 60;
+        case 120: case 125: case 250: case 255: return -1;  // multiplayer items and gestures
+        default: return 59;
+        }
+    default: return -1;
+    }
+}
+
+struct ItemShopState {
+    bool attempted{};
+    bool ready{};
+    int tries{};
+    std::int32_t first[sec_count][2]{};  // one shop per section and base / DLC
+    std::int32_t count[sec_count][2]{};  // rows, gaps included
+    std::int32_t items[sec_count][2]{};  // items only
+};
+ItemShopState g_item_shop{};
+void register_item_shop_talk() noexcept;
+
+bool find_param_holder(const wchar_t* name, std::uintptr_t& slot) noexcept {
+    std::uintptr_t manager{};
+    if (!g_statics.regulation_manager || !game::read(g_statics.regulation_manager, manager) || !manager) return false;
+    std::uintptr_t begin{}, end{};
+    if (!game::read(manager + 0x18, begin) || !game::read(manager + 0x20, end) || !begin || end <= begin) return false;
+    const std::size_t want = std::wcslen(name);
+    for (std::uintptr_t s = begin; s < end; s += 8) {
+        std::uintptr_t entry{};
+        if (!game::read(s, entry) || !entry) continue;
+        std::uint64_t length{};
+        if (!game::read(entry + 0x28, length) || length != want) continue;
+        wchar_t text[65]{};
+        if (length <= 7) {
+            if (!game::safe_read(entry + 0x18, text, length * 2)) continue;
+        } else {
+            std::uintptr_t heap{};
+            if (!game::read(entry + 0x18, heap) || !game::safe_read(heap, text, length * 2)) continue;
+        }
+        if (std::wcsncmp(text, name, want) != 0) continue;
+        std::uintptr_t holder{};
+        if (!game::read(entry + 0x80, holder) || !holder) return false;
+        slot = holder + 0x80;
+        return true;
+    }
+    return false;
+}
+
+
+// Paid add-ons: items of a DLC the player does not own are left out, even
+// though their data is in every copy of the game (r157-test16: the Idus
+// Sword showed without the Tarnished Edition). Steam's flat API from the
+// game's own steam_api64.dll; when it cannot answer, the add-on counts as
+// not owned. Tarnished Pack items go with the base game (user's choice).
+constexpr std::uint32_t kSteamShadowOfTheErdtree = 2778580;
+constexpr std::uint32_t kSteamTarnishedPack = 3655690;
+constexpr std::int32_t kTarnishedWeapons[]{3560000, 8530000, 13510000, 31540000, 62520000, 64530000, 66530000, 67530000};
+constexpr std::int32_t kTarnishedArmour[]{5340000, 5340100, 5340200, 5340300, 5350000, 5350100, 5350200, 5350300, 5351100,
+    5360000, 5360100, 5360200, 5360300, 5361000, 5370000, 5370100, 5370200, 5370300};
+constexpr std::int32_t kTarnishedGoods[]{2009600, 2009610, 2009620};
+
+template <std::size_t N>
+bool in_list(const std::int32_t (&list)[N], std::int32_t id) noexcept {
+    return std::find(std::begin(list), std::end(list), id) != std::end(list);
+}
+
+// Owned when Steam says the DLC is installed or, failing that, that the
+// account owns it (BIsSubscribedApp): a pack that is bought but unticked in
+// the game's DLC list reads as "not installed" (Nexus report, FJKarl: his
+// Tarnished Pack section did not show). Each answer is logged once.
+int steam_dlc_owned(std::uint32_t app) noexcept {  // 1 yes, 0 no, -1 unknown
+    using AppsFn = void*(__cdecl*)();
+    using AskFn = bool(__cdecl*)(void*, std::uint32_t);
+    const HMODULE steam = GetModuleHandleW(L"steam_api64.dll");
+    if (!steam) return -1;
+    AppsFn apps = nullptr;
+    for (const char* name : {"SteamAPI_SteamApps_v008", "SteamAPI_SteamApps_v009"})
+        if (!apps) apps = reinterpret_cast<AppsFn>(GetProcAddress(steam, name));
+    const auto installed = reinterpret_cast<AskFn>(GetProcAddress(steam, "SteamAPI_ISteamApps_BIsDlcInstalled"));
+    const auto subscribed = reinterpret_cast<AskFn>(GetProcAddress(steam, "SteamAPI_ISteamApps_BIsSubscribedApp"));
+    if (!apps || !installed) return -1;
+    void* interface_ = apps();
+    if (!interface_) return -1;
+    const bool is_installed = installed(interface_, app);
+    const bool is_owned = is_installed || (subscribed && subscribed(interface_, app));
+    // Logged when the answer changes (the shop asks again while it waits).
+    static std::uint32_t logged_app[2]{};
+    static int logged_answer[2]{-2, -2};
+    const int slot = app == kSteamTarnishedPack ? 1 : 0;
+    const int answer = (is_installed ? 2 : 0) | (is_owned ? 1 : 0);
+    if (logged_app[slot] != app || logged_answer[slot] != answer) {
+        logged_app[slot] = app;
+        logged_answer[slot] = answer;
+        wchar_t message[160]{};
+        swprintf_s(message, L"Steam: app %u installed %d, owned %d%ls.", app, is_installed ? 1 : 0, is_owned ? 1 : 0,
+            subscribed ? L"" : L" (no ownership check in this steam_api64.dll)");
+        log(message);
+    }
+#ifdef NT_DEV_ALL_DLC
+    // Local test builds only (the author's, defined when compiling them): the
+    // shop shows every add-on's items so they can be checked without owning
+    // them. Never in the repository's default build or a released package.
+    if (!is_owned) {
+        static bool told{};
+        if (!told) log(L"Steam: development build, add-on items shown without the add-on.");
+        told = true;
+        return 1;
+    }
+#endif
+    return is_owned ? 1 : 0;
+}
+
+struct ShopItem {
+    std::int32_t row_id;
+    std::int32_t equip_id;
+    std::uint8_t equip_type;
+    std::int32_t price;
+    bool spacer;
+    std::int32_t header;  // -1, or the group whose title this row shows
+    std::int32_t sell{};
+    std::uint8_t max_level{};
+};
+// Group titles in the shop: a row of a harmless note (Note: Hidden Cave,
+// goods 8700) whose nameMsgId is kShopHeaderMsg + group, at a price no one
+// can pay. The game reads that name through GetGoodsName (0xD13430 in
+// 2.7.2.0), which install_shop_header_names hooks for those ids only.
+constexpr std::int32_t kShopHeaderGoods = 8700;
+constexpr std::int32_t kShopHeaderMsg = 1992000000;
+constexpr std::int32_t kShopHeaderPrice = 999999999;
+struct ShopPending {
+    int group;
+    int dlc;  // 0 base game, 1 Shadow of the Erdtree
+    std::int32_t equip_id;
+    std::uint8_t equip_type;
+    std::int32_t price;
+    std::uintptr_t row;  // the item's EquipParam row
+    std::uint8_t max_level;  // weapons 0/10/25, spirit ashes 0-10
+    int kind;  // the group it would have outside Tarnished Edition (same as group there)
+};
+// Our shop rows, to set level and price when a shop opens (options
+// ItemShopWeaponLevel / ItemShopSpiritLevel / ItemShopPricePercent).
+struct ShopRowRef {
+    std::uint8_t* data;       // the ShopLineupParam row
+    std::int32_t base_id;     // +0 item
+    std::int32_t sell;        // its sell value
+    std::uint8_t kind;        // 0 other, 1 weapon, 2 spirit ash
+    std::uint8_t max_level;
+};
+std::vector<ShopRowRef> g_shop_rows[sec_count][2];
+
+// Armour sets one per line (user, r157-test16): the shop starts a new line
+// whenever sortGroupId changes and orders by sortId, so while one of our
+// armour shops is open every set gets its own sortGroupId (Protector +0xD8,
+// u8, 1-254 in set order) and sortId = set x 10 + slot (+0x4: head, body,
+// arms, legs). The game's values come back once no menu is open any more
+// (nt_top_menu_job, msa\src\game_menus.rs).
+struct ArmourLayoutCell {
+    std::uintptr_t row;
+    std::int32_t sort_id;  // ours
+    std::uint8_t sort_group;
+    std::int32_t original_sort_id;
+    std::uint8_t original_sort_group;
+    std::uint8_t original_slot;  // protectorCategory; 0xFF: not armour
+    std::uint16_t sort_offset;   // sortId (s32) in the row
+    std::uint16_t group_offset;  // sortGroupId (u8)
+};
+// Lines per section while one of our shops is open (r157-test22): weapons
+// by type, normal ones (gemMountType +0x241 == 2) before unique ones;
+// Ashes of War by the affinity they give (defaultWepAttr +0x35); spirit
+// ashes FP-cost then HP-cost, cheapest first; sorceries and incantations
+// attack then support. Talismans, consumables and materials keep the
+// game's own groups.
+std::vector<ArmourLayoutCell> g_shop_layout[sec_count][2];
+std::atomic<bool> g_armour_layout_applied{false};
+std::atomic<int> g_armour_layout_generation{0};
+
+// Damage taken (r157, Nexus report 08-11): humanoid NPCs and invaders attack
+// with AtkParam_Pc, the player's own attack rows, so scaling AtkParam_Npc
+// missed them, and Damage dealt made them hit harder. Now the player carries
+// a SpEffect of our own, kept on by msa (nt_keep_player_effect), whose
+// defEnemy/defPlayerDmgCorrectRate (+0x260..+0x284: physical, magic, fire,
+// lightning, holy) scale every hit the player takes from anyone, as the
+// Dragoncrest talismans do (their row 340000 is the template). The row is
+// appended to SpEffectParam with an id above the game's (999999999), the same
+// way the item shop grows ShopLineupParam; the old table stays allocated.
+constexpr std::int32_t kDamageCutEffectId = 1999990100;
+constexpr std::int32_t kDamageCutTemplateId = 340000;  // Dragoncrest Shield Talisman
+constexpr std::size_t kSpEffectRowSize = 0x390;
+extern "C" std::uint8_t nt_keep_player_effect(std::int32_t id);
+
+struct DamageCutState {
+    bool attempted{};
+    bool ready{};
+    std::uint8_t* row{};
+    float applied[10]{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+    std::int32_t kept{-1};  // id last handed to msa, -1 none yet
+    bool keep_pending{};
+    int generation{};  // g_param_appends when row was found
+};
+DamageCutState g_damage_cut{};
+
+// Appends rows (ids ascending, above every existing one) to a param table
+// that keeps its rows sorted, rebuilding the table with its prefix and id
+// index once; returns the new rows' data, or nothing.
+std::vector<std::uint8_t*> append_param_rows(const wchar_t* name, std::size_t row_size,
+    const std::vector<std::pair<std::int32_t, const std::uint8_t*>>& added, bool& retry) noexcept {
+    retry = false;
+    std::vector<std::uint8_t*> result;
+    if (added.empty()) return result;
+    for (std::size_t i = 1; i < added.size(); ++i)
+        if (added[i].first <= added[i - 1].first) return result;
+    std::uintptr_t slot{}, file{};
+    if (!find_param_holder(name, slot) || !game::read(slot, file) || !file) {
+        retry = true;
+        return result;
+    }
+    std::uint16_t count{};
+    std::uint32_t type_offset32{};
+    std::uint64_t type_offset{}, data_start{};
+    std::uint8_t prefix[16]{};
+    if (!game::read(file + 0x0A, count) || !game::read(file + 0x00, type_offset32) ||
+        !game::read(file + 0x10, type_offset) || !game::read(file + 0x30, data_start) ||
+        !game::safe_read(file - 16, prefix, sizeof(prefix))) {
+        retry = true;
+        return result;
+    }
+    std::uint32_t old_size{}, old_index_count{};
+    std::memcpy(&old_size, prefix, 4);
+    std::memcpy(&old_index_count, prefix + 4, 4);
+    if (count == 0 || count + added.size() > 0xFFFF || data_start != 0x40 + static_cast<std::uint64_t>(count) * 0x18 ||
+        type_offset32 != type_offset || type_offset <= data_start || old_index_count != count ||
+        old_size < type_offset) return result;
+    struct Row { std::int32_t id; std::int32_t pad; std::int64_t data; std::int64_t name; };
+    std::vector<Row> rows(count);
+    if (!game::safe_read(file + 0x40, rows.data(), rows.size() * sizeof(Row))) return result;
+    for (std::size_t i = 1; i < rows.size(); ++i)
+        if (rows[i].id <= rows[i - 1].id) return result;
+    if (rows.back().id >= added.front().first) return result;  // ids must stay sorted
+    const std::uint64_t kShift = 0x18ull * added.size();  // more entries in the row table
+    const std::uint64_t body = old_size - data_start;  // data, type name, row names
+    const std::uint64_t new_data_start = data_start + kShift;
+    const std::uint64_t stride = (row_size + 0xF) & ~std::uint64_t{0xF};
+    const std::uint64_t row_offset = (old_size + kShift + 0xF) & ~std::uint64_t{0xF};
+    const std::uint64_t file_size = row_offset + stride * added.size();
+    const std::uint64_t index_offset = (file_size + 0xF) & ~std::uint64_t{0xF};
+    const std::uint64_t new_count = count + added.size();
+    const std::uint64_t total = 16 + index_offset + new_count * 8 + 16;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!block) return result;
+    std::uint8_t* out = block + 16;
+    if (!game::safe_read(file, out, 0x40) || !game::safe_read(file + data_start, out + new_data_start, body)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return result;
+    }
+    for (Row& r : rows) {
+        r.data += static_cast<std::int64_t>(kShift);
+        r.name += static_cast<std::int64_t>(kShift);
+    }
+    const std::int64_t shared_name = rows.front().name;
+    for (std::size_t i = 0; i < added.size(); ++i) {
+        const std::uint64_t at = row_offset + stride * i;
+        rows.push_back({added[i].first, 0, static_cast<std::int64_t>(at), shared_name});
+        std::memcpy(out + at, added[i].second, row_size);
+    }
+    std::memcpy(out + 0x40, rows.data(), rows.size() * sizeof(Row));
+    const std::uint16_t count16 = static_cast<std::uint16_t>(new_count);
+    const std::uint64_t new_type_offset = type_offset + kShift;
+    const std::uint32_t type32 = static_cast<std::uint32_t>(new_type_offset);
+    std::memcpy(out + 0x0A, &count16, 2);
+    std::memcpy(out + 0x00, &type32, 4);
+    std::memcpy(out + 0x10, &new_type_offset, 8);
+    std::memcpy(out + 0x30, &new_data_start, 8);
+    const std::uint32_t size32 = static_cast<std::uint32_t>(file_size);
+    const std::uint32_t count32 = static_cast<std::uint32_t>(new_count);
+    std::memcpy(block, prefix, sizeof(prefix));
+    std::memcpy(block + 0, &size32, 4);
+    std::memcpy(block + 4, &count32, 4);
+    for (std::uint32_t i = 0; i < count32; ++i) {
+        const std::uint32_t entry[2]{static_cast<std::uint32_t>(rows[i].id), i};
+        std::memcpy(out + index_offset + i * 8ull, entry, 8);
+    }
+    if (!game::write<std::uintptr_t>(slot, reinterpret_cast<std::uintptr_t>(out))) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return result;
+    }
+    ++g_param_appends;
+    for (std::size_t i = 0; i < added.size(); ++i) result.push_back(out + row_offset + stride * i);
+    return result;
+}
+
+void sync_damage_cut() noexcept {
+    auto& state = g_damage_cut;
+    if (state.attempted) return;
+    if (state.ready && state.generation != g_param_appends) {
+        // SpEffectParam was rebuilt again (weapon effect copies): find our row
+        game::ParamTable effects;
+        if (game::find_param(g_statics, L"SpEffectParam", kSpEffectRowSize, effects, nullptr)) {
+            if (const std::uintptr_t row = param_row_by_id(effects, kDamageCutEffectId)) {
+                state.row = reinterpret_cast<std::uint8_t*>(row);
+                for (float& rate : state.applied) rate = -1.0f;  // rewrite every rate
+            }
+        }
+        state.generation = g_param_appends;
+    }
+    if (!state.ready) {
+        game::ParamTable effects;
+        if (!game::find_param(g_statics, L"SpEffectParam", kSpEffectRowSize, effects, g_log)) {
+            if (effects.file) state.attempted = true;
+            return;
+        }
+        std::uint8_t row[kSpEffectRowSize]{};
+        const std::uintptr_t source = param_row_by_id(effects, kDamageCutTemplateId);
+        if (!source || !game::safe_read(source, row, sizeof(row))) {
+            state.attempted = true;
+            log(L"Damage taken: the Dragoncrest Shield Talisman effect was not found; Damage taken unavailable.");
+            return;
+        }
+        // permanent, no icon, every damage rate neutral until set
+        const std::int32_t no_icon = -1;
+        const float permanent = -1.0f, one = 1.0f;
+        std::memcpy(row + 0x0, &no_icon, 4);
+        std::memcpy(row + 0x8, &permanent, 4);
+        for (std::size_t o = 0x260; o <= 0x2B0; o += 4) std::memcpy(row + o, &one, 4);
+        bool retry{};
+        const auto added = append_param_rows(L"SpEffectParam", kSpEffectRowSize, {{kDamageCutEffectId, row}}, retry);
+        state.row = added.empty() ? nullptr : added.front();
+        state.generation = g_param_appends;
+        if (!state.row) {
+            if (!retry) {
+                state.attempted = true;
+                log(L"Damage taken: SpEffectParam could not take a row of ours; Damage taken unavailable.");
+            }
+            return;
+        }
+        state.ready = true;
+        wchar_t message[120]{};
+        swprintf_s(message, L"Damage taken: SpEffect %d added for the player's incoming damage.", kDamageCutEffectId);
+        log(message);
+    }
+    // Taken: def*DmgCorrectRate, from players (+0x260..) and from everyone
+    // else (+0x274..). Dealt: atk*DmgCorrectRate, on players (+0x28C..) and
+    // on everyone else (+0x2A0..). Physical, magic, fire, lightning, holy.
+    const Id taken_parts[5]{taken_physical, taken_magic, taken_fire, taken_lightning, taken_holy};
+    const Id dealt_parts[5]{dmg_physical, dmg_magic, dmg_fire, dmg_lightning, dmg_holy};
+    float rates[10]{};
+    bool neutral = true;
+    for (int k = 0; k < 5; ++k) {
+        rates[k] = value_of(die_one_hit) ? 1000.0f
+            : static_cast<float>(value_of(damage_taken)) * static_cast<float>(value_of(taken_parts[k])) / 10000.0f;
+        // a 0-damage contact stays 0, so rolling into an enemy no longer kills
+        rates[5 + k] = value_of(one_hit_kill) ? 100000.0f
+            : static_cast<float>(value_of(damage_dealt)) * static_cast<float>(value_of(dealt_parts[k])) / 10000.0f;
+    }
+    for (const float rate : rates) neutral = neutral && rate == 1.0f;
+    for (int k = 0; k < 10; ++k) {
+        if (rates[k] == state.applied[k]) continue;
+        const std::uintptr_t row = reinterpret_cast<std::uintptr_t>(state.row);
+        if (k < 5) {
+            game::write<float>(row + 0x260 + k * 4, rates[k]);
+            game::write<float>(row + 0x274 + k * 4, rates[k]);
+        } else {
+            game::write<float>(row + 0x28C + (k - 5) * 4, rates[k]);
+            game::write<float>(row + 0x2A0 + (k - 5) * 4, rates[k]);
+        }
+        state.applied[k] = rates[k];
+    }
+    const std::int32_t want = neutral ? 0 : kDamageCutEffectId;
+    if (want != state.kept || state.keep_pending) {
+        state.keep_pending = nt_keep_player_effect(want) == 0;
+        state.kept = want;
+        if (!state.keep_pending) {
+            wchar_t message[160]{};
+            swprintf_s(message, L"Damage taken/dealt: %ls (taken %.2f %.2f %.2f %.2f %.2f, dealt %.2f %.2f %.2f %.2f %.2f).",
+                want ? L"on the player" : L"off", rates[0], rates[1], rates[2], rates[3], rates[4], rates[5], rates[6],
+                rates[7], rates[8], rates[9]);
+            log(message);
+        }
+    }
+}
+
+void sync_item_shop() noexcept {
+    auto& state = g_item_shop;
+    if (state.attempted || state.ready) return;
+    if (++state.tries > 30) {  // about a minute: give up, let the other options run
+        state.attempted = true;
+        log(L"Item shop: names or params never became ready; unavailable.");
+        return;
+    }
+    if (!g_msg_lookup || !g_msg_repository) {
+        // resolved once at startup: without it there are no names, ever
+        state.attempted = true;
+        log(L"Item shop: the game's text lookup was not found; unavailable.");
+        return;
+    }
+    if (!*g_msg_repository) return;
+    std::vector<ShopPending> pending;
+    const int owns_sote = steam_dlc_owned(kSteamShadowOfTheErdtree);
+    const int owns_tarnished = steam_dlc_owned(kSteamTarnishedPack);
+    std::size_t skipped_dlc = 0;
+    std::wstring name;
+    std::unordered_set<std::wstring> seen_names[sec_count][2];
+    // The shop hides a row that costs less than the item sells for
+    // (sellValue; the r154 Shop prices finding), so each row costs exactly
+    // that: the least the game shows. Items that cannot be sold stay free.
+    const auto add = [&](int group, int dlc, std::int32_t equip_id, std::uint8_t type, std::uintptr_t row,
+                         std::size_t sell_offset) {
+        if (group < 0 || group >= kShopGroupCount) return;
+        const int kind = group;
+        const bool tarnished = (type == 0 && in_list(kTarnishedWeapons, equip_id)) ||
+            (type == 1 && in_list(kTarnishedArmour, equip_id)) || (type == 3 && in_list(kTarnishedGoods, equip_id));
+        if (tarnished) {
+            if (owns_tarnished != 1) { ++skipped_dlc; return; }
+            group = kShopTarnished;
+            dlc = 0;
+        } else if (dlc == 1 && owns_sote == 0) {
+            ++skipped_dlc;
+            return;  // unknown (-1) keeps Shadow of the Erdtree: its data needs the DLC to load
+        }
+        // never the same name twice in one shop (r157-test23: Winged
+        // Misbegotten Ashes + 1..+10 next to the base ash)
+        if (!seen_names[kShopGroups[group].section][dlc == 1 ? 1 : 0].insert(name).second) return;
+        std::int32_t sell{};
+        if (!game::read(row + sell_offset, sell) || sell < 0) sell = 0;
+        pending.push_back({group, dlc, equip_id, type, sell, row, 0, kind});
+    };
+    // Only what a player can obtain: items that some item lot (map or enemy),
+    // vanilla shop, crafting recipe or class start gives. That leaves out
+    // cut and test content ([NPC] weapons, "Type N" armour, test gems,
+    // duplicate Ash of War rows, phantom multiplayer items), which could
+    // also look suspicious online. Flasks (replaceItemId) and Great Runes
+    // come from events, so they are added by type. Index = ItemLot category:
+    // 1 goods, 2 weapon (stored without affinity and level), 3 armour,
+    // 4 talisman, 5 Ash of War.
+    std::unordered_set<std::int32_t> obtainable[6];
+    {
+        bool lots_ok = true;
+        for (const wchar_t* lot : {L"ItemLotParam_map", L"ItemLotParam_enemy"}) {
+            game::ParamTable table;
+            if (!game::find_param(g_statics, lot, 0x98, table, nullptr)) { lots_ok = false; continue; }
+            for (const std::uintptr_t row : table.rows) {
+                std::int32_t ids[8]{}, categories[8]{};
+                if (!game::safe_read(row, ids, sizeof(ids)) || !game::safe_read(row + 0x20, categories, sizeof(categories))) continue;
+                for (int i = 0; i < 8; ++i) {
+                    if (ids[i] <= 0 || categories[i] < 1 || categories[i] > 5) continue;
+                    obtainable[categories[i]].insert(categories[i] == 2 ? ids[i] - ids[i] % 10000 : ids[i]);
+                }
+            }
+        }
+        static constexpr int kShopToLot[5]{2, 3, 4, 1, 5};
+        for (const wchar_t* shop : {L"ShopLineupParam", L"ShopLineupParam_Recipe"}) {
+            game::ParamTable table;
+            if (!game::find_param(g_statics, shop, 0x34, table, nullptr)) { lots_ok = false; continue; }
+            for (const std::uintptr_t row : table.rows) {
+                std::int32_t id{};
+                std::uint8_t type{};
+                if (!game::read(row, id) || !game::read(row + 0x17, type) || id <= 0 || type > 4) continue;
+                const int c = kShopToLot[type];
+                obtainable[c].insert(c == 2 ? id - id % 10000 : id);
+            }
+        }
+        game::ParamTable init;
+        if (game::find_param(g_statics, L"CharaInitParam", 0x140, init, nullptr)) {
+            for (const std::uintptr_t row : init.rows) {
+                std::int32_t v[0xA4 / 4]{};
+                if (!game::safe_read(row, v, sizeof(v))) continue;
+                const auto put = [&](int c, std::size_t offset) {
+                    const std::int32_t id = v[offset / 4];
+                    if (id > 0) obtainable[c].insert(c == 2 ? id - id % 10000 : id);
+                };
+                for (std::size_t o = 0x10; o <= 0x3C; o += 4) put(o >= 0x20 && o <= 0x2C ? 3 : 2, o);  // weapons, armour, arrows
+                for (std::size_t o = 0x40; o <= 0x4C; o += 4) put(4, o);  // talismans
+                for (std::size_t o = 0x60; o <= 0xA0; o += 4) put(1, o);  // spells and items
+            }
+        } else {
+            lots_ok = false;
+        }
+        if (!lots_ok) return;  // params not loaded yet
+    }
+    // Weapons: only the plain version of each (id % 10000 == 0); affinities
+    // come from Ashes of War and upgrades from smithing stones, both sold too.
+    // Ids: the row table holds them (file + 0x40 + i * 0x18).
+    const auto each_row = [&](const wchar_t* param, std::size_t row_size, auto&& fn) -> bool {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, param, row_size, table, nullptr)) return false;
+        std::uint16_t count{};
+        if (!game::read(table.file + 0x0A, count)) return false;
+        for (std::uint16_t i = 0; i < count && i < table.rows.size(); ++i) {
+            std::int32_t id{};
+            if (!game::read(table.file + 0x40 + i * 0x18, id)) continue;
+            fn(id, table.rows[i]);
+        }
+        return true;
+    };
+    int found = 0;
+    std::unordered_set<std::int32_t> reinforce_ids;
+    std::unordered_map<std::int32_t, std::uintptr_t> goods_ids;  // id -> row
+    each_row(L"ReinforceParamWeapon", 0x80, [&](std::int32_t id, std::uintptr_t) { reinforce_ids.insert(id); });
+    each_row(L"EquipParamGoods", 0xB0, [&](std::int32_t id, std::uintptr_t row) { goods_ids.emplace(id, row); });
+    const auto weapon_max_level = [&](std::uintptr_t row) -> std::uint8_t {
+        std::int16_t type{};
+        if (!game::read(row + 0xDA, type) || type < 0) return 0;
+        std::uint8_t level = 0;
+        for (int l = 1; l <= 25; ++l)
+            if (reinforce_ids.count(type + l)) level = static_cast<std::uint8_t>(l);
+        return level;
+    };
+    bool ok = each_row(L"EquipParamWeapon", 0x298, [&](std::int32_t id, std::uintptr_t row) {
+        if (id <= 0 || id % 10000 != 0 || id == 110000 || !obtainable[2].count(id)) return;
+        std::uint16_t type{};
+        if (!game::read(row + 0x1A6, type)) return;
+        int group = -1;
+        for (int g = 0; g < 46; ++g)
+            if (kShopWeaponTypes[g] == type) group = g;
+        if (group >= 0 && item_name({115, 11, 310, 410}, id, name, &found)) {
+            add(group, found - 1, id, 0, row, 0x20);
+            if (!pending.empty() && pending.back().equip_id == id) pending.back().max_level = weapon_max_level(row);
+        }
+    });
+    ok = ok && each_row(L"EquipParamProtector", 0x1A0, [&](std::int32_t id, std::uintptr_t row) {
+        std::uint8_t slot{};
+        if (id <= 10300 || !obtainable[3].count(id) || !game::read(row + 0xD6, slot) || slot > 3) return;  // no hair
+        // Ragged set (and Altered): only an NPC wears it; players could get
+        // it by mistake until patch 1.03, then it was removed (r157-test27).
+        if (id / 1000 == 610 || id / 1000 == 611) return;
+        if (item_name({117, 12, 313, 413}, id, name, &found)) add(kShopArmour, found - 1, id, 1, row, 0x20);
+    });
+    ok = ok && each_row(L"EquipParamAccessory", 0x60, [&](std::int32_t id, std::uintptr_t row) {
+        if (id > 0 && obtainable[4].count(id) && item_name({113, 13, 316, 416}, id, name, &found))
+            add(kShopTalismans, found - 1, id, 2, row, 0x18);
+    });
+    ok = ok && each_row(L"EquipParamGoods", 0xB0, [&](std::int32_t id, std::uintptr_t row) {
+        if (id <= 0) return;
+        std::uint8_t type{}, sort_group{};
+        std::int32_t replace_item{};
+        if (!game::read(row + 0x3E, type) || !game::read(row + 0x72, sort_group) ||
+            !game::read(row + 0x1C, replace_item)) return;
+        if (!obtainable[1].count(id) && type != 15) return;
+        if (!item_name({111, 10, 319, 419}, id, name, &found)) return;
+        // No flasks (replaceItemId: full <-> empty): their charges belong to
+        // the character, and a bought one became extra broken inventory
+        // entries (r157-test11). Golden Seeds and Sacred Tears are sold.
+        if (replace_item != -1) return;
+        std::uint8_t spirit_max = 0;
+        if (type == 7 || type == 8) {
+            // one row per spirit ash: its upgrades are id + 1..10 (some
+            // write "Name + 3", r157-test23: Winged Misbegotten Ashes)
+            if (id % 100 != 0) return;
+            for (int l = 1; l <= 10; ++l)
+                if (goods_ids.count(id + l)) spirit_max = static_cast<std::uint8_t>(l);
+        }
+        add(shop_goods_group(type, sort_group, name), found - 1, id, 3, row, 0x14);
+        if (!pending.empty() && pending.back().equip_id == id) pending.back().max_level = spirit_max;
+    });
+    ok = ok && each_row(L"EquipParamGem", 0x60, [&](std::int32_t id, std::uintptr_t row) {
+        if (id > 0 && obtainable[5].count(id) && item_name({35, 322, 422}, id, name, &found))
+            add(kShopGems, found - 1, id, 4, row, 0x20);
+    });
+    if (!ok) return;  // params not loaded yet
+    // One shop per section and base / DLC (user, r157-test9: fewer menus).
+    // Inside it the groups follow in menu order, each in param id order, and
+    // in sections with more than one group each group starts with a title row
+    // (r157-test12: the shop hides empty rows, so gaps did not show).
+    std::stable_sort(pending.begin(), pending.end(), [](const ShopPending& x, const ShopPending& y) {
+        const int sx = kShopGroups[x.group].section, sy = kShopGroups[y.group].section;
+        if (sx != sy) return sx < sy;
+        if (x.dlc != y.dlc) return x.dlc < y.dlc;
+        if (x.group != y.group) return x.group < y.group;
+        return x.equip_id < y.equip_id;
+    });
+    // Armour layout: complete sets (head, body, arms and legs) first, then
+    // the rest (altered versions, partial sets, single pieces), each part in
+    // id order; one sortGroupId per set (user, r157-test20). The game keeps
+    // no "when you get it" order, so that is not possible.
+    for (auto& section_rows : g_shop_rows) section_rows[0].clear(), section_rows[1].clear();
+    for (int s = 0; s < sec_count; ++s) g_shop_layout[s][0].clear(), g_shop_layout[s][1].clear();
+    // Tarnished Edition items keep the layout of their kind (user, 14-11):
+    // armour by set, weapons by type, in the Tarnished Edition shop.
+    const auto kind_section = [](const ShopPending& p) { return kShopGroups[p.kind].section; };
+    for (const int target : {static_cast<int>(sec_armour), static_cast<int>(sec_tarnished)})
+    for (int d = 0; d < 2; ++d) {
+        struct Piece { std::uintptr_t row; std::int32_t set; std::uint8_t slot; std::int32_t sort_id; std::uint8_t sort_group; };
+        std::vector<Piece> pieces;
+        std::map<std::int32_t, std::uint8_t> slots_of_set;  // set -> bit per slot
+        for (const ShopPending& p : pending) {
+            if (p.kind != kShopArmour || p.dlc != d || kShopGroups[p.group].section != target) continue;
+            Piece piece{p.row, p.equip_id / 1000, 0, 0, 0};
+            if (!game::read(p.row + 0xD6, piece.slot) || !game::read(p.row + 0x4, piece.sort_id) ||
+                !game::read(p.row + 0xD8, piece.sort_group) || piece.slot > 3) continue;
+            slots_of_set[piece.set] |= static_cast<std::uint8_t>(1u << piece.slot);
+            pieces.push_back(piece);
+        }
+        std::vector<std::int32_t> order;
+        for (const auto& [set, mask] : slots_of_set) if (mask == 0x0F) order.push_back(set);
+        for (const auto& [set, mask] : slots_of_set) if (mask != 0x0F) order.push_back(set);
+        std::map<std::int32_t, int> index_of_set;
+        for (std::size_t i = 0; i < order.size(); ++i) index_of_set[order[i]] = static_cast<int>(std::min<std::size_t>(i, 253));
+        for (const Piece& piece : pieces) {
+            const int set_index = index_of_set[piece.set];
+            g_shop_layout[target][d].push_back({piece.row, (set_index + 1) * 10 + piece.slot,
+                static_cast<std::uint8_t>(set_index + 1), piece.sort_id, piece.sort_group, piece.slot, 0x4, 0xD8});
+        }
+    }
+    {
+        std::int32_t spirit_rank[2]{};
+        for (const ShopPending& p : pending) {
+            const int target = kShopGroups[p.group].section;  // the shop it is in
+            const int s = kind_section(p);                    // how it is laid out
+            std::int32_t sort_id{};
+            std::uint8_t sort_group{};
+            if (s == sec_weapons && p.equip_type == 0) {
+                std::uint8_t mount{};
+                if (!game::read(p.row + 0x8, sort_id) || !game::read(p.row + 0x190, sort_group) ||
+                    !game::read(p.row + 0x241, mount)) continue;
+                const int g = std::min(p.kind, 125);
+                g_shop_layout[target][p.dlc].push_back({p.row, sort_id, static_cast<std::uint8_t>(1 + 2 * g + (mount == 2 ? 0 : 1)),
+                    sort_id, sort_group, 0xFF, 0x8, 0x190});
+            } else if (s == sec_gems && p.equip_type == 4) {
+                std::uint8_t affinity{};
+                if (!game::read(p.row + 0x28, sort_id) || !game::read(p.row + 0x7, sort_group) ||
+                    !game::read(p.row + 0x35, affinity)) continue;
+                g_shop_layout[target][p.dlc].push_back({p.row, sort_id, static_cast<std::uint8_t>(1 + std::min<int>(affinity, 200)),
+                    sort_id, sort_group, 0xFF, 0x28, 0x7});
+            } else if (s == sec_spirits && p.equip_type == 3) {
+                std::int16_t fp{}, hp{};
+                if (!game::read(p.row + 0x20, sort_id) || !game::read(p.row + 0x72, sort_group) ||
+                    !game::read(p.row + 0x80, fp) || !game::read(p.row + 0x82, hp)) continue;
+                const bool hp_cost = hp > 0;
+                const std::int32_t cost = std::max<std::int32_t>(0, hp_cost ? hp : fp);
+                const std::int32_t our_sort = cost * 10000 + (spirit_rank[p.dlc]++ % 10000);
+                g_shop_layout[target][p.dlc].push_back({p.row, our_sort,
+                    static_cast<std::uint8_t>(hp_cost ? 2 : 1), sort_id, sort_group, 0xFF, 0x20, 0x72});
+                // the upgraded rows (+1..+10) have their own goods rows: same place
+                for (int l = 1; l <= p.max_level; ++l) {
+                    const auto it = goods_ids.find(p.equip_id + l);
+                    std::int32_t sid{};
+                    std::uint8_t sgr{};
+                    if (it == goods_ids.end() || !game::read(it->second + 0x20, sid) || !game::read(it->second + 0x72, sgr)) continue;
+                    g_shop_layout[target][p.dlc].push_back({it->second, our_sort,
+                        static_cast<std::uint8_t>(hp_cost ? 2 : 1), sid, sgr, 0xFF, 0x20, 0x72});
+                }
+            } else if ((s == sec_sorceries || s == sec_incantations) && p.equip_type == 3) {
+                std::uint8_t type{};
+                if (!game::read(p.row + 0x20, sort_id) || !game::read(p.row + 0x72, sort_group) ||
+                    !game::read(p.row + 0x3E, type)) continue;
+                const bool support = type == 17 || type == 18;
+                g_shop_layout[target][p.dlc].push_back({p.row, sort_id, static_cast<std::uint8_t>(support ? 2 : 1),
+                    sort_id, sort_group, 0xFF, 0x20, 0x72});
+            }
+        }
+    }
+    std::vector<ShopItem> items;
+    items.reserve(pending.size() + 600);
+    std::int32_t counts[sec_count][2]{};
+    std::int32_t item_counts[sec_count][2]{};
+    int previous_group[sec_count][2];
+    for (auto& row : previous_group) row[0] = row[1] = -1;
+    int groups_in_section[sec_count]{};
+    for (int g = 0; g < kShopGroupCount; ++g) ++groups_in_section[kShopGroups[g].section];
+    for (const ShopPending& p : pending) {
+        const int s = kShopGroups[p.group].section;
+        std::int32_t& n = counts[s][p.dlc];
+        const std::int32_t first = (s * 2 + p.dlc) * kShopRange;
+        if (n >= kShopRange - 2) continue;
+        // No titles (r157-test13: the shop sorts them into a goods group of
+        // their own); with "item type" sorting the game separates groups.
+        previous_group[s][p.dlc] = p.group;
+        items.push_back({first + n++, p.equip_id, p.equip_type, p.price, false, -1, p.price, p.max_level});
+        ++item_counts[s][p.dlc];
+    }
+
+    // The vanilla table and its holder.
+    std::uintptr_t slot{};
+    std::uintptr_t file{};
+    if (!find_param_holder(L"ShopLineupParam", slot) || !game::read(slot, file) || !file) return;
+    std::uint16_t count{};
+    std::uint32_t type_offset32{};
+    std::uint64_t type_offset{}, data_start{};
+    if (!game::read(file + 0x0A, count) || !game::read(file + 0x00, type_offset32) ||
+        !game::read(file + 0x10, type_offset) || !game::read(file + 0x30, data_start)) return;
+    if (data_start != 0x40 + static_cast<std::uint64_t>(count) * 0x18 || type_offset32 != type_offset ||
+        type_offset <= data_start || count + items.size() > 0xFFFF) {
+        state.attempted = true;
+        log(L"Item shop: ShopLineupParam has an unexpected layout; unavailable.");
+        return;
+    }
+    struct Row { std::int32_t id; std::int32_t pad; std::int64_t data; std::int64_t name; };
+    if (count == 0) {
+        state.attempted = true;
+        log(L"Item shop: ShopLineupParam is empty; unavailable.");
+        return;
+    }
+    std::vector<Row> rows(count);
+    if (!game::safe_read(file + 0x40, rows.data(), rows.size() * sizeof(Row))) return;
+    // The merge and the id index need the game's rows in id order.
+    for (std::size_t i = 1; i < rows.size(); ++i)
+        if (rows[i].id <= rows[i - 1].id) {
+            state.attempted = true;
+            log(L"Item shop: ShopLineupParam rows are not in id order; unavailable.");
+            return;
+        }
+    // Our ids: above the table's highest one, on a round number.
+    const std::int64_t highest = rows.back().id;
+    const std::int64_t base64 = ((std::max<std::int64_t>(highest, 9999999) / 1000000) + 1) * 1000000;
+    if (base64 + kShopGroupCount * 2LL * kShopRange >= 0x7FFFFFFF) {
+        state.attempted = true;
+        log(L"Item shop: ShopLineupParam has no free ids; unavailable.");
+        return;
+    }
+    const std::int32_t base = static_cast<std::int32_t>(base64);
+    for (ShopItem& item : items) item.row_id += base;
+    std::int64_t name_offset = rows[0].name;
+    for (const Row& r : rows) {
+        if (r.name != name_offset || r.data < static_cast<std::int64_t>(data_start) ||
+            r.data + 0x34 > static_cast<std::int64_t>(type_offset)) {
+            state.attempted = true;
+            log(L"Item shop: ShopLineupParam rows are not as expected; unavailable.");
+            return;
+        }
+    }
+    // Template rows: one vanilla merchant row per equipType (0-4); the
+    // goods one must be unlimited, the others fall back to it.
+    std::uint8_t templ[5][0x34]{};
+    bool have[5]{};
+    for (const Row& r : rows) {
+        std::uint8_t buffer[0x34]{};
+        if (!game::safe_read(file + r.data, buffer, sizeof(buffer))) continue;
+        std::int16_t quantity{};
+        std::memcpy(&quantity, buffer + 0x14, 2);
+        const std::uint8_t type = buffer[0x17];
+        if (type > 4 || have[type] || (type == 3 && quantity != -1)) continue;
+        std::memcpy(templ[type], buffer, sizeof(buffer));
+        have[type] = true;
+    }
+    const bool have_template = have[3];
+    for (int i = 0; i < 5; ++i)
+        if (!have[i]) std::memcpy(templ[i], templ[3], sizeof(templ[3]));
+    if (!have_template || name_offset < static_cast<std::int64_t>(type_offset)) {
+        state.attempted = true;
+        log(L"Item shop: no template row in ShopLineupParam; unavailable.");
+        return;
+    }
+    // In memory the file is preceded by 16 bytes {u32 size, u32 rows, ...}
+    // and followed, at the next 16-byte boundary after size, by a sorted
+    // index {u32 id, u32 row} that the game's find-row-by-id (0xD4C820 in
+    // 2.7.2.0) binary-searches. Check that the vanilla table has them.
+    std::uint8_t prefix[16]{};
+    std::uint32_t old_size{}, old_index_count{};
+    if (!game::safe_read(file - 16, prefix, sizeof(prefix))) return;
+    std::memcpy(&old_size, prefix, 4);
+    std::memcpy(&old_index_count, prefix + 4, 4);
+    {
+        const std::uintptr_t old_index = file + ((static_cast<std::uintptr_t>(old_size) + 0xF) & ~std::uintptr_t{0xF});
+        std::uint32_t first[2]{}, last[2]{};
+        if (old_index_count != count || old_size < type_offset ||
+            !game::safe_read(old_index, first, 8) || !game::safe_read(old_index + (count - 1) * 8ull, last, 8) ||
+            static_cast<std::int32_t>(first[0]) != rows.front().id ||
+            static_cast<std::int32_t>(last[0]) != rows.back().id) {
+            state.attempted = true;
+            log(L"Item shop: ShopLineupParam has no id index where expected; unavailable.");
+            return;
+        }
+    }
+    const std::uint64_t data_size = type_offset - data_start;
+    const std::uint64_t tail_size = static_cast<std::uint64_t>(name_offset) - type_offset + 4;
+    const std::uint64_t new_count = count + items.size();
+    const std::uint64_t new_data_start = 0x40 + new_count * 0x18;
+    const std::uint64_t new_type_offset = new_data_start + data_size + items.size() * 0x34;
+    const std::uint64_t new_name_offset = new_type_offset + (name_offset - type_offset);
+    const std::uint64_t file_size = new_type_offset + tail_size;
+    const std::uint64_t index_offset = (file_size + 0xF) & ~std::uint64_t{0xF};
+    const std::uint64_t total = 16 + index_offset + new_count * 8 + 16;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!block) return;
+    std::uint8_t* out = block + 16;
+    if (!game::safe_read(file, out, 0x40) ||
+        !game::safe_read(file + data_start, out + new_data_start, data_size) ||
+        !game::safe_read(file + type_offset, out + new_type_offset, tail_size)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return;
+    }
+    // Merge the rows by id (both lists are sorted).
+    std::vector<Row> merged;
+    merged.reserve(new_count);
+    std::size_t a = 0;
+    std::size_t b = 0;
+    std::uint64_t new_row_data = new_data_start + data_size;
+    while (a < rows.size() || b < items.size()) {
+        if (b >= items.size() || (a < rows.size() && rows[a].id < items[b].row_id)) {
+            Row r = rows[a++];
+            r.data = static_cast<std::int64_t>(r.data - data_start + new_data_start);
+            r.name = static_cast<std::int64_t>(new_name_offset);
+            merged.push_back(r);
+        } else {
+            const ShopItem& item = items[b++];
+            std::uint8_t* data = out + new_row_data;
+            std::memcpy(data, templ[item.equip_type <= 4 ? item.equip_type : 3], 0x34);
+            // Nothing else from the template row: runes, one per purchase, no
+            // own name, icon or menu title (audit 2026-11-08: an overhaul
+            // regulation could price a whole type in Dragon Hearts).
+            {
+                const std::uint16_t one_set = 1;
+                const std::int32_t zero32 = 0, minus_one = -1;
+                const float one_f = 1.0f;
+                const std::int16_t minus_one16 = -1;
+                data[0x18] = 0;                          // costType: runes
+                std::memcpy(data + 0x1A, &one_set, 2);   // setNum
+                std::memcpy(data + 0x1C, &zero32, 4);    // value_Add
+                std::memcpy(data + 0x20, &one_f, 4);     // value_Magnification
+                std::memcpy(data + 0x24, &minus_one, 4); // iconId
+                std::memcpy(data + 0x28, &minus_one, 4); // nameMsgId
+                std::memcpy(data + 0x2C, &minus_one, 4); // menuTitleMsgId
+                std::memcpy(data + 0x30, &minus_one16, 2);  // menuIconId
+            }
+            // The shop hides an unlimited (-1) entry of equipment that does
+            // not stack (r157-test5/6: only arrows and one weapon showed), so
+            // weapons other than ammunition, armour, talismans and Ashes of
+            // War are offered one at a time, as most merchants do.
+            const std::int32_t price = item.price;
+            const bool ammo = item.equip_type == 0 && item.equip_id >= 50000000 && item.equip_id < 54000000;
+            const bool single = item.equip_type != 3 && !ammo;
+            const std::int16_t sold_out = 0;
+            const std::int32_t none = -1;
+            const std::int16_t unlimited = -1;
+            const std::uint32_t zero = 0;
+            std::memcpy(data + 0x00, &item.equip_id, 4);
+            std::memcpy(data + 0x04, &price, 4);
+            std::memcpy(data + 0x08, &none, 4);
+            std::memcpy(data + 0x0C, &zero, 4);
+            std::memcpy(data + 0x10, &zero, 4);
+            const std::int16_t one = 1;
+            (void)sold_out;
+            std::memcpy(data + 0x14, item.spacer ? &unlimited : single ? &one : &unlimited, 2);
+            if (item.header >= 0) {
+                const std::int32_t message_id = kShopHeaderMsg + item.header;
+                std::memcpy(data + 0x28, &message_id, 4);  // nameMsgId
+            }
+            data[0x17] = item.equip_type;
+            merged.push_back({item.row_id, 0, static_cast<std::int64_t>(new_row_data), static_cast<std::int64_t>(new_name_offset)});
+            if (!item.spacer && item.header < 0) {
+                const std::int32_t local = item.row_id - base;
+                const int s = local / (2 * kShopRange);
+                const int d = (local / kShopRange) % 2;
+                if (s >= 0 && s < sec_count) {
+                    // arrows and bolts stay at +0 (audit 2026-11-08)
+                    const std::uint8_t kind = item.equip_type == 0 ? (ammo ? 0 : 1) : (s == sec_spirits ? 2 : 0);
+                    g_shop_rows[s][d].push_back({data, item.equip_id, item.sell, kind, item.max_level});
+                }
+            }
+            new_row_data += 0x34;
+        }
+    }
+    std::memcpy(out + 0x40, merged.data(), merged.size() * sizeof(Row));
+    const std::uint16_t count16 = static_cast<std::uint16_t>(new_count);
+    const std::uint32_t type32 = static_cast<std::uint32_t>(new_type_offset);
+    std::memcpy(out + 0x0A, &count16, 2);
+    std::memcpy(out + 0x00, &type32, 4);
+    std::memcpy(out + 0x10, &new_type_offset, 8);
+    std::memcpy(out + 0x30, &new_data_start, 8);
+    // The prefix and the id index (merged is sorted by id).
+    const std::uint32_t size32 = static_cast<std::uint32_t>(file_size);
+    const std::uint32_t count32 = static_cast<std::uint32_t>(new_count);
+    std::memcpy(block, prefix, sizeof(prefix));
+    std::memcpy(block + 0, &size32, 4);
+    std::memcpy(block + 4, &count32, 4);
+    for (std::uint32_t i = 0; i < count32; ++i) {
+        const std::uint32_t entry[2]{static_cast<std::uint32_t>(merged[i].id), i};
+        std::memcpy(out + index_offset + i * 8ull, entry, 8);
+    }
+    // Point the holder at the new table (the old one stays allocated).
+    if (!game::write<std::uintptr_t>(slot, reinterpret_cast<std::uintptr_t>(out))) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        for (auto& section_rows : g_shop_rows) section_rows[0].clear(), section_rows[1].clear();
+        for (auto& section_layout : g_shop_layout) section_layout[0].clear(), section_layout[1].clear();
+        state.attempted = true;
+        log(L"Item shop: ShopLineupParam could not be replaced; unavailable.");
+        return;
+    }
+    g_shop_block_begin = reinterpret_cast<std::uintptr_t>(block);
+    g_shop_block_end = g_shop_block_begin + total;
+    g_shop_table = reinterpret_cast<std::uintptr_t>(out);
+    g_shop_holder = slot;
+    std::int32_t total_items = 0, shops = 0;
+    for (int s = 0; s < sec_count; ++s)
+        for (int d = 0; d < 2; ++d) {
+            state.first[s][d] = base + (s * 2 + d) * kShopRange;
+            state.count[s][d] = counts[s][d];
+            state.items[s][d] = item_counts[s][d];
+            total_items += counts[s][d];
+            if (counts[s][d]) ++shops;
+        }
+    state.ready = true;
+    wchar_t message[300]{};
+    swprintf_s(message, L"Item shop: ShopLineupParam %u -> %llu rows (highest vanilla id %lld, ours from %d); %d rows in %d shops, %zu items; Steam: Shadow of the Erdtree %d, Tarnished Pack %d (%zu add-on items left out).",
+        count, static_cast<unsigned long long>(new_count), static_cast<long long>(highest), base, total_items, shops,
+        pending.size(), owns_sote, owns_tarnished, skipped_dlc);
+    log(message);
+}
+
+// Healing aura (HP/s; Nexus request, Hinir): the Deathbed Dress's aura, as if
+// it were worn, for you and your allies. The dress itself only heals allies
+// within 7 m, 2 HP per second, and not its wearer (wikis; user, 13-11: "it
+// does nothing"). Its effect, SpEffect 6193010 ([Armor] Deathbed Dress, which
+// casts the ally-healing bullet 900), is kept on the player by msa
+// (nt_keep_player_effect_slot, slot 1); the heal it gives, SpEffect 6193012
+// (Deathbed Dress - Heal), gets changeHpPoint (s32 +0xA0, negative heals;
+// Smithbox SpEffect def) scaled from its 2 HP/s to the slider's value, and put
+// back at 0. You get the same HP per second through regen_worker.
+extern "C" std::uint8_t nt_keep_player_effect_slot(std::uint32_t slot, std::int32_t id);
+constexpr std::int32_t kDeathbedAuraEffect = 6193010;
+constexpr std::int32_t kDeathbedHealEffect = 6193012;
+constexpr std::ptrdiff_t kChangeHpPoint = 0xA0;
+constexpr int kDeathbedHpPerSecond = 2;
+struct HealingAuraState {
+    std::int32_t kept{-1};
+    bool pending{};
+    int found{-1};  // -1 not looked up, 0 no rows, 1 rows present
+    std::uintptr_t heal_row{};
+    std::int32_t heal_original{};
+    std::int32_t heal_written{};
+    int generation{-1};  // g_param_appends when heal_row was found
+};
+HealingAuraState g_aura{};
+
+void sync_healing_aura() noexcept {
+    if (g_aura.found < 0 || (g_aura.found == 1 && g_aura.generation != g_param_appends)) {
+        game::ParamTable effects;
+        if (!game::find_param(g_statics, L"SpEffectParam", kSpEffectRowSize, effects, nullptr)) return;
+        const std::uintptr_t aura = param_row_by_id(effects, kDeathbedAuraEffect);
+        const std::uintptr_t heal = param_row_by_id(effects, kDeathbedHealEffect);
+        const bool first = g_aura.found < 0;
+        g_aura.found = aura && heal ? 1 : 0;
+        g_aura.generation = g_param_appends;
+        if (!g_aura.found) {
+            log(L"Healing aura: SpEffect 6193010 / 6193012 not found in this game version.");
+        } else {
+            g_aura.heal_row = heal;
+            std::int32_t points{};
+            game::read(heal + kChangeHpPoint, points);
+            if (first) {
+                g_aura.heal_original = points;
+                g_aura.heal_written = points;
+                wchar_t message[128]{};
+                swprintf_s(message, L"Healing aura: Deathbed Dress heal (SpEffect 6193012) changeHpPoint %d.", points);
+                log(message);
+            } else {
+                g_aura.heal_written = points == g_aura.heal_original ? points : g_aura.heal_written;
+            }
+        }
+    }
+    if (g_aura.found != 1) return;
+    const int hp = value_of(healing_aura);
+    // The dress's own value gives 2 HP/s; scale it to the slider's value.
+    const std::int32_t heal = hp > 0 && g_aura.heal_original < 0
+        ? static_cast<std::int32_t>(std::lround(static_cast<double>(g_aura.heal_original) * hp / kDeathbedHpPerSecond))
+        : g_aura.heal_original;
+    if (heal != g_aura.heal_written && game::write<std::int32_t>(g_aura.heal_row + kChangeHpPoint, heal))
+        g_aura.heal_written = heal;
+    const std::int32_t want = hp > 0 ? kDeathbedAuraEffect : 0;
+    if (want == g_aura.kept && !g_aura.pending) return;
+    g_aura.pending = nt_keep_player_effect_slot(1, want) == 0;
+    g_aura.kept = want;
+    if (!g_aura.pending) {
+        wchar_t message[128]{};
+        if (want) swprintf_s(message, L"Healing aura: %d HP/s for you and allies within 7 m (heal %d).", hp, heal);
+        else swprintf_s(message, L"Healing aura: off.");
+        log(message);
+    }
+}
+
+// Materials found (Nexus request, FozexD): how many of each crafting material
+// a pick-up gives. ItemLotParam_map (gathering spots, corpses, chests) and
+// ItemLotParam_enemy (what enemies drop): lotItemNum01-08 (u8 +0x8A..+0x91;
+// Smithbox ItemLotParam def), only for goods slots (category 1, +0x20 + 4k)
+// whose item is a crafting material (one of the recipes' materials, g_craft).
+// Item drop rate already scales how often enemies drop them.
+struct FoundMaterialsState {
+    bool attempted{};
+    bool ready{};
+    std::vector<std::uintptr_t> slots{};    // address of each lotItemNum to scale
+    std::vector<std::uint8_t> original{};
+    int applied_percent{100};
+};
+FoundMaterialsState g_found{};
+
+void sync_found_materials() noexcept {
+    if (g_found.attempted) return;
+    if (!g_found.ready) {
+        if (!g_craft.ready) {
+            if (g_materials_attempted) g_found.attempted = true;  // no crafting data: nothing to scale
+            return;
+        }
+        std::vector<std::int32_t> materials;
+        for (const std::int32_t id : g_craft.ids)
+            if (id > 0) materials.push_back(id);
+        std::sort(materials.begin(), materials.end());
+        materials.erase(std::unique(materials.begin(), materials.end()), materials.end());
+        for (const wchar_t* lot : {L"ItemLotParam_map", L"ItemLotParam_enemy"}) {
+            game::ParamTable table;
+            if (!game::find_param(g_statics, lot, 0x98, table, nullptr)) {
+                if (!table.file) return;  // not loaded yet: retry
+                g_found.attempted = true;
+                log(L"Materials found: an item lot table has another layout; option disabled.");
+                return;
+            }
+            for (const std::uintptr_t row : table.rows) {
+                std::int32_t ids[8]{}, categories[8]{};
+                std::uint8_t counts[8]{};
+                if (!game::safe_read(row, ids, sizeof(ids)) || !game::safe_read(row + 0x20, categories, sizeof(categories)) ||
+                    !game::safe_read(row + 0x8A, counts, sizeof(counts)))
+                    continue;
+                for (int k = 0; k < 8; ++k) {
+                    if (categories[k] != 1 || ids[k] <= 0 || !counts[k] ||
+                        !std::binary_search(materials.begin(), materials.end(), ids[k]))
+                        continue;
+                    g_found.slots.push_back(row + 0x8A + k);
+                    g_found.original.push_back(counts[k]);
+                }
+            }
+        }
+        g_found.ready = true;
+        wchar_t message[128]{};
+        swprintf_s(message, L"Materials found: %zu item lot slots with crafting materials (%zu materials).",
+            g_found.slots.size(), materials.size());
+        log(message);
+    }
+    const int percent = value_of(materials_found);
+    if (percent == g_found.applied_percent) return;
+    for (std::size_t i = 0; i < g_found.slots.size(); ++i) {
+        const auto scaled = static_cast<std::int64_t>(g_found.original[i]) * percent / 100;
+        game::write<std::uint8_t>(g_found.slots[i], static_cast<std::uint8_t>(std::clamp<std::int64_t>(scaled, 1, 255)));
+    }
+    g_found.applied_percent = percent;
+}
+
 bool all_params_ready() noexcept {
     for (const auto& state : g_param_states)
         if (!state.ready && !state.attempted) return false;
     return (g_loot.ready || g_loot.attempted) && (g_travel.ready || g_travel.attempted) &&
         (g_buffs.ready || g_buffs.attempted) && (g_buddy.ready || g_buddy.attempted) &&
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
-        (g_flasks.ready || g_flasks.attempted) && g_materials_attempted &&
+        (g_flasks.ready || g_flasks.attempted) && g_materials_attempted && (g_found.ready || g_found.attempted) &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_projectile_range.ready || g_projectile_range.attempted) && (g_charm.ready || g_charm.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
+        (g_ng_poise.ready || g_ng_poise.attempted) && (g_drop_any.ready || g_drop_any.attempted) &&
+        (g_item_shop.ready || g_item_shop.attempted) &&
+        (g_damage_cut.attempted || (g_damage_cut.ready && !g_damage_cut.keep_pending)) && !g_aura.pending &&
+        (!g_item_shop.ready || g_talk_registered || g_talk_tries > 20) &&
         (g_clean.ready || g_clean.attempted) && (g_buff_vfx.ready || g_buff_vfx.attempted) &&
         (g_item_use_vfx.ready || g_item_use_vfx.attempted) &&
         (g_weapon_item_use_vfx.ready || g_weapon_item_use_vfx.attempted) &&
@@ -4526,6 +6968,14 @@ DWORD WINAPI param_worker(void*) noexcept {
         // World difficulty follows the loaded save's cycle, so it polls while on.
         WaitForSingleObject(g_param_event, all_params_ready() && !journey_wanted() ? INFINITE : 2000);
         loop.resume();
+        // Before anything reads ShopLineupParam: the item shop replaces the table.
+        sync_item_shop();
+        if (!g_item_shop.ready && !g_item_shop.attempted) continue;
+        if (g_item_shop.ready) register_item_shop_talk();
+        // Before anything keeps SpEffectParam row pointers: it adds a row.
+        sync_damage_cut();
+        if (!g_damage_cut.ready && !g_damage_cut.attempted) continue;
+        sync_healing_aura();
         // First, so it classifies SpEffects before any buildup slider rescales them.
         sync_weapon_effects();
         sync_params();
@@ -4539,6 +6989,8 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_charm();
         sync_charged_launch();
         sync_journey();
+        sync_ng_poise();
+        sync_drop_any();
         sync_clean();
         sync_buff_vfx(g_buff_vfx, 1, hide_buff_effects, L"self buff");
         sync_item_use_vfx(g_item_use_vfx, g_buffs.hidden_ids, hide_buff_effects, L"buff");
@@ -4549,6 +7001,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_ghost_npc();
         sync_flasks();
         sync_materials();
+        sync_found_materials();
         sync_helmet();
     }
 }
@@ -4686,7 +7139,17 @@ std::wstring describe_ids(std::size_t category) {
 // The sliders that apply on top of a category or to animations outside them.
 bool per_action_extra_speed() noexcept {
     return value_of(speed_sprint) != 100 || value_of(speed_walk) != 100 ||
-        value_of(speed_run) != 100 || value_of(speed_interact) != 100;
+        value_of(speed_run) != 100 || value_of(speed_interact) != 100 || value_of(speed_skill) != 100;
+}
+
+// Weapon skills (Ashes of War and unique skills): each has its own animation
+// section, a600-a999 (data/animations.json: the 40000-49999 attacks live there;
+// normal attacks are in the weapon sections a020-a062, spells in a4xx). Skill
+// speed replaces Attack speed (or Spell speed) on them, so the slider changes
+// skills only (Nexus request, toarai).
+bool is_skill(std::int32_t anim) noexcept {
+    const std::int32_t section = anim / 1000000;
+    return section >= 600 && section <= 999;
 }
 
 bool speed_active() noexcept {
@@ -4773,7 +7236,8 @@ DWORD WINAPI speed_worker(void*) noexcept {
             const int key = anim >= 0 ? anim % 1000000 : -1;
             const bool interaction = key >= 0 && is_interaction(key);
             const int c = key >= 0 && !interaction ? anim_category(key) : -1;
-            if (c >= 0) percent = percent * value_of(kSpeedIds[c]) / 100.0f;
+            if (anim >= 0 && is_skill(anim)) percent = percent * value_of(speed_skill) / 100.0f;
+            else if (c >= 0) percent = percent * value_of(kSpeedIds[c]) / 100.0f;
             if (c == kMoveCategory && is_sprint(key)) percent = percent * value_of(speed_sprint) / 100.0f;
             if (c == kMoveCategory && is_walk(key)) percent = percent * value_of(speed_walk) / 100.0f;
             if (c == kMoveCategory && is_run(key)) percent = percent * value_of(speed_run) / 100.0f;
@@ -5936,7 +8400,9 @@ DWORD WINAPI regen_worker(void*) noexcept {
     perf::Loop loop(L"regen");
     for (;;) {
         loop.sleep(100);
-        const int flat[3]{value_of(hp_regen_points), value_of(fp_regen_points), value_of(stamina_regen_points)};
+        // Healing aura heals you too, the same HP per second (the dress alone does not).
+        const int flat[3]{value_of(hp_regen_points) + value_of(healing_aura), value_of(fp_regen_points),
+            value_of(stamina_regen_points)};
         const int maximum_percent[3]{value_of(max_hp), value_of(max_fp), value_of(max_stamina)};
         // Free skills (cost 0%): the game only runs a skill's full version with
         // FP above 0, so the bar is held at 1 at least (too little for spells).
@@ -6348,6 +8814,15 @@ void apply(Id id) noexcept {
     case camera_reset_off: set_site(g_camera_reset, on(id)); break;
     case vignette_off: set_site(g_vignette, on(id)); break;
     case sharpen_off: set_site(g_sharpen, on(id)); break;
+    case map_in_combat:
+        set_site(g_map_combat_open, on(id));
+        set_site(g_map_combat_close, on(id));
+        break;
+    case craft_in_combat:
+        set_site(g_craft_combat, on(id));
+        set_site(g_craft_combat_flag, on(id));
+        set_site(g_craft_combat_menu, on(id));
+        break;
     case chromatic_off: set_site(g_chromatic, on(id)); break;
     case animation_distance: set_site(g_animation, on(id)); break;
     case rune_loss_off: set_site(g_rune_loss, on(id)); break;
@@ -6394,7 +8869,7 @@ void apply(Id id) noexcept {
         break;
     }
     case ultrawide: set_site(g_ultrawide, on(id)); break;
-    case ash_multiple: case ash_max_active: case ash_extra_cost: case ash_damage_per_ash: case ash_repeat: {
+    case ash_multiple: case ash_extra_cost: case ash_damage_per_ash: case ash_repeat: {
         spirit_ashes::update(spirit_ash_settings());
         const bool shared = on(ash_multiple) && g_spirit_ashes_started && build_buddy_slot_search();
         const bool start = set_site(g_buddy_slot_start, shared);
@@ -6408,6 +8883,9 @@ void apply(Id id) noexcept {
         }
         break;
     }
+    case ash_free_fighting:
+        spirit_ashes::set_free_fighting(static_cast<std::uint8_t>(std::clamp(value_of(id), 0, 2)));
+        break;
     case ash_dismiss_all:
         // A button: act, then back to off (option_changed / set_option_raw
         // refresh the row).
@@ -6423,6 +8901,7 @@ void apply(Id id) noexcept {
         }
         g_options[id].value = 0;
         break;
+    case shop_weapon_level: case shop_spirit_level: case shop_item_price: break;  // read when a shop opens
     case open_mirror: case open_level_up: case open_rebirth:
         // Buttons like Dismiss all: the screen opens on the next game frame
         // (talk-script commands, msa\src\game_menus.rs).
@@ -6437,7 +8916,7 @@ void apply(Id id) noexcept {
         g_options[id].value = 0;
         break;
     case skip_intro: set_site(g_intro, on(id)); break;
-    case dialog_yes_default: g_dialog_yes_data->on = on(id) ? 1 : 0; break;
+    case dialog_yes_default: if (g_dialog_yes_data) g_dialog_yes_data->on = on(id) ? 1 : 0; break;
     case extended_ranges: break;  // read when the game starts (it shapes the menu)
     case highlight_changed:
         if (g_set_highlight) (void)g_set_highlight(on(id) ? 1u : 0u);
@@ -6452,7 +8931,40 @@ void apply(Id id) noexcept {
         send_hud_layout(L"option changed");
         break;
     case aa_off: case motion_blur_off: case dof_off: break;  // window_option_worker keeps them in sync.
+    case npc_spawner: break;  // read once at startup (start_npc_spawner)
+    case healing_aura:  // param_worker (sync_healing_aura)
+    case materials_found:  // param_worker (sync_found_materials)
+        if (g_param_event) SetEvent(g_param_event);
+        break;
+    case keep_bodies:
+        if (on(id) && !install_keep_bodies()) break;
+        g_keep_bodies_on = on(id) ? 1 : 0;
+        if (g_keep_bodies_hooked) {
+            wchar_t message[128]{};
+            swprintf_s(message, L"Keep bodies %s (%ld bodies kept so far).", on(id) ? L"on" : L"off",
+                g_bodies_kept);
+            log(message);
+        }
+        break;
+    case ragdoll_death:
+        if (g_ragdoll_event) {
+            g_ragdoll_on = on(id) ? 1 : 0;
+            wchar_t message[128]{};
+            swprintf_s(message, L"Ragdoll on death %s (%ld deaths so far).", on(id) ? L"on" : L"off",
+                g_ragdoll_count);
+            log(message);
+        }
+        break;
     case status_immunity: break;  // status_worker
+    case camera_shake_off:
+        if (g_camera_shake) {
+            g_camera_shake->on = on(id) ? 1u : 0u;
+            wchar_t message[128]{};
+            swprintf_s(message, L"Disable camera shake %s (%u rumbles blocked so far).",
+                on(id) ? L"on" : L"off", static_cast<unsigned>(g_camera_shake->blocked));
+            log(message);
+        }
+        break;
     case set_time: case time_hour: case freeze_time: break;  // time_worker
     case set_weather: case weather_type: break;  // weather_worker
     case torrent_speed: case torrent_jump_speed: break;  // jump_worker
@@ -6491,6 +9003,7 @@ void apply(Id id) noexcept {
     case charged_launch: case launch_all: case launch_distance:
     case world_journey: case journey_keep_runes: case boss_hp:
     case clean_characters: case hide_buff_effects: case hide_weapon_buff_effects: case solid_ashes:
+    case ng_poise: case drop_any: case drop_key_items: case one_hit_kill:
         if (g_param_event) SetEvent(g_param_event);
         break;
     case skill_fp_cost:
@@ -6512,6 +9025,8 @@ bool available(Id id) noexcept {
     case camera_reset_off: return g_camera_reset.ready;
     case vignette_off: return g_vignette.ready;
     case sharpen_off: return g_sharpen.ready;
+    case craft_in_combat: return g_craft_combat.ready && g_craft_combat_flag.ready && g_craft_combat_menu.ready;
+    case map_in_combat: return g_map_combat_open.ready && g_map_combat_close.ready;
     case chromatic_off: return g_chromatic.ready;
     case animation_distance: return g_animation.ready;
     case rune_loss_off: return g_rune_loss.ready;
@@ -6519,20 +9034,21 @@ bool available(Id id) noexcept {
     case pause_key: return g_pause.ready;
     case fps_unlock: case fps_limit: return g_frametime.ready && g_fullscreen_cap.ready;
     case ultrawide: return g_ultrawide.ready;
-    case ash_multiple: case ash_max_active: case ash_dismiss_all: case ash_extra_cost: case ash_damage_per_ash:
-    case ash_repeat:
+    case ash_multiple: case ash_dismiss_all: case ash_extra_cost: case ash_damage_per_ash:
+    case ash_repeat: case ash_free_fighting:
         return g_spirit_ashes_started;
     case refresh_rate: return g_fullscreen_cap.ready;
     case skip_intro: return g_intro.ready;
-    case open_mirror: case open_level_up: case open_rebirth: case summon_melina: case melina_companion:
+    case open_mirror: case open_level_up: case open_rebirth:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man;
+    case summon_melina: case melina_companion: return false;  // work in progress, separate mod
     case dialog_yes_default: return g_dialog_yes_data != nullptr;
     case extended_ranges: case highlight_changed: return !g_config_path.empty();
     case enemies_downed_vulnerable:
         return (g_downed != nullptr || g_downed_site != nullptr) && g_statics.layout_2_7_1 &&
             g_statics.world_chr_man;
     case hud_screen_edges: case hud_scale: case menu_edges: return hud_layout_available();
-    case aa_off: case motion_blur_off: case dof_off: return g_window_slot != nullptr;
+    case aa_off: case motion_blur_off: case dof_off: return g_window_slot != nullptr && g_statics.layout_2_7_1;
     // Param tables load with the regulation file, after the menu is built; the
     // row-size check on load disables a table whose layout does not match.
     case camera_distance:
@@ -6563,6 +9079,18 @@ bool available(Id id) noexcept {
     case hide_weapon_buff_effects:
         return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_weapon_buff_vfx.attempted;
     case solid_ashes: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_ghost.attempted;
+    case ng_poise: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_ng_poise.attempted;
+    case camera_shake_off: return g_camera_shake != nullptr;
+    case ragdoll_death: return g_ragdoll_event != nullptr;
+    case keep_bodies: return g_timed_fade_site != nullptr;
+    case healing_aura: return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_aura.found != 0;
+    case materials_found: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_found.attempted;
+    case one_hit_kill: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_damage_cut.attempted;
+    case shop_weapon_level: case shop_spirit_level: case shop_item_price: return g_item_gib != nullptr;
+    case npc_spawner: return g_npc_spawner_built_in && !g_npc_spawner_standalone;
+    case drop_any: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_drop_any.attempted;
+    case drop_key_items:
+        return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_drop_any.attempted;
     case solid_ghosts: return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case player_clean:
         return g_statics.layout_2_7_1 && g_statics.world_chr_man && g_statics.regulation_manager;
@@ -6573,7 +9101,7 @@ bool available(Id id) noexcept {
     case max_hp: case max_fp: case max_stamina:
     case hp_regen_points: case fp_regen_points: case stamina_regen_points:
     case speed_global: case speed_attack: case speed_spell: case speed_roll: case speed_move:
-    case speed_jump: case speed_item: case speed_sprint: case speed_walk: case speed_run: case speed_interact:
+    case speed_jump: case speed_item: case speed_sprint: case speed_walk: case speed_run: case speed_interact: case speed_skill:
     case interaction_objects:
     case enemy_speed: case no_fall_damage:
     case status_immunity:
@@ -6649,6 +9177,16 @@ DWORD WINAPI save_worker(void*) noexcept {
     const std::size_t total = g_extended ? count + std::size(g_scales) : count;
     int written[count + std::size(g_scales)]{};
     bool known[count + std::size(g_scales)]{};
+    // What the INI already holds counts as written, so the first save only
+    // writes what changed (audit 2026-11-08: it rewrote about 200 keys).
+    constexpr int kMissing = INT_MIN + 7;
+    for (std::size_t i = 0; i < total && !g_config_path.empty(); ++i) {
+        const bool is_scale = i >= count;
+        const wchar_t* const key = is_scale ? g_scales[i - count].key : g_options[i].key;
+        const wchar_t* const section = !is_scale && g_options[i].general ? L"General" : L"Vanilla";
+        const int stored = static_cast<int>(GetPrivateProfileIntW(section, key, kMissing, g_config_path.c_str()));
+        if (stored != kMissing) written[i] = stored, known[i] = true;
+    }
     perf::Loop loop(L"save");
     for (;;) {
         loop.pause();
@@ -6705,7 +9243,9 @@ void ERUI_CALL named_slider_changed(void* target, const ERUI_CustomSliderChangeC
     request_save();
 }
 
-bool is_named(Id i) noexcept { return i == weather_type || i == charged_launch || i == world_journey; }
+bool is_named(Id i) noexcept {
+    return i == weather_type || i == charged_launch || i == world_journey || i == ash_free_fighting;
+}
 
 // Fork export (r115) that colours labels away from their default; null when
 // ERNativeUI lacks it or the highlight is off.
@@ -6789,6 +9329,7 @@ void ERUI_CALL scale_changed(void* target, const ERUI_CustomSliderChangeContext*
 }
 
 void restore_option(Id i) noexcept {
+    if (!available(i)) return;
     auto& option = g_options[i];
     option.value = option.fallback;
     Scale* const scale = scale_of(i);
@@ -7396,6 +9937,143 @@ void collect_chr(std::uintptr_t chr, void* context) noexcept {
     }
 }
 
+// Keep bodies: 6 s after a body is kept, it is frozen (ChrIns debug flags
+// +0x538 bit 8, disabled_updates) and gets the model parts it had alive, once
+// (putting them back every frame fought the game, NPC Spawner found). Only
+// characters still loaded are touched; the others are forgotten.
+DWORD WINAPI bodies_worker(void*) noexcept {
+    constexpr ULONGLONG kSettleMs = 6000;
+    std::vector<std::uintptr_t> loaded{};
+    int logged = 0;
+    for (;;) {
+        Sleep(250);
+        try {
+            if (!g_keep_bodies_on || g_bodies_pending <= 0) continue;
+            loaded.clear();
+            game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
+            std::sort(loaded.begin(), loaded.end());
+            const ULONGLONG now = GetTickCount64();
+            AcquireSRWLockExclusive(&g_seen_alive_lock);
+            for (auto it = g_seen_alive.begin(); it != g_seen_alive.end();) {
+                BodyState& state = it->second;
+                if (!state.dead_since || state.settled) {
+                    ++it;
+                    continue;
+                }
+                const std::uintptr_t chr = it->first;
+                if (!std::binary_search(loaded.begin(), loaded.end(), chr)) {
+                    InterlockedDecrement(&g_bodies_pending);
+                    it = g_seen_alive.erase(it);
+                    continue;
+                }
+                if (now - state.dead_since >= kSettleMs) {
+                    std::uint8_t flags{};
+                    if (game::read(chr + 0x539, flags)) game::write<std::uint8_t>(chr + 0x539, flags | 0x01);
+                    const bool parts = state.mask_known && restore_model_parts(chr, state.alive_mask);
+                    state.settled = true;
+                    InterlockedDecrement(&g_bodies_pending);
+                    if (logged < 40) {
+                        ++logged;
+                        std::int32_t model{-1};
+                        game::read(chr + 0x64, model);
+                        wchar_t message[128]{};
+                        swprintf_s(message, L"Keep bodies: c%04d frozen in place%ls.", model,
+                            parts ? L", its model parts put back" : L"");
+                        log(message);
+                    }
+                }
+                ++it;
+            }
+            ReleaseSRWLockExclusive(&g_seen_alive_lock);
+        } catch (...) {
+        }
+    }
+}
+
+// Characters at the health limit get a bar drawn against their real maximum.
+// The game keeps recalculating max_uncapped_hp from base_hp (+0x144), so writing
+// only the former made the bar flicker. Both are lowered once per character, by
+// the ratio that brings max_uncapped_hp down to the limit: a second pass would
+// lower base_hp again, as the game can take seconds to recalculate.
+// Only while a health slider is moved: the game's rates alone stay far below it.
+DWORD WINAPI health_limit_worker(void*) noexcept {
+    std::set<std::uintptr_t> applied;
+    std::vector<std::uintptr_t> loaded;
+    for (;;) {
+        Sleep(250);
+        if (value_of(enemy_hp) == 100 && value_of(boss_hp) == 100) continue;
+        try {
+            loaded.clear();
+            game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
+            // sorted once, so forgetting unloaded characters is not quadratic
+            std::sort(loaded.begin(), loaded.end());
+            for (auto it = applied.begin(); it != applied.end();)
+                it = std::binary_search(loaded.begin(), loaded.end(), *it) ? std::next(it) : applied.erase(it);
+            for (const std::uintptr_t chr : loaded) {
+                EnemyState s{};
+                std::int32_t uncapped{}, base{};
+                if (applied.count(chr) || !read_enemy(chr, s) || s.hp_max != kMaxCharacterHp ||
+                    !game::read(s.data + 0x140, uncapped) || !game::read(s.data + 0x144, base) ||
+                    uncapped <= kMaxCharacterHp || base <= 0)
+                    continue;
+                const auto lowered = std::max(static_cast<std::int32_t>(
+                    static_cast<std::int64_t>(base) * kMaxCharacterHp / uncapped), 1);
+                game::write(s.data + 0x144, lowered);
+                game::write(s.data + 0x140, kMaxCharacterHp);
+                applied.insert(chr);
+                if (g_diagnostics) {
+                    wchar_t message[160]{};
+                    swprintf_s(message, L"Health limit: NpcParam %d HP %d/%d uncapped %d: base %d -> %d.",
+                        s.npc_param, s.hp, s.hp_max, uncapped, base, lowered);
+                    log(message);
+                }
+            }
+        } catch (...) {
+        }
+    }
+}
+
+// Log file only: the real health of loaded bosses and of anything with a lot of
+// health, to compare with the "Boss health:" line of sync_params. Logs each
+// character once, then when its maximum changes or its health reaches 0.
+DWORD WINAPI boss_health_log_worker(void*) noexcept {
+    struct Seen { std::int32_t hp, hp_max; };
+    std::map<std::uintptr_t, Seen> seen;
+    std::vector<std::uintptr_t> loaded;
+    for (;;) {
+        Sleep(500);
+        try {
+            loaded.clear();
+            game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
+            // forget unloaded characters: the map no longer grows all session
+            std::sort(loaded.begin(), loaded.end());
+            for (auto it = seen.begin(); it != seen.end();)
+                it = std::binary_search(loaded.begin(), loaded.end(), it->first) ? std::next(it) : seen.erase(it);
+            for (const std::uintptr_t chr : loaded) {
+                EnemyState s{};
+                if (!read_enemy(chr, s) || (s.team >= 1 && s.team <= 5)) continue;
+                if (s.team != 7 && s.hp_max < 5000 && s.hp_max >= 0) continue;
+                const auto found = seen.find(chr);
+                const wchar_t* event{};
+                if (found == seen.end()) event = L"loaded";
+                else if (found->second.hp_max != s.hp_max) event = L"maximum changed";
+                else if (found->second.hp > 0 && s.hp <= 0) event = L"health reached 0";
+                if (event) {
+                    std::int32_t uncapped{};
+                    game::read(s.data + 0x140, uncapped);
+                    wchar_t message[180]{};
+                    swprintf_s(message, L"Boss health live: NpcParam %d team %u HP %d/%d uncapped %d (was %d/%d): %ls.",
+                        s.npc_param, s.team, s.hp, s.hp_max, uncapped, found == seen.end() ? 0 : found->second.hp,
+                        found == seen.end() ? 0 : found->second.hp_max, event);
+                    log(message);
+                }
+                seen[chr] = {s.hp, s.hp_max};
+            }
+        } catch (...) {
+        }
+    }
+}
+
 // What decides a character's outcome in the pass and changes while it is
 // loaded: map handle (+0x08, selector and block), death flag (+0x1C5) and HP.
 // A character whose signature is unchanged since the last pass gave the same
@@ -7906,7 +10584,8 @@ DWORD WINAPI ghost_worker(void*) noexcept {
             for (const std::uintptr_t chr : loaded) {
                 std::int32_t look{}, npc_param{}, type{};
                 std::uint8_t team{};
-                if (chr != player && game::read(chr + 0x6C, team) && (team == 2 || team == 8 || team == 12 ||
+                // diagnostics only: extra reads and up to 60 lines (audit 2026-11-08)
+                if (g_diagnostics && chr != player && game::read(chr + 0x6C, team) && (team == 2 || team == 8 || team == 12 ||
                     team == 26 || team == 27 || team == 28 || team == 47) && game::read(chr + 0x60, npc_param) &&
                     game::read(chr + kChrType, type) && game::read(chr + kPhantomOverride, look) &&
                     allies_logged.size() < 60 && allies_logged.insert({npc_param, type, team}).second) {
@@ -8191,7 +10870,7 @@ struct Text { const wchar_t* label; const wchar_t* help; };
 enum Category : std::size_t {
     cat_survival, cat_equipment, cat_resources, cat_movement, cat_defense, cat_torrent, cat_dealt, cat_taken, cat_poise,
     cat_status, cat_weapon, cat_buffs, cat_enemies, cat_spirits, cat_runes, cat_map, cat_world, cat_camera,
-    cat_image, cat_display, cat_interface, cat_count
+    cat_image, cat_display, cat_interface, cat_item_shop, cat_count
 };
 
 // Option texts follow the order of Id. Options marked (beta) depend on game
@@ -8229,6 +10908,7 @@ const Texts kEnglish{
         {L"Image", L"Post-processing and level of detail."},
         {L"Display", L"Frame rate, refresh rate and aspect ratio."},
         {L"Interface & System", L"HUD and menu layout, pause, startup logos and Yes/No dialogs."},
+        {L"Item Shop", L"Every item you can obtain, sorted by type, in a shop that opens from the talk menu (F11 > Item Shop). Set its upgrade level and price here or in Shop settings inside that menu."},
     },
     {
         {L"Custom field of view", L"Scale the game's field of view. Applies instantly."},
@@ -8253,14 +10933,14 @@ const Texts kEnglish{
         {L"Infinite poise", L"Normal hits never stagger you. Applies at once, with or without armour. Grabs still work."},
         {L"No fall damage", L"Falls never hurt or kill you or Torrent, whatever the height, on foot or riding. In bottomless pits you keep falling."},
         {L"Status immunity", L"Poison, rot, bleed, blight, frost, sleep and madness never build up on you, not even from one big hit. An effect already running when you turn it on still wears off as usual. Enemies are unaffected."},
-        {L"Damage dealt (%)", L"Scales your attacks and spells. Applies from the next hit."},
-        {L"Damage taken (%)", L"Scales enemy attacks. Also affects attacks between NPCs and from spirit ashes."},
+        {L"Damage dealt (%)", L"Scales your attacks and spells. Only you: humanoid NPCs and invaders, who use the same attacks as players, keep theirs. Applies from the next hit."},
+        {L"Damage taken (%)", L"Scales the damage you take from enemies, humanoid NPCs and invaders included. Only you: attacks between NPCs and on your spirit ashes do not change."},
         {L"Poise damage dealt (%)", L"Scales the poise damage of your attacks, weapons and spells: how fast they stagger enemies and break their stance. Applies to your next hit."},
         {L"Poise damage taken (%)", L"Scales the poise damage of enemy attacks: how fast they stagger you. Also affects NPCs and spirit ashes. Applies to the next hit."},
         {L"Stamina cost (%)", L"Scales the stamina used by your attacks and actions."},
         {L"Spell FP cost (%)", L"Scales the FP cost of sorceries and incantations."},
         {L"Status buildup (%)", L"Poison, rot, bleed, blight, frost, sleep and madness. Applies to everyone, you included."},
-        {L"One-hit kills", L"Your hits defeat enemies instantly."},
+        {L"One-hit kills", L"Your hits that deal damage defeat enemies instantly (a push or rolling into them does not)."},
         {L"Weapon buff duration (%)", L"Greases and weapon enchantments. Applies to the next buff you cast or use."},
         {L"Self buff duration (%)", L"Buff spells and incantations, boluses and other timed effects on you and your allies. Applies to the next one."},
         {L"Enemy debuff duration (%)", L"Timed effects aimed at enemies, such as defence reductions. Also affects enemy debuffs on you."},
@@ -8296,7 +10976,6 @@ const Texts kEnglish{
         {L"Resummon without resting", L"After a spirit falls you can call it again without resting at a grace. Turning it off restores the usual limit."},
         {L"Summon anywhere", L"Every summoning monument reaches across its whole area, so you can summon wherever the game allows spirits, and ashes are no longer dismissed for walking away from it. Turning it off restores the usual reach."},
         {L"Several ashes at once", L"Multiple Spirit Ashes, built in. Using a different spirit ash keeps the ones already summoned, each paying its FP; using a summoned ash's item again dismisses only that one with a short fade, even with too little FP. No confirmations appear, summoned ashes follow you into new areas and through doors, and each gets a compact row with its name and HP on the HUD (up to 7). The HUD only changes after restarting the game: the rows appear if the option is on when the game starts, otherwise the game's own spirit panel stays (going back to the title screen is not enough). Off, summoning works as in the base game."},
-        {L"Most ashes at once", L"How many spirit ashes can be summoned together with Several ashes at once. A summon with several spirits counts as one. The HUD shows up to 6; many ashes can lower performance."},
         {L"Ashes stay after a boss falls", L"Monuments tied to a boss no longer dismiss your spirit ashes when it dies, and stay usable afterwards, also in arenas of bosses you already beat. Applies after the area reloads (rest at a grace)."},
         {L"Dismiss all ashes", L"With Several ashes at once, dismisses every summoned spirit ash with a short fade. Works as a button; it can also be bound to a key in [Hotkeys] of NativeTweaks.ini (SpiritDismissAll = F5)."},
         {L"Cost of extra ashes (%)", L"With Several ashes at once, the FP each ash costs when another one is already summoned, in % of its own cost. 100% is the normal cost; the first ash always costs it."},
@@ -8336,7 +11015,7 @@ const Texts kEnglish{
         {L"Knockback dealt (%)", L"How far your hits push enemies. Applies from the next hit."},
         {L"Knockback taken (%)", L"How far enemy hits push you. Also affects NPCs and spirit ashes."},
         {L"Effects on enemy attacks too", L"Enemies, NPCs and spirit ashes also apply the weapon effects turned on above. Makes the game harder."},
-        {L"Remove enemy immunities", L"Enemies immune to poison, rot, bleed, frostbite or sleep get a typical resistance instead. Madness and death blight still only affect player-type characters. Applies to enemies loaded afterwards: rest at a grace."},
+        {L"Remove enemy immunities", L"Enemies immune to poison, rot, bleed, frostbite or sleep get a typical resistance instead, also those whose immunity comes from a built-in effect, such as gargoyles and Erdtree Avatars. Madness and death blight still only affect player-type characters. Applies to enemies loaded afterwards: rest at a grace."},
         {L"Crimson flask healing (%)", L"Scales the HP restored by the Flask of Crimson Tears, at every upgrade level. 0% heals nothing."},
         {L"Cerulean flask FP (%)", L"Scales the FP restored by the Flask of Cerulean Tears, at every upgrade level. 0% restores nothing."},
         {L"Spell stamina cost (%)", L"Scales the stamina used by sorceries and incantations, charged casts included."},
@@ -8345,7 +11024,7 @@ const Texts kEnglish{
         {L"Skill FP cost (%)", L"Scales the FP used by Ashes of War, charged stages and follow-ups included. 0% makes them free and keeps at least 1 FP, which the game needs for the full skill."},
         {L"Carry up to 999 of each item", L"Stackable items hold 999 on you and in the chest. Unique items (key items, whistle, flasks) are unchanged."},
         {L"Item use speed (%)", L"Drinking flasks, using consumables and picking up items. Multiplies the overall speed."},
-        {L"Shop prices (%)", L"Scales what merchants and other shops charge, in runes or in items such as Dragon Hearts. 0% makes everything free. Trades for remembrances still need them. Applies the next time you open a shop."},
+        {L"Merchant prices (%)", L"Scales what merchants and other shops charge, in runes or in items such as Dragon Hearts. Items never cost less than they sell for, because the game would hide them, so 0% only makes free what cannot be sold. Trades for remembrances still need them. Applies the next time you open a shop."},
         {L"Craft without materials", L"Crafting recipes need no materials. You still need the cookbook and the crafting kit. Turning it off restores the usual materials."},
         {L"Weapon stat requirements (%)", L"Scales the Strength, Dexterity, Intelligence, Faith and Arcane needed to wield weapons, shields, staves and seals. 0% removes them. Re-equip your weapon to refresh it."},
         {L"Upgrade without materials", L"Upgrading weapons (smithing and somber stones) and spirit ashes (glovewort) needs no materials. Runes are still charged unless Upgrade cost is 0%. Turning it off restores the usual materials."},
@@ -8370,7 +11049,7 @@ const Texts kEnglish{
         {L"No lock-on", L"You cannot lock on to enemies or other characters, and a lock you hold is released. Applies at once."},
         {L"Break poise in one hit", L"Every hit of yours staggers enemies and breaks the stance of bosses that can be broken. Applies from your next hit and overrides Poise damage dealt."},
         {L"Instant status effects", L"Any hit that builds up poison, rot, bleed, death blight, frost, sleep or madness triggers it at once, for everyone: you, enemies and spirit ashes. Overrides the buildup sliders; with Status immunity it only affects others."},
-        {L"Die in one hit", L"Any enemy hit that deals damage kills you. Hits between enemies and from your spirit ashes share this data, so they kill in one hit too. Overrides Damage taken; God mode still protects you."},
+        {L"Die in one hit", L"Any hit that deals damage kills you, from enemies, humanoid NPCs and invaders alike. Only you: enemies and your spirit ashes keep their health. Overrides Damage taken; God mode still protects you."},
         {L"Enemies break your poise in one hit", L"Every enemy hit staggers you. Your spirit ashes share this data and also break enemies' poise in one hit. Overrides Poise damage taken."},
         {L"Charged attacks launch enemies", L"Your charged heavy attacks throw enemies through the air instead of staggering them: back, far back or upward. It works with their poise intact. Enemies already on the ground, large enemies and bosses have no throw and keep their own reaction. Far back throws best; Launch distance below sets how far. Applies from your next hit."},
         {L"Every attack launches", L"With the option above on, every attack of yours that makes enemies react throws them the same way, not only charged heavy attacks: light and heavy attacks, skills, spells and thrown items."},
@@ -8379,7 +11058,7 @@ const Texts kEnglish{
         {L"Keep your runes", L"With World difficulty on, enemies give the runes of your save's own cycle instead of the harder cycle's."},
         {L"Open the mirror", L"Opens the appearance screen of the Roundtable Hold mirror. Use it out of combat."},
         {L"Rebirth", L"Opens Rennala's rebirth screen to reallocate your attributes. No Larval Tear needed. Use it out of combat."},
-        {L"Boss health (%)", L"Scales the health of bosses only: main, field, dungeon and DLC bosses. Multiplies Enemy health, so with Enemy health at 100% only bosses change. Applies to bosses loaded afterwards: rest at a grace."},
+        {L"Boss health (%)", L"Scales the health of bosses only: main, field, dungeon and DLC bosses. Multiplies Enemy health, so with Enemy health at 100% only bosses change. Applies to bosses loaded afterwards: rest at a grace. The game stops health at 524287, so going higher adds nothing."},
         {L"Keep characters clean (beta)", L"BETA: applies to everyone, enemies included; for your character alone use Keep your character clean. Blood, mud and scorch marks no longer stick to characters' bodies, yours and enemies'. Splatters still appear on the ground and walls. Applies to new hits; marks already on you wear off as usual."},
         {L"Hide buff effects", L"Your own buffs (incantations, sorceries, boluses, talismans and similar) no longer show particles or a glow on your body. They work exactly the same, keep their sound, and invisibility still works. Weapon buffs keep their look (see the option below). Applies to the next buff you use."},
         {L"Hide weapon buff effects", L"Greases and weapon enchantments no longer show their glow or particles on your weapon. They work exactly the same and keep their sound. Applies to the next grease or enchantment you use."},
@@ -8390,6 +11069,7 @@ const Texts kEnglish{
         {L"Extended ranges", L"Off by default. Many sliders of this menu go further and get a Scale row (x1 to x100) under them that multiplies their value. Applies when you restart the game."},
         {L"Highlight changed options", L"Off by default. The names of options set away from the game's default are coloured, so you can see at a glance what you changed. Applies at once."},
         {L"Same ash again", L"With Several ashes at once, using a summoned spirit ash's item summons it once more instead of dismissing it, so you can have the same ash several times; each one pays its FP. Dismiss all ashes removes them. Off by default: the item dismisses that ash."},
+        {L"Free fighting", L"Off by default. Where summoned spirit ashes fight freely, with no warp to your side cutting into the fight: Boss arenas, only there; Everywhere, in boss arenas and in any fight on foot. When a fight ends, ashes left far away come back to you. In every mode they still cross fog gates with you. Applies right away."},
         {L"Deflect window (%) (beta)", L"BETA: with the Deflecting Hardtear, makes its perfect guard window last longer. 100% is the game's (6 frames when you raise your guard, fewer after several deflects in a row); 200% doubles the first window. Your character only."},
         {L"Solid spirit ashes", L"Summoned spirit ashes (and Seluvis's puppets) lose their blue ghostly look and appear as solid characters. They work exactly the same. Applies to the next ash you summon."},
         {L"Stack self buffs (beta)", L"BETA: your own buffs of the same kind no longer replace each other, so for example Flame, Grant Me Strength, Barrier of Gold and a Boiled Crab, or Golden Vow and an Uplifting Aromatic, all stay on at once. Using the same buff again still just refreshes it. Applies to the next buffs you use."},
@@ -8410,6 +11090,21 @@ const Texts kEnglish{
         {L"Bewitching on all enemies (beta)", L"BETA: Bewitching Branches also work on enemies the game makes immune, such as Black Knights or skeletons. Reaches enemies that appear after you turn it on: rest at a grace. Some may not fight back well while charmed."},
         {L"Bewitching on bosses (beta)", L"BETA: Bewitching Branches also work on bosses. A charmed boss can stall its phases or a scripted fight for up to 3 minutes. Rest at a grace after changing it."},
         {L"Objects follow interaction speed (beta)", L"BETA: chests, doors and levers also move at Interaction speed. Lifts keep their speed. Effects around them do not change. Other objects that start moving at that same moment can speed up briefly. Off by default."},
+        {L"New Game+ poise scaling (%) (beta)", L"BETA: from NG+2 on, the game changes enemy poise, from x0.95 at NG+2 to x0.6 at NG+7. 100% keeps that change and 0% removes it, so enemies keep the poise of a first playthrough. Only matters in a New Game+ save. Applies to enemies that appear afterwards: rest at a grace."},
+        {L"Disable camera shake (beta)", L"BETA: attacks, landings and events no longer shake the camera. Controller vibration from them stops too. Applies at once to new shakes."},
+        {L"Drop or discard any item (beta)", L"BETA: every weapon, armour piece, talisman, Ash of War and item can be dropped or discarded, except key items, Great Runes and flasks. A dropped item stays on the ground until you leave the area; a discarded one is gone for good. Applies at once."},
+        {L"...key items too (beta)", L"BETA: also key items, Great Runes and flasks. Discarding an item the story needs, such as a medallion or a key, can leave you unable to go on. A flask in a quick slot keeps one: remove it from the slot to drop the last one. Needs the option above."},
+        {L"Weapon level", L"Upgrade level of the weapons in the item shop (F11 > Item Shop). Somber weapons follow their own scale: +25 here is +10 for them. Weapons that cannot be upgraded stay at +0. Applies the next time you open the shop."},
+        {L"Spirit ash level", L"Upgrade level of the spirit ashes in the item shop, up to +10 or the highest level each ash has. Applies the next time you open the shop."},
+        {L"Price (%)", L"Price of everything in the item shop, as a percentage of its sell value. 0% makes everything free. Applies the next time you open the shop."},
+        {L"NPC Spawner", L"Off by default. Spawn any enemy, boss or NPC wherever you are, to test fights and settings: F11 > NPC Spawner, or Mod Settings > NPC Spawner, with its own settings (NpcSpawner.ini next to NativeTweaks.dll). Restart the game after changing it. Unavailable when the standalone NpcSpawner.dll is installed: that one is used."},
+        {L"Ragdoll on death (beta)", L"BETA: when you or a human character (NPCs, invaders, other Tarnished) dies, the body falls limp and stays on the ground instead of fading out, as with Player Ragdoll Physics by Dweet. Other enemies already stay on the ground; bosses keep their own death. Applies from the next death."},
+        {L"Keep bodies (beta)", L"BETA: bosses and other creatures that fade out or dissolve after death (skeletons, crabs, trolls, dragons...) stay on the ground instead, in the last pose of their death. You, Torrent, spirit ashes, allies summoned with you and ghostly characters still fade as in the game. Not tested with every boss yet: if a boss's runes, fog wall or event do not come, turn it off. Applies from the next death."},
+        {L"Skill speed (%)", L"Your weapon skills (Ashes of War and unique skills). They use this instead of Attack speed, so normal attacks keep theirs. Multiplies the overall speed."},
+        {L"Healing aura (HP/s)", L"The Deathbed Dress's aura without wearing it, stronger: you and allies within 7 m, spirit ashes included, recover this many HP every second. The dress alone gives allies 2 HP/s and you nothing. 0 turns it off. Applies within a second."},
+        {L"Materials found (%)", L"How many crafting materials you get from each gathering spot, corpse, chest and enemy drop: 200% gives twice as many. Only materials used in crafting recipes. Item drop rate changes how often enemies drop things. Applies to the next pick-up."},
+        {L"Craft in combat", L"Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
+        {L"Map in combat", L"The map opens while enemies are fighting you, and stays open when a fight starts. Fast travel still follows the game's rules (or Fast travel anywhere). Applies at once."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -8440,6 +11135,7 @@ const Texts kSpanish{
         {L"Imagen", L"Posprocesado y nivel de detalle."},
         {L"Pantalla", L"FPS, frecuencia de refresco y relación de aspecto."},
         {L"Interfaz y sistema", L"Disposición del HUD y los menús, pausa, logos de inicio y preguntas Sí/No."},
+        {L"Tienda de objetos", L"Todos los objetos que se pueden conseguir, ordenados por tipo, en una tienda que se abre desde el menú de diálogo (F11 > Tienda de objetos). El nivel de mejora y el precio se ajustan aquí o en Ajustes de la tienda, dentro de ese menú."},
     },
     {
         {L"Campo de visión personalizado", L"Escala el campo de visión del juego. Se aplica al momento."},
@@ -8464,14 +11160,14 @@ const Texts kSpanish{
         {L"Equilibrio infinito", L"Los golpes normales no te hacen tambalear. Se aplica al momento, con o sin armadura. Los agarres siguen."},
         {L"Sin daño por caída", L"Las caídas nunca te dañan ni te matan a ti ni a Torrent, sea cual sea la altura, a pie o montado. En abismos sigues cayendo."},
         {L"Inmunidad a estados alterados", L"Veneno, putrefacción, hemorragia, muerte, congelación, sueño y locura no se acumulan en ti, ni siquiera con un golpe fuerte. Un efecto que ya tengas al activarla se pasa como siempre. No afecta a enemigos."},
-        {L"Daño infligido (%)", L"Escala tus ataques y hechizos. Se aplica desde el siguiente golpe."},
-        {L"Daño recibido (%)", L"Escala los ataques enemigos. También afecta a los ataques entre PNJ y a las cenizas espirituales."},
+        {L"Daño infligido (%)", L"Escala tus ataques y hechizos. Solo a ti: los PNJ humanoides y los invasores, que usan los mismos ataques que los jugadores, no cambian. Se aplica desde el siguiente golpe."},
+        {L"Daño recibido (%)", L"Escala el daño que recibes de los enemigos, incluidos los PNJ humanoides y los invasores. Solo a ti: los ataques entre PNJ y a tus cenizas espirituales no cambian."},
         {L"Daño al equilibrio infligido (%)", L"Escala el daño al equilibrio de tus ataques, armas y hechizos: lo rápido que hacen tambalear a los enemigos y les rompen la postura. Se aplica en el siguiente golpe."},
         {L"Daño al equilibrio recibido (%)", L"Escala el daño al equilibrio de los ataques enemigos: lo rápido que te hacen tambalear. También afecta a PNJ y cenizas espirituales. Se aplica en el siguiente golpe."},
         {L"Coste de aguante (%)", L"Escala el aguante que gastan tus ataques y acciones."},
         {L"Coste de PC de hechizos (%)", L"Escala el coste en PC de hechicerías y encantamientos."},
         {L"Acumulación de estados (%)", L"Veneno, putrefacción, hemorragia, muerte, congelación, sueño y locura. Afecta a todos, también a ti."},
-        {L"Matar de un golpe", L"Tus golpes derrotan a los enemigos al instante."},
+        {L"Matar de un golpe", L"Tus golpes que hacen daño derrotan a los enemigos al instante (empujarlos o rodar contra ellos no)."},
         {L"Duración de mejoras de arma (%)", L"Grasas y encantamientos de arma. Se aplica a la siguiente mejora que uses."},
         {L"Duración de mejoras propias (%)", L"Hechizos y encantamientos de mejora, bolos y otros efectos temporales sobre ti y tus aliados. Se aplica al siguiente."},
         {L"Duración de efectos sobre enemigos (%)", L"Efectos temporales dirigidos a enemigos, como reducir su defensa. También afecta a los que los enemigos te aplican."},
@@ -8507,7 +11203,6 @@ const Texts kSpanish{
         {L"Reinvocar sin descansar", L"Tras caer una ceniza puedes volver a invocarla sin descansar en una gracia. Al desactivarlo vuelve el límite original."},
         {L"Invocar en cualquier lugar", L"Cada monumento de invocación alcanza toda su zona, así que puedes invocar donde el juego permita espíritus, y las cenizas ya no se retiran por alejarte de él. Al desactivarla vuelve el alcance original."},
         {L"Varias cenizas a la vez", L"Multiple Spirit Ashes, integrado. Al usar otra ceniza espiritual se quedan las que ya están invocadas, y cada una cobra sus PC; volver a usar el objeto de una invocada retira solo esa con un fundido corto, aunque no tengas PC. No salen confirmaciones, las cenizas te siguen al cambiar de zona y al cruzar puertas, y cada una tiene una fila con su nombre y su vida en el HUD (hasta 7). El HUD solo cambia al reiniciar el juego: las filas salen si la opción está activada al arrancar y, si no, se queda el panel de cenizas del juego (volver al menú principal no basta). Desactivada, invocar funciona como en el juego original."},
-        {L"Máximo de cenizas a la vez", L"Cuántas cenizas espirituales puedes tener invocadas juntas con «Varias cenizas a la vez». Una invocación de varios espíritus cuenta como una. El HUD muestra hasta 6; muchas cenizas pueden bajar el rendimiento."},
         {L"Las cenizas se quedan al vencer al jefe", L"Los monumentos ligados a un jefe ya no retiran tus cenizas cuando muere y siguen activos después, también en las salas de jefes que ya venciste. Se aplica al recargar la zona (descansa en una gracia)."},
         {L"Retirar todas las cenizas", L"Con «Varias cenizas a la vez», retira todas las cenizas invocadas con un fundido corto. Funciona como un botón; también puedes asignarle una tecla en [Hotkeys] de NativeTweaks.ini (SpiritDismissAll = F5)."},
         {L"Coste de las cenizas extra (%)", L"Con «Varias cenizas a la vez», los PC que cuesta cada ceniza cuando ya hay otra invocada, en % de su coste. 100% es el coste normal; la primera siempre cuesta lo suyo."},
@@ -8547,7 +11242,7 @@ const Texts kSpanish{
         {L"Retroceso infligido (%)", L"Cuánto empujan tus golpes a los enemigos. Se aplica desde el siguiente golpe."},
         {L"Retroceso recibido (%)", L"Cuánto te empujan los golpes enemigos. También afecta a PNJ y cenizas espirituales."},
         {L"Efectos también en enemigos", L"Enemigos, PNJ y cenizas espirituales también aplican los efectos de arma activados arriba. Hace el juego más difícil."},
-        {L"Quitar inmunidades enemigas", L"Los enemigos inmunes a veneno, putrefacción, hemorragia, congelación o sueño pasan a tener una resistencia normal. Locura y muerte siguen afectando solo a personajes tipo jugador. Se aplica a los enemigos cargados después: descansa en una gracia."},
+        {L"Quitar inmunidades enemigas", L"Los enemigos inmunes a veneno, putrefacción, hemorragia, congelación o sueño pasan a tener una resistencia normal, también los que tienen la inmunidad por un efecto propio, como las gárgolas y los avatares del Árbol Áureo. Locura y muerte siguen afectando solo a personajes tipo jugador. Se aplica a los enemigos cargados después: descansa en una gracia."},
         {L"Curación del frasco carmesí (%)", L"Escala la vida que restaura el frasco de lágrimas carmesí, en todos sus niveles de mejora. 0% no cura."},
         {L"PF del frasco cerúleo (%)", L"Escala los PF que restaura el frasco de lágrimas cerúleas, en todos sus niveles de mejora. 0% no restaura."},
         {L"Coste de aguante de hechizos (%)", L"Escala el aguante que gastan hechicerías y encantamientos, también al cargarlos."},
@@ -8556,7 +11251,7 @@ const Texts kSpanish{
         {L"Coste de PC de habilidades (%)", L"Escala los PC que gastan las cenizas de guerra, también al cargarlas y en los golpes de seguimiento. 0% las hace gratis y te deja siempre al menos 1 PC, que el juego necesita para la versión completa de la habilidad."},
         {L"Llevar hasta 999 de cada objeto", L"Los objetos que se acumulan admiten 999 encima y en el cofre. Los objetos únicos (llaves, silbato, frascos) no cambian."},
         {L"Velocidad de uso de objetos (%)", L"Beber frascos, usar consumibles y recoger objetos. Se multiplica con la velocidad general."},
-        {L"Precios de las tiendas (%)", L"Escala lo que cobran los mercaderes y demás tiendas, en runas o en objetos como los corazones de dragón. 0% lo hace todo gratis. Los intercambios por recuerdos siguen pidiéndolos. Se aplica la próxima vez que abras una tienda."},
+        {L"Precios de los mercaderes (%)", L"Escala lo que cobran los mercaderes y demás tiendas, en runas o en objetos como los corazones de dragón. Nada cuesta menos de lo que se vende, porque el juego lo ocultaría, así que 0% solo deja gratis lo que no se puede vender. Los intercambios por recuerdos siguen pidiéndolos. Se aplica la próxima vez que abras una tienda."},
         {L"Fabricar sin materiales", L"Las recetas de fabricación no piden materiales. Sigues necesitando el libro de recetas y el kit de fabricación. Al desactivarla vuelven los materiales de siempre."},
         {L"Requisitos de atributos de armas (%)", L"Escala la Fuerza, Destreza, Inteligencia, Fe y Arcano necesarios para usar armas, escudos, bastones y sellos. 0% los elimina. Vuelve a equipar el arma para actualizarlo."},
         {L"Mejorar sin materiales", L"Mejorar armas (piedras de forja y piedras sombrías) y cenizas de espíritu (belladona) no pide materiales. Las runas se siguen cobrando salvo con Coste de mejora a 0%. Al desactivarla vuelven los materiales de siempre."},
@@ -8581,7 +11276,7 @@ const Texts kSpanish{
         {L"Sin fijar objetivo", L"No puedes fijar a enemigos ni a otros personajes, y se suelta el fijado que tengas. Se aplica al momento."},
         {L"Romper el equilibrio de un golpe", L"Cada golpe tuyo hace tambalear a los enemigos y rompe la postura de los jefes que se pueden romper. Se aplica desde el siguiente golpe y anula «Daño al equilibrio infligido»."},
         {L"Estados alterados al instante", L"Cualquier golpe que acumule veneno, putrefacción, hemorragia, muerte, congelación, sueño o locura lo provoca de una vez, para todos: tú, los enemigos y las cenizas espirituales. Anula los deslizadores de acumulación; con «Inmunidad a estados alterados» solo afecta a los demás."},
-        {L"Morir de un golpe", L"Cualquier golpe enemigo que haga daño te mata. Los golpes entre enemigos y los de tus cenizas espirituales usan los mismos datos, así que también matan de un golpe. Anula «Daño recibido»; el modo dios te sigue protegiendo."},
+        {L"Morir de un golpe", L"Cualquier golpe que haga daño te mata, venga de enemigos, PNJ humanoides o invasores. Solo a ti: los enemigos y tus cenizas espirituales no cambian. Anula «Daño recibido»; el modo dios te sigue protegiendo."},
         {L"Los enemigos rompen tu equilibrio de un golpe", L"Cada golpe enemigo te hace tambalear. Tus cenizas espirituales usan los mismos datos y también rompen el equilibrio enemigo de un golpe. Anula «Daño al equilibrio recibido»."},
         {L"Los ataques cargados lanzan a los enemigos", L"Tus ataques fuertes cargados lanzan a los enemigos por los aires en vez de hacerlos tambalear: hacia atrás, lejos o hacia arriba. Funciona aunque no pierdan el equilibrio. Los enemigos que ya están en el suelo, los grandes y los jefes no tienen esa animación y mantienen su reacción. «Lejos» es la que mejor lanza; «Distancia del lanzamiento», más abajo, decide lo lejos que vuelan. Se aplica desde tu siguiente golpe."},
         {L"Todos tus ataques lanzan", L"Con la opción de arriba activada, todos tus ataques que hacen reaccionar al enemigo lo lanzan igual, no solo los fuertes cargados: ataques ligeros y fuertes, habilidades, hechizos y objetos arrojadizos."},
@@ -8590,7 +11285,7 @@ const Texts kSpanish{
         {L"Mantener tus runas", L"Con Dificultad del mundo activa, los enemigos dan las runas del ciclo de tu partida en lugar de las del ciclo más difícil."},
         {L"Abrir el espejo", L"Abre la pantalla de apariencia del espejo de la Mesa Redonda. Úsalo fuera de combate."},
         {L"Renacer", L"Abre la pantalla de renacimiento de Rennala para redistribuir tus atributos. No necesita Lágrima larval. Úsalo fuera de combate."},
-        {L"Vida de los jefes (%)", L"Escala solo la vida de los jefes: principales, de campo, de mazmorra y del DLC. Se multiplica con «Vida de enemigos», así que con «Vida de enemigos» al 100 % solo cambian los jefes. Se aplica a los jefes que se carguen después: descansa en una gracia."},
+        {L"Vida de los jefes (%)", L"Escala solo la vida de los jefes: principales, de campo, de mazmorra y del DLC. Se multiplica con «Vida de enemigos», así que con «Vida de enemigos» al 100 % solo cambian los jefes. Se aplica a los jefes que se carguen después: descansa en una gracia. El juego detiene la vida en 524287: subir más no añade nada."},
         {L"Personajes limpios (beta)", L"BETA: se aplica a todos, enemigos incluidos; para tu personaje solo, usa Mantener limpio a tu personaje. La sangre, el barro y las quemaduras ya no se pegan al cuerpo de los personajes, ni al tuyo ni al de los enemigos. Las salpicaduras siguen saliendo en el suelo y las paredes. Se aplica a los golpes nuevos; las manchas que ya tienes se van como siempre."},
         {L"Ocultar efectos de mejoras", L"Tus mejoras (encantamientos, hechizos, bolos, talismanes y similares) ya no muestran partículas ni brillo en tu cuerpo. Funcionan exactamente igual, mantienen su sonido y la invisibilidad sigue funcionando. Las mejoras del arma mantienen su aspecto (ver la opción de abajo). Se aplica a la siguiente mejora que uses."},
         {L"Ocultar efectos de mejoras de arma", L"Las grasas y los encantamientos de arma ya no muestran su brillo ni partículas en el arma. Funcionan exactamente igual y mantienen su sonido. Se aplica a la siguiente grasa o encantamiento que uses."},
@@ -8601,6 +11296,7 @@ const Texts kSpanish{
         {L"Rangos ampliados", L"Desactivado por defecto. Muchos deslizadores de este menú llegan más lejos y tienen debajo una fila de Escala (x1 a x100) que multiplica su valor. Se aplica al reiniciar el juego."},
         {L"Resaltar opciones cambiadas", L"Desactivado por defecto. Los nombres de las opciones que no están en el valor del juego salen en color, para ver de un vistazo qué has cambiado. Se aplica al momento."},
         {L"Repetir la misma ceniza", L"Con «Varias cenizas a la vez», usar el objeto de una ceniza ya invocada la invoca otra vez en lugar de retirarla, para tener la misma ceniza varias veces; cada una cobra sus PC. «Retirar todas las cenizas» las quita todas. Desactivada por defecto: el objeto retira esa ceniza."},
+        {L"Lucha libre", L"Desactivada por defecto. Dónde pelean libres las cenizas invocadas, sin que un teletransporte a tu lado corte la pelea: Arenas de jefe, solo ahí; En todas partes, en arenas de jefe y en cualquier pelea a pie. Al acabar una pelea, las que se hayan quedado lejos vuelven contigo. En todos los modos siguen cruzando la niebla contigo. Se aplica al momento."},
         {L"Ventana de desvío (%) (beta)", L"BETA: con la Lágrima de desvío, alarga la ventana de la guardia perfecta. El 100 % es la del juego (6 fotogramas al alzar la guardia, menos tras varios desvíos seguidos); el 200 % duplica la primera ventana. Solo para tu personaje."},
         {L"Cenizas sin aspecto fantasmal", L"Las cenizas espirituales invocadas (y las marionetas de Seluvis) pierden su aspecto fantasmal azul y se ven como personajes sólidos. Funcionan exactamente igual. Se aplica a la siguiente ceniza que invoques."},
         {L"Acumular mejoras propias (beta)", L"BETA: tus mejoras del mismo tipo ya no se sustituyen entre sí; por ejemplo, Llama, dame fuerza, Barrera de oro y un Cangrejo hervido, o Voto dorado y un Aromático estimulante, siguen activas a la vez. Usar otra vez la misma mejora solo la renueva. Se aplica a las siguientes mejoras que uses."},
@@ -8621,6 +11317,21 @@ const Texts kSpanish{
         {L"Embrujar a todos los enemigos (beta)", L"BETA: las Ramas embrujadoras también funcionan con enemigos que el juego hace inmunes, como Caballeros negros o esqueletos. Afecta a los enemigos que aparezcan después de activarla: descansa en una gracia. Algunos pueden no luchar bien mientras están embrujados."},
         {L"Embrujar a los jefes (beta)", L"BETA: las Ramas embrujadoras también funcionan con los jefes. Un jefe embrujado puede bloquear sus fases o un combate con guion hasta 3 minutos. Descansa en una gracia después de cambiarla."},
         {L"Objetos a velocidad de interacción (beta)", L"BETA: cofres, puertas y palancas también van a la velocidad de interacción. Los ascensores no cambian. Los efectos de alrededor tampoco. Otros objetos que empiecen a moverse en ese momento pueden acelerarse un instante. Apagada por defecto."},
+        {L"Equilibrio en Nueva Partida+ (%) (beta)", L"BETA: desde NG+2 el juego cambia el equilibrio de los enemigos, de x0,95 en NG+2 a x0,6 en NG+7. Al 100 % se mantiene ese cambio y al 0 % se quita, así que los enemigos tienen el equilibrio de una primera partida. Solo afecta a una partida en Nueva Partida+. Se aplica a los enemigos que aparecen después: descansa en una gracia."},
+        {L"Quitar el temblor de cámara (beta)", L"BETA: los ataques, las caídas y los eventos ya no hacen temblar la cámara. También se quita la vibración del mando que producen. Se aplica al momento a los temblores nuevos."},
+        {L"Soltar o tirar cualquier objeto (beta)", L"BETA: cualquier arma, armadura, talismán, ceniza de guerra u objeto se puede soltar o tirar, salvo los objetos clave, las Grandes Runas y los frascos. Lo que sueltas se queda en el suelo hasta que sales de la zona; lo que tiras se pierde para siempre. Se aplica al momento."},
+        {L"...también objetos clave (beta)", L"BETA: también los objetos clave, las Grandes Runas y los frascos. Si tiras un objeto que necesita la historia, como un medallón o una llave, puedes quedarte sin poder avanzar. Un frasco en el acceso rápido se queda con uno: quítalo del acceso para soltar el último. Necesita la opción de arriba."},
+        {L"Nivel de las armas", L"Nivel de mejora de las armas de la tienda de objetos (F11 > Tienda de objetos). Las armas sombrías siguen su propia escala: +25 aquí equivale a +10 en ellas. Las que no se pueden mejorar se quedan en +0. Se aplica la próxima vez que abras la tienda."},
+        {L"Nivel de las cenizas", L"Nivel de mejora de las cenizas de espíritu de la tienda de objetos, hasta +10 o el máximo de cada ceniza. Se aplica la próxima vez que abras la tienda."},
+        {L"Precio (%)", L"Precio de todo lo que hay en la tienda de objetos, como porcentaje de su valor de venta. Con 0% todo es gratis. Se aplica la próxima vez que abras la tienda."},
+        {L"NPC Spawner", L"Desactivado por defecto. Invoca cualquier enemigo, jefe o PNJ donde estés, para probar combates y ajustes: F11 > NPC Spawner, o Mod Settings > NPC Spawner, con sus propios ajustes (NpcSpawner.ini junto a NativeTweaks.dll). Reinicia el juego después de cambiarlo. No disponible si NpcSpawner.dll está instalado por separado: se usa ese."},
+        {L"Cuerpos inertes al morir (beta)", L"BETA: cuando mueres tú o un personaje humano (PNJ, invasores, otros Sinluz), el cuerpo cae inerte y se queda en el suelo en lugar de desvanecerse, como con Player Ragdoll Physics de Dweet. Los demás enemigos ya se quedan en el suelo; los jefes mantienen su propia muerte. Se aplica desde la siguiente muerte."},
+        {L"Mantener los cuerpos (beta)", L"BETA: los jefes y otras criaturas que se desvanecen o se deshacen al morir (esqueletos, cangrejos, trols, dragones...) se quedan en el suelo, en la última postura de su muerte. Tú, Torrente, las cenizas de espíritu, los aliados invocados contigo y los personajes fantasmales se siguen desvaneciendo como en el juego. Aún no se ha probado con todos los jefes: si no llegan las runas, la niebla o el evento de un jefe, desactívala. Se aplica desde la siguiente muerte."},
+        {L"Velocidad de habilidades (%)", L"Tus habilidades de arma (cenizas de guerra y habilidades únicas). Usan esto en lugar de la velocidad de ataque, así que los ataques normales mantienen la suya. Se multiplica por la velocidad general."},
+        {L"Aura curativa (PV/s)", L"El aura del Vestido del lecho de muerte sin llevarlo, y más fuerte: tú y los aliados a menos de 7 m, cenizas de espíritu incluidas, recuperáis estos PV cada segundo. El vestido solo da 2 PV/s a los aliados y nada a quien lo lleva. Con 0 se apaga. Se aplica en un segundo."},
+        {L"Materiales obtenidos (%)", L"Cuántos materiales de fabricación consigues de cada punto de recolección, cadáver, cofre y botín de enemigos: con 200% el doble. Solo los materiales que usan las recetas. La tasa de botín cambia cada cuánto sueltan cosas los enemigos. Se aplica a la siguiente recogida."},
+        {L"Fabricar en combate", L"Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
+        {L"Mapa en combate", L"El mapa se abre mientras luchas contra enemigos y no se cierra cuando empieza un combate. El viaje rápido sigue las reglas del juego (o Viaje rápido en cualquier sitio). Se aplica al momento."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -8651,6 +11362,7 @@ const Texts kChinese{
         {L"画面", L"后期处理与细节层次。"},
         {L"显示", L"帧率、刷新率与画面比例。"},
         {L"界面与系统", L"HUD 与菜单布局、暂停、启动标志和是/否对话框。"},
+        {L"物品商店", L"在对话菜单（F11 > 物品商店）中打开的商店，按类型列出所有可获得的物品。可在此处或该菜单内的“商店设置”中调整强化等级和价格。"},
     },
     {
         {L"自定义视野", L"缩放游戏视野。立即生效。"},
@@ -8675,14 +11387,14 @@ const Texts kChinese{
         {L"无限韧性", L"普通攻击永远无法使你踉跄。立即生效，无论是否穿戴防具。投技仍然有效。"},
         {L"无坠落伤害", L"无论高度多少，无论步行还是骑乘，坠落都不会伤害或杀死你和灵马。在无底深渊中会一直下落。"},
         {L"异常状态免疫", L"中毒、腐败、出血、咒死、冻伤、睡眠和发狂不会在你身上累积，即使是一次重击也不会。开启时已在生效的异常会照常结束。不影响敌人。"},
-        {L"造成伤害 (%)", L"缩放你的攻击和法术伤害。从下一次命中开始生效。"},
-        {L"受到伤害 (%)", L"缩放敌人的攻击伤害。也会影响 NPC 之间及骨灰的攻击。"},
+        {L"造成伤害 (%)", L"缩放你的攻击和法术伤害。只作用于你：使用与玩家相同攻击的人形 NPC 和入侵者不受影响。从下一次命中开始生效。"},
+        {L"受到伤害 (%)", L"缩放你受到的敌人伤害，包括人形 NPC 和入侵者。只作用于你：NPC 之间以及对骨灰的攻击不变。"},
         {L"造成削韧 (%)", L"缩放你的攻击、武器和法术的削韧：使敌人踉跄、破坏其架势的速度。下一次攻击即生效。"},
         {L"受到削韧 (%)", L"缩放敌人攻击的削韧：使你踉跄的速度。也会影响 NPC 和骨灰。下一次攻击即生效。"},
         {L"精力消耗 (%)", L"缩放攻击和行动消耗的精力。"},
         {L"法术 FP 消耗 (%)", L"缩放魔法和祷告的 FP 消耗。"},
         {L"异常状态累积 (%)", L"中毒、腐败、出血、咒死、冻伤、睡眠和发狂。对所有人生效，包括你自己。"},
-        {L"一击必杀", L"你的攻击会立即击败敌人。"},
+        {L"一击必杀", L"你造成伤害的攻击会立即击败敌人（推挤或翻滚撞到敌人不算）。"},
         {L"武器附魔持续时间 (%)", L"油脂和武器附魔。对下一次施放或使用的增益生效。"},
         {L"自身增益持续时间 (%)", L"增益法术与祷告、丸药及作用于你和同伴的其他限时效果。对下一次生效。"},
         {L"敌人减益持续时间 (%)", L"作用于敌人的限时效果，例如降低防御。也会影响敌人对你施加的减益。"},
@@ -8718,7 +11430,6 @@ const Texts kChinese{
         {L"无需休息即可再次召唤", L"骨灰死亡后无需在赐福休息即可再次召唤。关闭后恢复原版限制。"},
         {L"随处召唤", L"每块召唤碑的范围覆盖其整个区域，只要游戏允许召唤灵体即可召唤，骨灰也不会因你远离召唤碑而被解除。关闭后恢复原版范围。"},
         {L"同时召唤多个骨灰", L"内置 Multiple Spirit Ashes。使用另一个骨灰时，已召唤的骨灰会保留，且每个都会消耗 FP；再次使用已召唤骨灰的道具会以短暂淡出只解除该骨灰，即使 FP 不足也可以。不会弹出确认，骨灰会跟随你进入新区域和穿过门，并在 HUD 上各有一行名称和生命值（最多 7 行）。HUD 仅在重新启动游戏后才会改变：游戏启动时开启此选项才会显示这些行，否则保留原版的骨灰面板（返回标题画面不够）。关闭后召唤与原版游戏相同。"},
-        {L"同时召唤骨灰上限", L"开启“同时召唤多个骨灰”时，最多可同时召唤多少个骨灰。一次召唤多个灵体算作一个。HUD 最多显示 6 个；骨灰过多可能降低性能。"},
         {L"击败首领后骨灰保留", L"与首领绑定的召唤碑在首领死亡后不再解除你的骨灰，之后仍可使用，已击败首领的场地也一样。区域重新载入后生效（在赐福处休息）。"},
         {L"解除全部骨灰", L"开启“同时召唤多个骨灰”时，以短暂淡出解除所有已召唤的骨灰。像按钮一样使用；也可以在 NativeTweaks.ini 的 [Hotkeys] 中绑定按键（SpiritDismissAll = F5）。"},
         {L"额外骨灰消耗 (%)", L"开启“同时召唤多个骨灰”时，已有骨灰在场时再召唤一个所需的 FP，按其自身消耗的百分比计算。100% 为正常消耗；第一个骨灰始终按原消耗。"},
@@ -8758,7 +11469,7 @@ const Texts kChinese{
         {L"造成击退 (%)", L"你的攻击将敌人击退的距离。从下一次命中开始生效。"},
         {L"受到击退 (%)", L"敌人攻击将你击退的距离。也会影响 NPC 和骨灰。"},
         {L"敌人攻击也附带效果", L"敌人、NPC 和骨灰的攻击也会附带上方开启的武器效果。会提高游戏难度。"},
-        {L"移除敌人免疫", L"对中毒、腐败、出血、冻伤或睡眠免疫的敌人改为普通抗性。发狂和咒死仍只对玩家类角色生效。对之后加载的敌人生效：在赐福处休息。"},
+        {L"移除敌人免疫", L"对中毒、腐败、出血、冻伤或睡眠免疫的敌人改为普通抗性，包括因自身效果而免疫的敌人，例如石像鬼和黄金树化身。发狂和咒死仍只对玩家类角色生效。对之后加载的敌人生效：在赐福处休息。"},
         {L"红露滴圣杯瓶回复 (%)", L"缩放红露滴圣杯瓶回复的血量，所有强化等级都适用。0% 为不回复。"},
         {L"蓝露滴圣杯瓶回复 (%)", L"缩放蓝露滴圣杯瓶回复的 FP，所有强化等级都适用。0% 为不回复。"},
         {L"法术精力消耗 (%)", L"缩放魔法和祷告消耗的精力，包括蓄力施放。"},
@@ -8767,7 +11478,7 @@ const Texts kChinese{
         {L"战技 FP 消耗 (%)", L"缩放战灰的 FP 消耗，包括蓄力和追加攻击。0% 为免费，并始终保留至少 1 点 FP，游戏需要它来施放完整的战技。"},
         {L"每种道具可携带 999 个", L"可堆叠的道具在身上和仓库中都能存放 999 个。唯一道具（关键道具、灵马笛、圣杯瓶）不变。"},
         {L"道具使用速度 (%)", L"饮用圣杯瓶、使用消耗品和拾取物品的动作。与整体速度相乘。"},
-        {L"商店价格 (%)", L"缩放商人和其他商店的要价，无论是卢恩还是龙心脏等道具。0% 为全部免费。用回忆交换的物品仍需要回忆。下次打开商店时生效。"},
+        {L"商人价格 (%)", L"缩放商人和其他商店的要价，无论是卢恩还是龙心脏等道具。物品价格不会低于其售出价，否则游戏会将其隐藏，因此 0% 只会让无法出售的物品免费。用回忆交换的物品仍需要回忆。下次打开商店时生效。"},
         {L"制作无需材料", L"制作配方不再需要材料。仍需要制作笔记和制作工具。关闭后恢复原有材料。"},
         {L"武器能力值需求 (%)", L"缩放使用武器、盾牌、手杖和圣印记所需的力气、灵巧、智力、信仰和感应。0% 为取消需求。重新装备武器即可刷新。"},
         {L"强化无需材料", L"强化武器（锻造石与暗色锻造石）和骨灰（铃兰）不再需要材料。除非强化费用为 0%，否则仍需支付卢恩。关闭后恢复原有材料。"},
@@ -8792,7 +11503,7 @@ const Texts kChinese{
         {L"禁用锁定", L"无法锁定敌人或其他角色，已有的锁定会解除。立即生效。"},
         {L"一击破韧", L"你的每次攻击都会使敌人踉跄，并击破可被破防的头目的架势。从下一次攻击起生效，并覆盖“造成削韧 (%)”。"},
         {L"异常状态立即触发", L"任何累积中毒、腐败、出血、咒死、冻伤、睡眠或发狂的攻击都会立即触发该状态，对所有人生效：你、敌人和骨灰。覆盖累积滑块；配合“异常状态免疫”则只影响他人。"},
-        {L"一击即死", L"任何造成伤害的敌人攻击都会杀死你。敌人之间以及你的骨灰的攻击使用相同数据，也会一击致命。覆盖“受到伤害 (%)”；无敌仍会保护你。"},
+        {L"一击即死", L"任何造成伤害的攻击都会杀死你，无论来自敌人、人形 NPC 还是入侵者。只作用于你：敌人和你的骨灰不受影响。覆盖“受到伤害 (%)”；无敌模式仍会保护你。"},
         {L"敌人一击破你韧性", L"敌人的每次攻击都会使你踉跄。你的骨灰使用相同数据，也会一击击破敌人的韧性。覆盖“受到削韧 (%)”。"},
         {L"蓄力攻击击飞敌人", L"你的蓄力重攻击会将敌人击飞，而不是使其踉跄：向后、远距或向上。即使敌人韧性未被击破也有效。已倒地的敌人、大型敌人和头目没有击飞动作，保持自身的反应。“远距击飞”效果最好；下方的“击飞距离 (%)”决定距离。从下一次攻击起生效。"},
         {L"所有攻击都会击飞", L"开启上方选项时，你所有会让敌人产生反应的攻击都会以相同方式击飞敌人，而不只是蓄力重攻击：轻攻击、重攻击、战技、法术和投掷物品。"},
@@ -8801,7 +11512,7 @@ const Texts kChinese{
         {L"保留你的卢恩", L"开启世界难度时，敌人给予你存档所在周目的卢恩，而不是更高难度周目的卢恩。"},
         {L"打开镜子", L"打开圆桌厅堂镜子的外观界面。请在战斗外使用。"},
         {L"重生", L"打开菈妮的重生界面以重新分配属性点。不需要幼虫之泪。请在战斗外使用。"},
-        {L"头目血量 (%)", L"仅缩放头目的血量：主要头目、野外头目、地下城头目和 DLC 头目。与“敌人血量”相乘，因此“敌人血量”为 100% 时只改变头目。对之后加载的头目生效：在赐福处休息。"},
+        {L"头目血量 (%)", L"仅缩放头目的血量：主要头目、野外头目、地下城头目和 DLC 头目。与“敌人血量”相乘，因此“敌人血量”为 100% 时只改变头目。对之后加载的头目生效：在赐福处休息。游戏将血量上限限制为 524287，继续调高不会增加血量。"},
         {L"保持角色干净（测试版）", L"测试版：作用于所有角色，包括敌人；若只想让你的角色保持干净，请使用“保持你的角色干净”。血迹、泥污和焦痕不再附着在角色身上，包括你和敌人。地面和墙壁上仍会出现飞溅痕迹。对新的攻击生效；已有的痕迹会照常消失。"},
         {L"隐藏增益效果", L"你自身的增益（祷告、魔法、丸药、护符等）不再在身上显示粒子或光芒。效果完全相同，保留音效，隐身仍然有效。武器增益保持原样（见下方选项）。对你使用的下一个增益生效。"},
         {L"隐藏武器增益效果", L"油脂和武器附魔不再在武器上显示光芒或粒子。效果完全相同，保留音效。对你使用的下一个油脂或附魔生效。"},
@@ -8812,6 +11523,7 @@ const Texts kChinese{
         {L"扩展范围", L"默认关闭。此菜单中的许多滑块可调范围更大，下方另有一行“倍率”（x1 至 x100）用于放大数值。重启游戏后生效。"},
         {L"高亮已更改的选项", L"默认关闭。不在游戏默认值的选项名称会以颜色显示，一眼就能看出改过什么。立即生效。"},
         {L"重复召唤同一骨灰", L"开启“同时召唤多个骨灰”时，再次使用已召唤骨灰的道具会再召唤一次，而不是解除它，这样可以同时拥有多个相同的骨灰；每次都会消耗 FP。“解除所有骨灰”可将其全部解除。默认关闭：道具会解除该骨灰。"},
+        {L"自由战斗", L"默认关闭。召唤的骨灰在哪里自由战斗，不会被传送回你身边而打断战斗：头目场地，仅在那里；全部，头目场地和任何徒步战斗。战斗结束后，留在远处的骨灰会回到你身边。所有模式下骨灰仍会和你一起穿过雾门。立即生效。"},
         {L"偏转判定时间 (%)（测试版）", L"测试版：使用偏转硬泪滴时，延长完美防御的判定时间。100% 为游戏原本的判定（举盾时 6 帧，连续偏转后会变短）；200% 将第一次的判定时间翻倍。仅作用于你的角色。"},
         {L"骨灰不再呈幽灵外观", L"召唤的骨灰（以及瑟留斯的人偶）不再呈现蓝色幽灵外观，而是显示为实体角色。效果完全不变。从下一次召唤的骨灰开始生效。"},
         {L"叠加自身增益（测试版）", L"测试版：同类的自身增益不再互相覆盖，例如“火焰，赐我力量”、“黄金屏障”和水煮螃蟹，或“黄金誓约”和振奋香药，都能同时生效。再次使用同一增益仍只会刷新时间。从下一次使用的增益开始生效。"},
@@ -8832,6 +11544,21 @@ const Texts kChinese{
         {L"魅惑所有敌人（测试版）", L"测试版：魅惑树枝也对游戏设为免疫的敌人生效，例如黑骑士或骷髅。只影响开启后出现的敌人：请在赐福处休息。部分敌人被魅惑时可能无法正常战斗。"},
         {L"魅惑头目（测试版）", L"测试版：魅惑树枝也对头目生效。被魅惑的头目可能使其阶段或脚本战斗停滞最多 3 分钟。更改后请在赐福处休息。"},
         {L"物体跟随互动速度（测试版）", L"测试版：宝箱、门和拉杆也按互动速度运动。升降机保持原速。周围的特效不变。同一时刻开始运动的其他物体可能短暂加速。默认关闭。"},
+        {L"新游戏+ 架势调整 (%)（测试版）", L"测试版：从 NG+2 起，游戏会改变敌人的架势，从 NG+2 的 x0.95 到 NG+7 的 x0.6。100% 保留该改变，0% 将其移除，让敌人保持一周目的架势。仅对新游戏+存档有效。对之后出现的敌人生效：在赐福处休息。"},
+        {L"关闭镜头震动（测试版）", L"测试版：攻击、落地和事件不再使镜头震动，由此产生的手柄震动也会停止。对新的震动立即生效。"},
+        {L"丢弃或扔掉任意物品（测试版）", L"测试版：除重要道具和大卢恩外，所有武器、防具、护符、战灰和道具都可以丢弃或扔掉（圣杯瓶除外）。丢在地上的物品在离开区域前会一直留着；扔掉的物品会永久消失。立即生效。"},
+        {L"……包括重要道具（测试版）", L"测试版：重要道具、大卢恩和圣杯瓶也可以丢弃。扔掉剧情需要的物品（如徽章或钥匙）可能导致无法继续推进。装备在快捷栏中的圣杯瓶会保留一个：从快捷栏卸下后才能丢弃最后一个。需要先开启上一个选项。"},
+        {L"武器强化等级", L"物品商店（F11 > 物品商店）中武器的强化等级。失色武器按自己的等级换算：这里的 +25 对它们是 +10。无法强化的武器保持 +0。下次打开商店时生效。"},
+        {L"骨灰强化等级", L"物品商店中骨灰的强化等级，最高 +10 或各骨灰的最高等级。下次打开商店时生效。"},
+        {L"价格 (%)", L"物品商店中所有物品的价格，按出售价值的比例计算。0% 时全部免费。下次打开商店时生效。"},
+        {L"NPC 召唤器", L"默认关闭。在任何地方召唤任意敌人、头目或 NPC，用于测试战斗和设置：F11 > NPC Spawner，或 Mod Settings > NPC Spawner，有其自己的设置（NativeTweaks.dll 旁的 NpcSpawner.ini）。更改后需重启游戏。若单独安装了 NpcSpawner.dll，则此项不可用，使用该文件。"},
+        {L"死亡布娃娃（测试版）", L"测试版：你或人形角色（NPC、入侵者、其他褪色者）死亡时，身体会瘫倒并留在地上，而不是逐渐消失，效果同 Dweet 的 Player Ragdoll Physics。其他敌人本来就会留在地上；头目保持其原有的死亡方式。从下一次死亡开始生效。"},
+        {L"保留尸体（测试版）", L"测试版：死亡后会逐渐消失或消散的头目及其他生物（骷髅、螃蟹、巨魔、龙等）会以死亡时的最后姿势留在地上。你、灵马、骨灰、与你一同召唤的同伴以及幽灵角色仍会像游戏中一样消失。尚未在所有头目上测试：如果头目的卢恩、雾门或事件没有出现，请关闭此项。从下一次死亡开始生效。"},
+        {L"战技速度 (%)", L"你的武器战技（战灰与专属战技）。它们使用此项而不是攻击速度，普通攻击保持各自的速度。与整体速度相乘。"},
+        {L"治愈光环（HP/秒）", L"无需穿着即可获得更强的临终礼服光环：你和 7 米内的同伴（包括骨灰）每秒恢复这么多血量。礼服本身只为同伴每秒恢复 2 点，不会治疗穿着者。设为 0 关闭。约一秒内生效。"},
+        {L"获得材料 (%)", L"每个采集点、尸体、宝箱和敌人掉落给你的制作材料数量：200% 为两倍。仅限制作配方使用的材料。物品掉落率决定敌人掉落的频率。下次拾取时生效。"},
+        {L"战斗中制作", L"与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
+        {L"战斗中查看地图", L"与敌人战斗时也能打开地图，战斗开始时地图也不会关闭。快速传送仍遵循游戏规则（或随处快速传送）。立即生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -8841,13 +11568,13 @@ const Texts kChinese{
 // Menu pages in display order; each lists its options in display order.
 struct Layout { Category category; std::initializer_list<Id> ids; };
 const Layout kLayout[]{
-    {cat_survival, {god_mode, no_death, no_fall_damage, max_hp, max_fp, max_stamina, hp_regen_points,
+    {cat_survival, {god_mode, no_death, no_fall_damage, max_hp, max_fp, max_stamina, hp_regen_points, healing_aura,
         fp_regen_points, stamina_regen_points, flask_hp, flask_fp}},
     {cat_equipment, {equip_weight, weapon_weight, weapon_requirements, spell_no_requirements, spell_one_slot,
-        carry_max, hide_helmet}},
+        carry_max, hide_helmet, drop_any, drop_key_items}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
-    {cat_movement, {speed_global, speed_attack, speed_spell, speed_roll, speed_move, speed_walk, speed_run, speed_sprint,
+    {cat_movement, {speed_global, speed_attack, speed_skill, speed_spell, speed_roll, speed_move, speed_walk, speed_run, speed_sprint,
         speed_jump, speed_item, speed_interact, interaction_objects,
         jump_height, jump_distance}},
     {cat_defense, {dodge_frames, parry_frames, deflect_window, perfect_guard, knockdown_invincible, item_super_armor}},
@@ -8858,25 +11585,28 @@ const Layout kLayout[]{
     {cat_taken, {damage_taken, taken_physical, taken_magic, taken_fire, taken_lightning, taken_holy,
         knockback_taken, die_one_hit}},
     {cat_poise, {player_poise, player_poise_lock, posture_taken, posture_one_hit_taken, posture_dealt,
-        posture_one_hit, enemy_poise, enemy_poise_lock}},
+        posture_one_hit, enemy_poise, enemy_poise_lock, ng_poise}},
     {cat_status, {status_buildup, buildup_bleed, buildup_poison, buildup_rot, buildup_frost, buildup_sleep,
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
     {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, charm_all_enemies, charm_bosses,
         enemies_no_attack, enemies_no_move,
-        enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable}},
+        enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable, npc_spawner}},
     // Summon Melina and Melina companion (summon_melina, melina_companion) stay out
     // of the menu: work in progress, moving to a separate mod (2026-10-28).
-    {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
+    {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_free_fighting, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
-    {cat_runes, {rune_loss_off, runes_gained, loot_drop, shop_price, upgrade_cost, upgrade_free, craft_free}},
-    {cat_map, {all_graces, reveal_map, fast_travel_anywhere, open_mirror, open_level_up, open_rebirth}},
+    {cat_runes, {rune_loss_off, runes_gained, loot_drop, materials_found, shop_price, upgrade_cost, upgrade_free, craft_free,
+        craft_in_combat}},
+    {cat_item_shop, {shop_weapon_level, shop_spirit_level, shop_item_price}},
+    {cat_map, {all_graces, reveal_map, map_in_combat, fast_travel_anywhere, open_mirror, open_level_up, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on,
-        lock_on_distance}},
+        lock_on_distance, camera_shake_off}},
     {cat_image, {vignette_off, chromatic_off, sharpen_off, aa_off, motion_blur_off, dof_off, animation_distance,
-        clean_characters, player_clean, hide_buff_effects, hide_weapon_buff_effects, solid_ashes, solid_ghosts}},
+        clean_characters, player_clean, hide_buff_effects, hide_weapon_buff_effects, solid_ashes, solid_ghosts,
+        ragdoll_death, keep_bodies}},
     {cat_display, {fps_unlock, fps_limit, refresh_rate, ultrawide}},
     {cat_interface, {hud_screen_edges, hud_scale, menu_edges, pause_key, skip_intro, dialog_yes_default,
         extended_ranges, highlight_changed}},
@@ -9140,6 +11870,432 @@ std::wstring maybe_traditional(std::string_view lang, const wchar_t* text) {
     return lang == "zht" ? zht::convert(std::wstring_view(text)) : std::wstring(text);
 }
 
+// Item Shop in the ERNativeUI fork's talk menu (F11). Pages: 0 = sections,
+// 100 + section = its groups, 1000 + group = base game / Shadow of the
+// Erdtree. A shop row closes the menu and opens the game's shop over that
+// group's rows (msa\src\game_menus.rs waits a few frames for the menu to go).
+using TalkBuildFn = void(ERUI_CALL*)(void*, void*, std::uint32_t);
+using TalkChooseFn = void(ERUI_CALL*)(void*, void*, std::uint32_t, std::uint32_t);
+using TalkRegisterFn = ERUI_Result(ERUI_CALL*)(const ERUI_Utf16View*, TalkBuildFn, TalkChooseFn, void*, std::uint64_t*);
+using TalkAddRowFn = ERUI_Result(ERUI_CALL*)(void*, std::uint32_t, const ERUI_Utf16View*);
+using TalkMenuFn = ERUI_Result(ERUI_CALL*)(void*, std::uint32_t);
+using TalkCloseFn = ERUI_Result(ERUI_CALL*)(void*);
+using TalkOpenFn = ERUI_Result(ERUI_CALL*)(std::uint64_t);
+using TalkOpenAtFn = ERUI_Result(ERUI_CALL*)(std::uint64_t, std::uint32_t);
+struct TalkApi {
+    TalkRegisterFn register_entry{};
+    TalkAddRowFn add_row{};
+    TalkMenuFn open_page{};
+    TalkCloseFn close{};
+    TalkOpenFn open{};
+    TalkCloseFn back{};  // optional
+    TalkOpenAtFn open_at{};  // optional (fork r157-talk13): reopen at one page
+};
+// The page to come back to after a shop: the base / DLC choice of its
+// section when it has both, else the section list (0).
+std::atomic<std::uint32_t> g_talk_return_page{0};
+TalkApi g_talk{};
+std::uint64_t g_talk_entry{};
+
+const wchar_t* shop_text(const ShopText& text) noexcept {
+    if (g_profile_language == "es") return text.es;
+    if (g_profile_language == "zh" || g_profile_language == "zht") return text.zh;
+    return text.en;
+}
+
+void talk_row(void* menu, std::uint32_t row, const std::wstring& text) noexcept {
+    try {
+        const std::wstring shown = maybe_traditional(g_profile_language, text.c_str());
+        ERUI_Utf16View view{};
+        view.data = reinterpret_cast<const std::uint16_t*>(shown.c_str());
+        view.length = static_cast<std::uint32_t>(shown.size());
+        g_talk.add_row(menu, row, &view);
+    } catch (...) {
+    }
+}
+
+std::int32_t shop_section_total(int s) noexcept { return g_item_shop.items[s][0] + g_item_shop.items[s][1]; }
+
+// The shop's "all items" sort: GameDataMan +0x60 = CSMenuSystemSaveLoad,
+// +0x1440 sorts[20] (u32), index 12 = all items; 0x80005141 = item type,
+// ascending. With it the shop groups items by type with a gap between
+// groups, as the inventory does (Glorious Merchant, MIT, sets the same).
+// It is the player's saved sort for that list, so restore_shop_sort puts
+// the player's own value back when our shop closes.
+std::uint32_t write_shop_sort() noexcept {
+    std::uintptr_t gdm{}, menu_save{};
+    if (!g_statics.game_data_man || !game::read(g_statics.game_data_man, gdm) || !gdm ||
+        !game::read(gdm + 0x60, menu_save) || !menu_save) return 0xFFFFFFFFu;
+    std::uint32_t current{};
+    if (!game::read(menu_save + 0x1470, current)) return 0xFFFFFFFEu;
+    game::write<std::uint32_t>(menu_save + 0x1470, 0x80005141u);
+    return current;
+}
+
+// Glorious Merchant writes the sort right after the game opens the shop, so
+// it is written now and again while the shop opens (the request waits four
+// frames), for about one second; the log says what was there.
+// The player's own "all items" sort, put back when our shop closes: it is
+// saved with the character (audit 2026-11-08). 0 = nothing to restore.
+std::atomic<std::uint32_t> g_saved_shop_sort{0};
+
+void set_shop_sort_by_type() noexcept {
+    const std::uint32_t before = write_shop_sort();
+    std::uint32_t none = 0;
+    if (before < 0xFFFFFFFEu && before != 0x80005141u) g_saved_shop_sort.compare_exchange_strong(none, before);
+    // msa\src\game_menus.rs sets it again right after the shop opens.
+}
+
+void restore_shop_sort() noexcept {
+    const std::uint32_t saved = g_saved_shop_sort.exchange(0);
+    if (!saved) return;
+    std::uintptr_t gdm{}, menu_save{};
+    if (!g_statics.game_data_man || !game::read(g_statics.game_data_man, gdm) || !gdm ||
+        !game::read(gdm + 0x60, menu_save) || !menu_save) return;
+    game::write<std::uint32_t>(menu_save + 0x1470, saved);
+}
+
+extern "C" std::uintptr_t nt_top_menu_job();
+
+void write_shop_layout(int section, int dlc, bool ours) noexcept {
+    for (const ArmourLayoutCell& cell : g_shop_layout[section][dlc]) {
+        game::write<std::int32_t>(cell.row + cell.sort_offset, ours ? cell.sort_id : cell.original_sort_id);
+        game::write<std::uint8_t>(cell.row + cell.group_offset, ours ? cell.sort_group : cell.original_sort_group);
+        if (cell.original_slot != 0xFF)
+            game::write<std::uint8_t>(cell.row + 0xD6, ours ? std::uint8_t{0} : cell.original_slot);
+    }
+}
+
+std::atomic<int> g_shop_layout_section{-1};
+std::atomic<int> g_shop_layout_dlc{0};
+
+struct ArmourLayoutJob { int dlc; int generation; };
+
+// Waits for the shop to open (a menu job appears after the first 300 ms,
+// which the F11 list may still use) and then to close (no menu job for
+// 100 ms), and puts the game's values back. If it never opens, or the menu
+// state is unknown, it restores after 5 s.
+DWORD WINAPI armour_layout_worker(void* parameter) noexcept {
+    const ArmourLayoutJob job = *static_cast<ArmourLayoutJob*>(parameter);
+    delete static_cast<ArmourLayoutJob*>(parameter);
+    bool seen_open = false;
+    int closed_ticks = 0;
+    // 25 ms polls (user, 08-11: coming back felt slower than going in):
+    // closed after two empty reads, about 50 ms.
+    for (int tick = 0; tick < 24000; ++tick) {
+        Sleep(25);
+        if (g_armour_layout_generation.load() != job.generation) return 0;  // a newer shop took over
+        const std::uintptr_t top = nt_top_menu_job();
+        if (top == static_cast<std::uintptr_t>(-1)) {
+            if (!seen_open && tick > 200) break;  // no menu state: never opened
+            continue;
+        }
+        if (top != 0) {
+            if (tick >= 12) seen_open = true;
+            closed_ticks = 0;
+        } else if (seen_open && ++closed_ticks >= 2) {
+            break;
+        } else if (!seen_open && tick > 200) {
+            break;  // never opened
+        }
+    }
+    if (g_armour_layout_generation.load() != job.generation) return 0;
+    if (g_shop_sell_zero) *g_shop_sell_zero = 0;
+    if (g_armour_layout_applied.exchange(false)) {
+        write_shop_layout(g_shop_layout_section.load(), job.dlc, false);
+    }
+    restore_shop_sort();
+    // Leaving the shop goes back to F11 > Item Shop (user, r157-test22), so
+    // the next shop is one choice away; Back there closes the menu.
+    if (seen_open && g_talk.open && g_talk_entry) {
+        const std::uint32_t page = g_talk_return_page.load();
+        const ERUI_Result result = page && g_talk.open_at ? g_talk.open_at(g_talk_entry, page) : g_talk.open(g_talk_entry);
+        if (result != ERUI_OK) {
+            wchar_t message[100]{};
+            swprintf_s(message, L"Item shop: back to the talk menu refused (result %u).", static_cast<unsigned>(result));
+            log(message);
+        }
+    }
+    return 0;
+}
+
+void apply_shop_layout(int section, int dlc) noexcept {
+    const int generation = ++g_armour_layout_generation;
+    if (g_armour_layout_applied.exchange(false))  // the previous shop's values, if still applied
+        write_shop_layout(g_shop_layout_section.load(), g_shop_layout_dlc.load(), false);
+    g_shop_layout_section.store(section);
+    g_shop_layout_dlc.store(dlc);
+    if (!g_shop_layout[section][dlc].empty()) {
+        write_shop_layout(section, dlc, true);
+        g_armour_layout_applied.store(true);
+    }
+    auto* job = new (std::nothrow) ArmourLayoutJob{dlc, generation};
+    if (!job) return;
+    if (HANDLE thread = CreateThread(nullptr, 0, armour_layout_worker, job, 0, nullptr)) CloseHandle(thread);
+    else delete job;
+}
+
+void apply_shop_options(int section, int dlc) noexcept {
+    const int weapon_level = std::clamp(value_of(shop_weapon_level), 0, 25);
+    const int spirit_level = std::clamp(value_of(shop_spirit_level), 0, 10);
+    const int percent = std::clamp(value_of(shop_item_price), 0, 500);
+    const bool free_ok = g_shop_sell_zero != nullptr;
+    for (const ShopRowRef& r : g_shop_rows[section][dlc]) {
+        std::int32_t id = r.base_id;
+        if (r.kind == 1 && r.max_level > 0) {
+            const int level = r.max_level >= 25 ? weapon_level : (weapon_level * r.max_level + 12) / 25;
+            id += std::min<int>(level, r.max_level);
+        } else if (r.kind == 2) {
+            id += std::min<int>(spirit_level, r.max_level);
+        }
+        // without the sell-value hook nothing may cost less than it sells for
+        std::int32_t price = static_cast<std::int32_t>(static_cast<std::int64_t>(r.sell) * percent / 100);
+        if (!free_ok) price = std::max(price, r.sell);
+        std::memcpy(r.data + 0x00, &id, 4);
+        std::memcpy(r.data + 0x04, &price, 4);
+    }
+    if (!free_ok && percent < 100) log(L"Item shop: no sell value hook, so prices stay at least at the sell value.");
+}
+
+void open_item_shop(void* menu, int section, int dlc) noexcept {
+    g_talk_return_page.store(g_item_shop.items[section][0] > 0 && g_item_shop.items[section][1] > 0
+        ? 1000u + static_cast<std::uint32_t>(section) : 0u);
+    const std::int32_t first = g_item_shop.first[section][dlc];
+    const std::int32_t n = g_item_shop.count[section][dlc];
+    g_talk.close(menu);
+    // Another mod or a regulation reload may have replaced ShopLineupParam.
+    std::uintptr_t live{};
+    if (n <= 0 || !g_shop_holder || !game::read(g_shop_holder, live) || live != g_shop_table) {
+        log(L"Item shop: ShopLineupParam is no longer ours (another mod replaced it?); not opened.");
+        return;
+    }
+    apply_shop_options(section, dlc);
+    // With "item type" sorting the shop orders armour by slot first, so a
+    // set's own sortGroupId alone put every piece on its own line
+    // (r157-test18). The layout now also files every piece as a head while
+    // the shop is open (protectorCategory +0xD6), so sortGroupId (the set)
+    // and sortId (set x 10 + real slot) decide the order: one set per line
+    // with the game's gap between sets (test).
+    apply_shop_layout(section, dlc);  // a newer generation first: an old worker can't undo what follows
+    if (g_shop_sell_zero) *g_shop_sell_zero = 1;
+    set_shop_sort_by_type();
+    const bool queued = spirit_ashes::open_shop(first, first + n - 1);
+    if (!queued) {
+        ++g_armour_layout_generation;  // the worker stops
+        if (g_shop_sell_zero) *g_shop_sell_zero = 0;
+        if (g_armour_layout_applied.exchange(false)) write_shop_layout(section, dlc, false);
+        restore_shop_sort();
+    }
+    wchar_t message[200]{};
+    swprintf_s(message, L"Item shop: section %d %s, %d rows, weapons +%d, spirit ashes +%d, price %d%%: %s.", section,
+        dlc ? L"DLC" : L"base", n, std::clamp(value_of(shop_weapon_level), 0, 25), std::clamp(value_of(shop_spirit_level), 0, 10),
+        std::clamp(value_of(shop_item_price), 0, 500), queued ? L"opened" : L"not available");
+    log(message);
+}
+
+// F11 > Item Shop > Shop settings (user, r157-test25): the same three
+// options as the Item Shop page of Mod Settings, with a short list of
+// values each. Page 2000 shows them with their value; 2001-2003 list the
+// values, the current one marked; choosing one goes back to 2000.
+constexpr std::uint32_t kShopSettingsRow = 900;
+// F11 > Item Shop > Recover flasks (user, 08-11): a lost flask comes back
+// empty, one of it, as after drinking every charge; resting at a grace fills
+// it with the allotment the character keeps (Golden Seeds included). Only
+// what is missing; Crimson and Cerulean share the Sacred Tear level, so a
+// missing one takes the other's, or the level chosen on page 3001.
+constexpr std::uint32_t kFlaskRow = 901;
+constexpr std::uint32_t kFlaskPage = 3000;
+constexpr std::uint32_t kFlaskLevelPage = 3001;
+extern "C" std::uint8_t nt_flask_state(std::int32_t* out);
+int g_flask_level = 0;  // used when neither tears flask is left
+bool g_flask_given[3]{};
+
+std::wstring goods_name(std::int32_t id) {
+    std::wstring name;
+    int found = 0;
+    if (!item_name({111, 10, 319, 419}, id, name, &found)) name = L"#" + std::to_wstring(id);
+    return name;
+}
+constexpr std::uint32_t kShopSettingsPage = 2000;
+struct ShopSetting {
+    Id id;
+    ShopText name;
+    std::initializer_list<int> values;
+};
+const ShopSetting kShopSettings[]{
+    {shop_weapon_level, {L"Weapon level", L"Nivel de las armas", L"武器强化等级"}, {0, 5, 10, 15, 20, 25}},
+    {shop_spirit_level, {L"Spirit ash level", L"Nivel de las cenizas", L"骨灰强化等级"}, {0, 3, 5, 8, 10}},
+    {shop_item_price, {L"Price", L"Precio", L"价格"}, {0, 25, 50, 100, 200}},
+};
+
+std::wstring shop_setting_value(Id id, int value) {
+    static constexpr ShopText kFree{L"Free", L"Gratis", L"免费"};
+    static constexpr ShopText kMax{L" (max, somber +10)", L" (máx., sombrías +10)", L"（最高，失色武器 +10）"};
+    if (id == shop_item_price) return value == 0 ? std::wstring(shop_text(kFree)) : std::to_wstring(value) + L"%";
+    std::wstring text = L"+" + std::to_wstring(value);
+    if (id == shop_weapon_level && value == 25) text += shop_text(kMax);
+    return text;
+}
+
+void ERUI_CALL item_shop_build(void*, void* menu, std::uint32_t page) noexcept {
+    try {
+        static constexpr ShopText kSettings{L"Shop settings", L"Ajustes de la tienda", L"商店设置"};
+        static constexpr ShopText kCurrent{L" (current)", L" (actual)", L"（当前）"};
+        static constexpr ShopText kFlasks{L"Recover flasks", L"Recuperar frascos", L"找回圣杯瓶"};
+        if (page == 0) {
+            talk_row(menu, kShopSettingsRow, shop_text(kSettings));
+            if (g_item_gib) talk_row(menu, kFlaskRow, shop_text(kFlasks));
+            for (int s = 0; s < sec_count; ++s)
+                if (shop_section_total(s))
+                    talk_row(menu, static_cast<std::uint32_t>(s),
+                        std::wstring(shop_text(kShopSections[s])) + L" (" + std::to_wstring(shop_section_total(s)) + L")");
+        } else if (page >= 1000 && page < 1000u + sec_count) {
+            static constexpr ShopText kBase{L"Base game", L"Juego base", L"本体"};
+            static constexpr ShopText kDlc{L"Shadow of the Erdtree", L"Shadow of the Erdtree", L"黄金树幽影"};
+            const int s = static_cast<int>(page - 1000);
+            talk_row(menu, 0, std::wstring(shop_text(kBase)) + L" (" + std::to_wstring(g_item_shop.items[s][0]) + L")");
+            talk_row(menu, 1, std::wstring(shop_text(kDlc)) + L" (" + std::to_wstring(g_item_shop.items[s][1]) + L")");
+        } else if (page == kFlaskPage) {
+            static constexpr ShopText kHave{L": in your inventory", L": lo tienes", L"：已持有"};
+            static constexpr ShopText kGiven{L": recovered, rest at a grace", L": recuperado, descansa en un lugar de gracia",
+                L"：已找回，请在赐福处休息"};
+            static constexpr ShopText kRecover{L": recover", L": recuperar", L"：找回"};
+            static constexpr ShopText kLevel{L"Level for the tears flasks", L"Nivel de los frascos de lágrimas", L"露滴圣杯瓶等级"};
+            static constexpr ShopText kNoPlayer{L"Load a character first.", L"Carga antes un personaje.", L"请先读取角色。"};
+            static constexpr ShopText kHint{L"Resting at a site of grace fills them with your uses.",
+                L"Al descansar en un lugar de gracia se llenan con tus usos.", L"在赐福处休息即可按你的次数补满。"};
+            std::int32_t s[5]{};
+            if (!nt_flask_state(s)) {
+                talk_row(menu, 99, shop_text(kNoPlayer));
+            } else {
+                const int level = s[0] >= 0 ? (s[0] - 1000) / 2 : s[1] >= 0 ? (s[1] - 1050) / 2 : g_flask_level;
+                const std::int32_t empty[3]{1000 + level * 2, 1050 + level * 2, 251};
+                for (int k = 0; k < 3; ++k) {
+                    const bool have = s[k] >= 0;
+                    if (have) g_flask_given[k] = false;
+                    const std::wstring name = goods_name(have ? s[k] : empty[k]);
+                    talk_row(menu, static_cast<std::uint32_t>(k), name +
+                        shop_text(have ? kHave : g_flask_given[k] ? kGiven : kRecover));
+                }
+                if (s[0] < 0 && s[1] < 0)
+                    talk_row(menu, 10, std::wstring(shop_text(kLevel)) + L": +" + std::to_wstring(g_flask_level));
+                talk_row(menu, 99, shop_text(kHint));
+            }
+        } else if (page == kFlaskLevelPage) {
+            for (int l = 0; l <= 12; ++l)
+                talk_row(menu, static_cast<std::uint32_t>(l),
+                    L"+" + std::to_wstring(l) + (l == g_flask_level ? shop_text(kCurrent) : L""));
+        } else if (page == kShopSettingsPage) {
+            for (std::uint32_t k = 0; k < std::size(kShopSettings); ++k)
+                talk_row(menu, k, std::wstring(shop_text(kShopSettings[k].name)) + L": " +
+                    shop_setting_value(kShopSettings[k].id, value_of(kShopSettings[k].id)));
+        } else if (page > kShopSettingsPage && page <= kShopSettingsPage + std::size(kShopSettings)) {
+            const ShopSetting& setting = kShopSettings[page - kShopSettingsPage - 1];
+            const int current = value_of(setting.id);
+            std::uint32_t row = 0;
+            for (const int value : setting.values)
+                talk_row(menu, row++, shop_setting_value(setting.id, value) + (value == current ? shop_text(kCurrent) : L""));
+        }
+    } catch (...) {
+    }
+}
+
+void ERUI_CALL item_shop_choose(void*, void* menu, std::uint32_t page, std::uint32_t row) noexcept {
+    if (page == 0 && row == kShopSettingsRow) {
+        g_talk.open_page(menu, kShopSettingsPage);
+        return;
+    }
+    if (page == 0 && row == kFlaskRow) {
+        g_talk.open_page(menu, kFlaskPage);
+        return;
+    }
+    if (page == kFlaskLevelPage) {
+        if (row <= 12) g_flask_level = static_cast<int>(row);
+        if (g_talk.back) g_talk.back(menu);
+        return;
+    }
+    if (page == kFlaskPage) {
+        if (row == 10) {
+            g_talk.open_page(menu, kFlaskLevelPage);
+            return;
+        }
+        std::int32_t s[5]{};
+        if (row > 2 || !nt_flask_state(s) || s[row] >= 0 || g_flask_given[row]) return;  // only what is missing
+        const int level = s[0] >= 0 ? (s[0] - 1000) / 2 : s[1] >= 0 ? (s[1] - 1050) / 2 : g_flask_level;
+        const std::int32_t empty[3]{1000 + level * 2, 1050 + level * 2, 251};
+        const ItemGibEntry item{0x40000000u | static_cast<std::uint32_t>(empty[row]), 1, -1, -1};
+        const bool given = give_items(&item, 1);
+        if (given) g_flask_given[row] = true;
+        wchar_t message[160]{};
+        swprintf_s(message, L"Recover flasks: goods %d (empty, +%d) %ls; HP/FP allotment %d/%d.", empty[row], level,
+            given ? L"given" : L"not given", s[3], s[4]);
+        log(message);
+        return;  // the page is built again with the new state
+    }
+    if (page == kShopSettingsPage) {
+        if (row < std::size(kShopSettings)) g_talk.open_page(menu, kShopSettingsPage + 1 + row);
+        return;
+    }
+    if (page > kShopSettingsPage && page <= kShopSettingsPage + std::size(kShopSettings)) {
+        const ShopSetting& setting = kShopSettings[page - kShopSettingsPage - 1];
+        if (row < setting.values.size()) {
+            const int value = setting.values.begin()[row];
+            if (Scale* const scale = scale_of(setting.id)) set_scale_index(*scale, 0);
+            if (set_option_raw(setting.id, value)) request_save();
+        }
+        // back to Shop settings, rebuilt with the new value
+        if (g_talk.back) g_talk.back(menu);
+        return;
+    }
+    if (!g_item_shop.ready) return;
+    if (page == 0 && row < static_cast<std::uint32_t>(sec_count)) {
+        const int s = static_cast<int>(row);
+        const bool base = g_item_shop.items[s][0] > 0;
+        const bool dlc = g_item_shop.items[s][1] > 0;
+        if (base && dlc) g_talk.open_page(menu, 1000u + row);
+        else if (base || dlc) open_item_shop(menu, s, dlc ? 1 : 0);
+    } else if (page >= 1000 && page < 1000u + sec_count && row < 2) {
+        open_item_shop(menu, static_cast<int>(page - 1000), static_cast<int>(row));
+    }
+}
+
+
+
+void register_item_shop_talk() noexcept {
+    if (g_talk_registered || g_talk_tries > 20) return;
+    ++g_talk_tries;
+    const HMODULE host = GetModuleHandleW(L"ERNativeUI.dll");
+    if (!host) return;
+    g_talk.register_entry = reinterpret_cast<TalkRegisterFn>(GetProcAddress(host, "ERNativeUIFork_TalkRegister"));
+    g_talk.add_row = reinterpret_cast<TalkAddRowFn>(GetProcAddress(host, "ERNativeUIFork_TalkAddRow"));
+    g_talk.open_page = reinterpret_cast<TalkMenuFn>(GetProcAddress(host, "ERNativeUIFork_TalkOpenPage"));
+    g_talk.close = reinterpret_cast<TalkCloseFn>(GetProcAddress(host, "ERNativeUIFork_TalkClose"));
+    if (!g_talk.register_entry || !g_talk.add_row || !g_talk.open_page || !g_talk.close) {
+        g_talk_tries = 100;
+        log(L"Item shop: this ERNativeUI has no talk menu (F11); the item shop has no menu.");
+        return;
+    }
+    try {
+        static constexpr ShopText kName{L"Item Shop", L"Tienda de objetos", L"物品商店"};
+        const std::wstring name = maybe_traditional(g_profile_language, shop_text(kName));
+        ERUI_Utf16View view{};
+        view.data = reinterpret_cast<const std::uint16_t*>(name.c_str());
+        view.length = static_cast<std::uint32_t>(name.size());
+        std::uint64_t entry{};
+        g_talk.open = reinterpret_cast<TalkOpenFn>(GetProcAddress(host, "ERNativeUIFork_TalkOpen"));
+        g_talk.back = reinterpret_cast<TalkCloseFn>(GetProcAddress(host, "ERNativeUIFork_TalkBack"));
+        g_talk.open_at = reinterpret_cast<TalkOpenAtFn>(GetProcAddress(host, "ERNativeUIFork_TalkOpenAt"));
+        const ERUI_Result result = g_talk.register_entry(&view, item_shop_build, item_shop_choose, nullptr, &entry);
+        g_talk_registered = result == ERUI_OK;
+        if (g_talk_registered) g_talk_entry = entry;
+        wchar_t message[120]{};
+        swprintf_s(message, L"Item shop: talk menu entry %s (result %u).", g_talk_registered ? L"registered" : L"refused",
+            static_cast<unsigned>(result));
+        log(message);
+    } catch (...) {
+    }
+}
+
 live_text::Texts profile_row_texts(std::string_view lang, int slot, bool save) {
     const ProfileTexts& t = profile_texts(lang);
     if (save) {
@@ -9285,6 +12441,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
          GetPrivateProfileIntW(L"Diagnostics", L"PerfLog", 0, g_config_path.c_str()) != 0);
     perf::configure(g_config_path, g_log);
     start_spirit_ashes();
+    start_npc_spawner();
     g_perf_death_hook = perf::timer(L"hook_death");
     g_perf_death_lock = perf::timer(L"hook_death_lock_wait");
     g_perf_downed_hook = perf::timer(L"hook_downed");
@@ -9300,6 +12457,15 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     resolve_jump_site();
     install_fall_hook();
     install_status_immunity_hook();
+    install_camera_shake_hook();
+    install_ragdoll_hook();
+#ifdef NT_DEV_COMBAT_TRACE
+    install_combat_trace();
+#endif
+    resolve_keep_bodies();
+    resolve_item_gib();
+    resolve_msg_lookup();
+    install_sell_value_hook();
     install_lock_range_hooks();
     install_toughness_hook();
     install_death_hook();
@@ -9313,6 +12479,9 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         if (!available(static_cast<Id>(i))) continue;
         if (value_of(static_cast<Id>(i)) != g_options[i].fallback) apply(static_cast<Id>(i));
     }
+    // On by default, and only apply() patches the spirit slot search
+    // (audit 2026-11-08: with default settings it stayed at 10 per player).
+    if (available(ash_multiple) && value_of(ash_multiple) != 0) apply(ash_multiple);
     // The layout options are skipped above while ERNativeUI.dll is not loaded yet.
     send_hud_layout(L"startup");
     if (!g_config_path.empty()) {
@@ -9324,6 +12493,8 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     if (g_window_slot) start_thread(&window_option_worker, L"window_option");
     if (g_param_event && g_statics.layout_2_7_1 && g_statics.regulation_manager) start_thread(&param_worker, L"param");
     if (g_statics.layout_2_7_1 && g_statics.world_chr_man) {
+        if (g_diagnostics) start_thread(&boss_health_log_worker, L"boss_health_log");
+        start_thread(&health_limit_worker, L"health_limit");
         start_thread(&speed_worker, L"speed");
         start_thread(&regen_worker, L"regen");
         start_thread(&fall_worker, L"fall");
@@ -9465,6 +12636,11 @@ constexpr const wchar_t* kJourneySpanish[kJourneyCount]{
     L"Tu partida", L"NG+1", L"NG+2", L"NG+3", L"NG+4", L"NG+5", L"NG+6", L"NG+7"};
 constexpr const wchar_t* kJourneyChinese[kJourneyCount]{
     L"存档周目", L"NG+1", L"NG+2", L"NG+3", L"NG+4", L"NG+5", L"NG+6", L"NG+7"};
+// SpiritFreeFighting values (msa area_follow FREE_FIGHTING_*).
+constexpr std::size_t kFreeFightCount = 3;
+constexpr const wchar_t* kFreeFightEnglish[kFreeFightCount]{L"Off", L"Boss arenas", L"Everywhere"};
+constexpr const wchar_t* kFreeFightSpanish[kFreeFightCount]{L"Desactivada", L"Arenas de jefe", L"En todas partes"};
+constexpr const wchar_t* kFreeFightChinese[kFreeFightCount]{L"关闭", L"头目场地", L"全部"};
 constexpr const wchar_t* kWeatherChinese[kWeatherCount]{
     L"晴天", L"晴朗", L"少云", L"多云", L"雨", L"雨云", L"风雨", L"风雾", L"雪",
     L"大雪", L"雾", L"浓雾", L"大风多云", L"雨雾", L"雪雾", L"阵雨"};
@@ -9503,6 +12679,9 @@ std::vector<std::wstring> value_names(std::string_view lang, Id i) {
     } else if (i == world_journey) {
         english = kJourneyEnglish, spanish = kJourneySpanish, chinese = kJourneyChinese;
         count = kJourneyCount;
+    } else if (i == ash_free_fighting) {
+        english = kFreeFightEnglish, spanish = kFreeFightSpanish, chinese = kFreeFightChinese;
+        count = kFreeFightCount;
     }
     const wchar_t* const* names = english;
     if (lang == "es") names = spanish;
@@ -9548,6 +12727,50 @@ std::wstring option_help(std::string_view lang, Id i) {
 }
 
 } // namespace
+
+// Give runes (user, 14-11): a text box on the Runes page; the number typed
+// is added to the runes you carry (PlayerGameData +0x6C, rune_count in
+// fromsoftware-rs; GameDataMan -> +0x8), up to 999,999,999, when confirmed.
+void ERUI_CALL give_runes_changed(void*, const ERUI_TextInputChangeContext* context) noexcept {
+    erui::TextInputChange change{};
+    if (!erui::detail::make_text_input_change(context, change)) return;
+    std::wstring digits;
+    for (const wchar_t c : change.value)
+        if (c >= L'0' && c <= L'9') digits += c;
+    if (digits.empty() || digits.size() > 10) return;
+    const unsigned long long amount = std::wcstoull(digits.c_str(), nullptr, 10);
+    std::uintptr_t manager{}, player{};
+    std::uint32_t runes{};
+    if (!amount || !g_statics.game_data_man || !game::read(g_statics.game_data_man, manager) || !manager ||
+        !game::read(manager + 0x8, player) || !player || !game::read(player + 0x6C, runes))
+        return;
+    const unsigned long long total = std::min<unsigned long long>(999999999ull, runes + amount);
+    if (!game::write<std::uint32_t>(player + 0x6C, static_cast<std::uint32_t>(total))) return;
+    wchar_t message[128]{};
+    swprintf_s(message, L"Give runes: +%llu (now %llu).", total - runes, total);
+    log(message);
+}
+
+void add_give_runes_row(erui::Page& page, std::string_view l) noexcept {
+    const bool es = l == "es", zh = l == "zh" || l == "zht";
+    erui::TextInputOptions options{};
+    options.placeholder = es ? L"Cantidad" : zh ? L"数量" : L"Amount";
+    options.maximum_length = 10;
+    const erui::RowHandle row = page.add_text_input(
+        es ? L"Dar runas" : zh ? L"给予卢恩" : L"Give runes",
+        es ? L"Escribe una cantidad y confírmala: se suma a las runas que llevas (hasta 999.999.999). Hace falta una partida cargada."
+           : zh ? L"输入数量并确认：会加到你携带的卢恩上（最多 999,999,999）。需要已载入存档。"
+                : L"Type an amount and confirm it: it is added to the runes you carry (up to 999,999,999). Needs a loaded game.",
+        options, &give_runes_changed, nullptr);
+    if (row == ERUI_INVALID_ROW) log(L"Give runes: the text box could not be added.");
+}
+
+void add_npc_spawner_pages(erui::Page& parent) noexcept {
+    if (!g_npc_spawner_started) return;
+    log(npc_spawner::add_pages(parent.provider_handle(), parent.handle())
+            ? L"NPC Spawner (built in): its pages are in Mod Settings after Vanilla Settings."
+            : L"NPC Spawner (built in): its pages could not all be added (some rows may be missing).");
+}
 
 void add_pages(erui::Page& parent, const char* language) noexcept {
     const std::string_view lang = language ? language : "en";
@@ -9654,6 +12877,7 @@ void add_pages(erui::Page& parent, const char* language) noexcept {
                 });
             }
         }
+        if (which == cat_runes) add_give_runes_row(page, lang);
         const auto page_restore = page.add_button(t.restore_page.label, t.restore_page.help,
             &restore_page_defaults, const_cast<Layout*>(&layout));
         live_text::track_row(page_restore, [](const char* l) {

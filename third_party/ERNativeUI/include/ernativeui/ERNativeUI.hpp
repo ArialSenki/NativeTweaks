@@ -1568,6 +1568,11 @@ public:
     Page() = default;
     // NativeTweaks fork: exposes the handle for live text updates.
     [[nodiscard]] ERUI_PageHandle handle() const noexcept { return page_; }
+    // NativeTweaks fork: the provider this page belongs to (NPC Spawner,
+    // built in, adds its pages to NativeTweaks' own provider).
+    [[nodiscard]] ERUI_ProviderHandle provider_handle() const noexcept {
+        return draft_ ? draft_->provider_ : ERUI_INVALID_PROVIDER;
+    }
 
     RowHandle add_button(
         std::wstring_view label,

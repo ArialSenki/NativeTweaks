@@ -1,6 +1,6 @@
 # Instalar NativeTweaks con Elden Mod Loader
 
-Guía para instalar NativeTweaks (**r132**) con **Elden Mod Loader** (EML, de techiew) en lugar de Mod Organizer 2 o Mod Engine. Las instrucciones cortas de los cuatro cargadores (MO2, ME3, ME2, EML) están en el `README.txt` del paquete y en la descripción de Nexus.
+Guía para instalar NativeTweaks con **Elden Mod Loader** (EML, de techiew) en lugar de Mod Organizer 2 o Mod Engine. Las instrucciones cortas de los cuatro cargadores (MO2, ME3, ME2, EML) están en el `README.txt` del paquete y en la descripción de Nexus.
 
 > ⚠️ **Sin probar.** El autor solo ha probado NativeTweaks con Mod Organizer 2. Estos pasos siguen la configuración propia de Elden Mod Loader; si algo no funciona, envía los logs (ver *Solución de problemas*).
 
@@ -8,9 +8,9 @@ Guía para instalar NativeTweaks (**r132**) con **Elden Mod Loader** (EML, de te
 
 ## Requisitos
 
-- **Elden Ring 2.7.2.0, 2.7.1.0 o 2.7.1.1**, PC (Steam). En otras versiones, las opciones cuyos datos no se encuentren aparecen en gris.
+- **Elden Ring 2.7.0.0 (1.17), 2.7.1.0 (1.17.1), 2.7.2.0 (1.17.2) o las japonesas 2.7.1.1 y 2.7.2.1**, PC (Steam). En otras versiones, las opciones cuyos datos no se encuentren aparecen en gris.
 - **Elden Mod Loader** (de su página en Nexus Mods), compatible con tu versión del juego.
-- **`NativeTweaks-r132.zip`**.
+- **El zip de NativeTweaks** (la última versión de Nexus).
 
 ## 1. Instala Elden Mod Loader
 

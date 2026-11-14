@@ -1,83 +1,51 @@
 # NativeTweaks
 
-An Elden Ring mod that adds a **NativeTweaks** tab to the game's own System
-menu. Download and player instructions are on
-[Nexus Mods](https://www.nexusmods.com/eldenring/mods/11339); this repository
-has the source.
+An Elden Ring mod DLL that adds a native **NativeTweaks** tab to the game's System menu, through a fork of [ERNativeUI](https://github.com/Flammrock/ERNativeUI). The tab holds two things:
 
-What's in the tab:
+- **Vanilla Settings**: more than 180 options for Elden Ring itself, grouped in pages (survival, equipment, resources, movement, defense, Torrent, damage, poise, status effects, spirit ashes, runes and shops, map, world, camera, image, display, interface, item shop). They apply at once and are saved in `NativeTweaks.ini`.
+- **Mod pages**: every DLL mod with an INI next to it gets a page where its values can be edited from the game. Mods can describe their INI with a template (labels, types, ranges) and can apply saved values live through an optional API.
 
-- **Mod settings.** Every DLL mod with an INI next to its DLL gets a page, so
-  its options can be changed from inside the game. Mod authors can describe
-  their options with a template ([docs/INI_TEMPLATE_FOR_MODDERS.md](docs/INI_TEMPLATE_FOR_MODDERS.md))
-  and pick changes up live ([docs/LIVE_RELOAD_GUIDE.md](docs/LIVE_RELOAD_GUIDE.md)).
-- **Vanilla Settings.** More than 150 options for the game itself on 21 pages
-  (camera, HUD, combat, dodging, Torrent, weather, spirit ashes and more),
-  applied at once, with hotkeys and profiles.
-- **[Multiple Spirit Ashes](https://github.com/ArialSenki/MultipleSpiritAshes)**,
-  built in: several spirit ashes at once, up to 500 spirits.
+It also adds entries to the ERNativeUI talk menu (F11): an **Item Shop** with every obtainable item by type, its own settings (upgrade level, price) and **Recover flasks**.
 
-Supported game versions: Elden Ring 2.7.2.0, 2.7.1.0 and 2.7.1.1, PC. Options
-whose game data isn't found on another version are greyed out. Offline only,
-with Easy Anti-Cheat disabled.
+Supported game versions: 2.7.0.0 (1.17), 2.7.1.0 (1.17.1), 2.7.2.0 (1.17.2), Japanese 2.7.1.1 and 2.7.2.1, PC. Offline only, with Easy Anti-Cheat disabled.
+
+Player documentation (installation for MO2, Mod Engine 3, Mod Engine 2 and Elden Mod Loader; every option) is the `README.txt` shipped in each release archive. The work log is [`PROGRESS.md`](PROGRESS.md) (in Spanish).
 
 ## Layout
 
-| Path | Contents |
-| --- | --- |
-| `src/` | The mod: menu pages (`native_tweaks.cpp`), vanilla options (`vanilla_settings.cpp`), hotkeys, game memory helpers, Chinese text |
-| `msa/` | [Multiple Spirit Ashes](https://github.com/ArialSenki/MultipleSpiritAshes) (git submodule, Rust), linked in as a static library |
-| `include/`, `sdk/` | C/C++ headers and an example for mods that want live reload or a provider page |
-| `third_party/ERNativeUI/` | ERNativeUI headers (MIT, by Flammrock) |
-| `docs/` | Guides for mod authors and design notes |
-| `data/` | Animation tables used by some options |
-| `tests/`, `tools/` | Unit tests, an AOB scanner and packaging helpers |
+| Path | What it is |
+|---|---|
+| `src/native_tweaks.cpp` | Start-up, connection to ERNativeUI, mod discovery, INI pages, templates, profiles, language, logging. |
+| `src/vanilla_settings.cpp` | Vanilla Settings: options, texts (en/es/zh; zht converted at run time), game hooks and param patches, item shop. |
+| `src/hotkeys.cpp` | `[Hotkeys]` in `NativeTweaks.ini`: keys that set options or load profiles. |
+| `src/game_memory.cpp` | Guarded reads, AOB scans, game statics, param tables. |
+| `src/spirit_ashes.cpp` | C++ side of the Rust staticlib below. |
+| `msa/` | Multiple Spirit Ashes (Rust, staticlib): several spirit ashes at once, area follow and free fighting, compact HUD rows, game menus (mirror, level up, rebirth, shop), flask state. `msa/standalone` builds the same code as `MultipleSpiritAshes.dll`. |
+| `third_party/ERNativeUI/include` | ERNativeUI public headers (MIT). |
+| `include/`, `sdk/`, `examples/` | Headers and samples for mod authors. |
+| `docs/` | API and template guides; `docs/historico/` keeps early research notes. |
+| `tools/audit/` | Off-line audit target (stubs for the Rust side). |
 
-## Building
+## For mod authors
 
-Requirements: MSVC 2022 build tools, CMake 3.24+, and Rust (stable,
-`x86_64-pc-windows-msvc`) for the spirit ashes library.
+- [`docs/INI_TEMPLATE_FOR_MODDERS.md`](docs/INI_TEMPLATE_FOR_MODDERS.md) and [`docs/INI_TEMPLATE_GUIDE.txt`](docs/INI_TEMPLATE_GUIDE.txt): describe an INI so its page shows proper toggles, sliders and lists.
+- [`docs/LIVE_RELOAD_API_V1.md`](docs/LIVE_RELOAD_API_V1.md) and [`docs/LIVE_RELOAD_GUIDE.md`](docs/LIVE_RELOAD_GUIDE.md): the optional `NativeTweaks_RequestReloadV1` / `NativeTweaks_GetReloadStatusV1` exports that let NativeTweaks apply saved values without a restart.
+- Your own native pages: register them with ERNativeUI directly (its public API); the old ERMS provider proposal is kept in `docs/historico/`.
+- The ERNativeUI fork's own API (talk menu, text inputs, live texts) is documented in the fork, `docs/fork/api.md`.
 
-```bat
-git clone --recursive https://github.com/ArialSenki/NativeTweaks
-cd NativeTweaks
-cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+## Build
+
+Windows x64, MSVC (Visual Studio 2022 Build Tools) and Rust (for `msa/`), CMake 3.24 or newer.
+
+```powershell
+cmake -S . -B build-nativetweaks-msvc -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build-nativetweaks-msvc
 ```
 
-That produces `NativeTweaks.dll`. The menu itself runs on ERNativeUI, and
-NativeTweaks needs the extended build of it from the
-[`nativetweaks` branch of my ERNativeUI fork](https://github.com/ArialSenki/ERNativeUI/tree/nativetweaks)
-(the official ERNativeUI.dll won't work). Build its host with
-`-DERNATIVEUI_BUILD_HOST=ON` and ship that `ERNativeUI.dll` next to
-`NativeTweaks.dll`.
+The Rust library is built by `msa\build.cmd` into `-DNT_MSA_TARGET_DIR` (default `%LOCALAPPDATA%\NativeTweaks-msa-build`). Give every checkout or worktree its own target folder: Cargo decides by path whether the library is up to date, and a shared folder can link another checkout's code. Release builds also write `NativeTweaks.pdb` (only its file name is stored in the DLL).
 
-## Ideas for contributors
+Tests: `msa\build.cmd test` (needs the game executables of each supported version, see `msa/src/hud.rs`) and the ERNativeUI fork's own CTest suite.
 
-Not planned for now, but welcome if someone wants to implement them:
+## Licences
 
-- **Search in Mod Settings:** a row that finds an option across the many pages,
-  using the native text input.
-- **A fuller status file:** other menu mods loaded, which game functions they
-  already hooked, the loader in use and unusual INI values, so one short file
-  answers most bug reports. ERNativeUI already writes a basic
-  `ERNativeUI-status.txt`.
-- **Getting ready for game patches:** on an unknown game version, look up the
-  needed addresses by pattern and write them to a file as a candidate profile,
-  to review by hand. It should never turn anything on by itself.
-
-## Credits
-
-- [ERNativeUI](https://github.com/Flammrock/ERNativeUI) by Flammrock, the
-  native menu framework this is built on.
-- [fromsoftware-rs](https://github.com/vswarte/fromsoftware-rs) by Vincent
-  Swarte and contributors, used by Multiple Spirit Ashes.
-
-## Downloads and changelog
-
-The latest build is also on the [Releases](https://github.com/ArialSenki/NativeTweaks/releases/latest) page. [CHANGELOG.md](CHANGELOG.md) lists every version, as on Nexus.
-
-## License
-
-[MIT](LICENSE). Elden Ring is a trademark of FromSoftware / Bandai Namco. This
-is a fan-made mod, not affiliated with them.
+NativeTweaks source: see the release archive. ERNativeUI headers: MIT, [`third_party/ERNativeUI/LICENSE.txt`](third_party/ERNativeUI/LICENSE.txt). Rust dependencies: `msa/THIRD-PARTY-NOTICES.txt`.

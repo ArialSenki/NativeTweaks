@@ -24,6 +24,15 @@ if(MSVC)
     # MSVC 14.40+ makes std::mutex constexpr, which an older MSVCP140.dll
     # (common in Proton/Wine prefixes) cannot lock: keep the old constructor.
     target_compile_definitions(NativeTweaks PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+    # The Rust staticlib needs the DLL runtime (/MD): pinned, so a change
+    # fails clearly instead of with LNK2038.
+    set_property(TARGET NativeTweaks PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+    # A PDB for Release, to read crash dumps players send. Only its file name
+    # goes into the DLL (/PDBALTPATH), not the build folder; the optimised
+    # linking stays as without /DEBUG.
+    target_compile_options(NativeTweaks PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(NativeTweaks PRIVATE
+        $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF /PDBALTPATH:%_PDB%>)
 endif()
 
 # Multiple Spirit Ashes (Rust, msa\) is linked in as a static library; cargo

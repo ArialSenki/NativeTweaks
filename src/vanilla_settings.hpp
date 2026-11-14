@@ -28,6 +28,9 @@ int audit(LogFn log) noexcept;
 // Every control applies immediately and is persisted to the [Vanilla] section.
 // language: "en", "es" or "zh".
 void add_pages(erui::Page& parent, const char* language) noexcept;
+// NPC Spawner (built in, when started): its "NPC Spawner" submenu in `parent`,
+// right after Vanilla Settings.
+void add_npc_spawner_pages(erui::Page& parent) noexcept;
 
 // Sends the saved HUD/menu layout to ERNativeUI (logs it as pending when the
 // host is not loaded yet). Call it again once the host API is connected.

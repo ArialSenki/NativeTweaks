@@ -34,7 +34,7 @@ namespace {
 HMODULE g_own_module{};
 erui::Registration g_registration{};
 // Build tag shown in the log and, with ERUI 1.3, on the title screen.
-constexpr wchar_t kBuildTag[] = L"r153";
+constexpr wchar_t kBuildTag[] = L"r158";
 SRWLOCK g_settings_lock = SRWLOCK_INIT;
 SRWLOCK g_save_lock = SRWLOCK_INIT;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
@@ -536,9 +536,6 @@ void initialize_logging() noexcept {
         if (!slash) return;
         std::wstring directory(module_path, slash + 1);
         g_config_path = directory + L"NativeTweaks.ini";
-        // Keep settings saved by builds released as Mod Forge (ERModSettingsHub.ini).
-        if (GetFileAttributesW(g_config_path.c_str()) == INVALID_FILE_ATTRIBUTES)
-            CopyFileW((directory + L"ERModSettingsHub.ini").c_str(), g_config_path.c_str(), TRUE);
         // [Diagnostics] PerfLog needs the log, so it turns it on as well.
         if (GetPrivateProfileIntW(
                 L"Logging", L"EnableLog", 0, g_config_path.c_str()) == 0 &&
@@ -546,6 +543,14 @@ void initialize_logging() noexcept {
                 L"Diagnostics", L"PerfLog", 0, g_config_path.c_str()) == 0) return;
 
         g_log_path = directory + L"NativeTweaks.log";
+        // The log is appended across sessions: above 4 MB it moves to
+        // NativeTweaks.previous.log and a new one starts (audit 2026-11-08).
+        WIN32_FILE_ATTRIBUTE_DATA log_info{};
+        if (GetFileAttributesExW(g_log_path.c_str(), GetFileExInfoStandard, &log_info) &&
+            (log_info.nFileSizeHigh != 0 || log_info.nFileSizeLow > 4u * 1024 * 1024)) {
+            (void)MoveFileExW(g_log_path.c_str(), (directory + L"NativeTweaks.previous.log").c_str(),
+                MOVEFILE_REPLACE_EXISTING);
+        }
         g_log_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_log_event) return;
         HANDLE writer = CreateThread(nullptr, 0, &log_writer, nullptr, 0, nullptr);
@@ -577,8 +582,35 @@ void wait_for_startup_discovery_window() noexcept {
     const int quiet_configured = g_config_path.empty() ? 2500 :
         GetPrivateProfileIntW(L"Discovery", L"StableModuleMs", 2500,
             g_config_path.c_str());
-    const DWORD maximum_ms = static_cast<DWORD>(
+    DWORD maximum_ms = static_cast<DWORD>(
         std::clamp(maximum_configured, 0, 10000));
+    // ERNativeUI closes provider registration 15 s after Steam is ready, and
+    // that is never earlier than 15 s after the game process started. When
+    // the game loads NativeTweaks late (Steam slow to answer), the wait must
+    // end before that, or Mod Settings has no NativeTweaks page (08-11 02:03:
+    // registered 0.1 s too late). Mods that load afterwards still go through
+    // late_module_check.
+    {
+        FILETIME created{}, exited{}, kernel{}, user{}, now_time{};
+        if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+            GetSystemTimeAsFileTime(&now_time);
+            const auto ticks = [](const FILETIME& t) {
+                return (static_cast<std::uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+            };
+            const std::uint64_t since_start_ms = ticks(now_time) > ticks(created)
+                ? (ticks(now_time) - ticks(created)) / 10000 : 0;
+            constexpr std::uint64_t kRegisterBeforeMs = 13500;
+            const DWORD budget = since_start_ms >= kRegisterBeforeMs
+                ? 0 : static_cast<DWORD>(kRegisterBeforeMs - since_start_ms);
+            if (budget < maximum_ms) {
+                wchar_t message[160]{};
+                swprintf_s(message, L"Startup discovery shortened to %lu ms (the game started %llu ms ago).",
+                    static_cast<unsigned long>(budget), static_cast<unsigned long long>(since_start_ms));
+                log_message(message);
+                maximum_ms = budget;
+            }
+        }
+    }
     if (maximum_ms == 0) return;
     const DWORD minimum_ms = static_cast<DWORD>(
         std::clamp(minimum_configured, 0, static_cast<int>(maximum_ms)));
@@ -676,7 +708,7 @@ void add_generic_setting_row(erui::Page& page, GenericIniSetting& setting) {
 
 // ---- Export / import --------------------------------------------------------
 // Export copies the mod's INI to DLLs\NativeTweaks\profiles\<file name>;
-// import copies it back (keeping <ini>.bak) and applies after a restart.
+// import copies it back (keeping <ini>.nativetweaks-import.bak) and applies after a restart.
 
 void show_alert(std::wstring_view message) noexcept;
 bool read_file_bytes(const std::wstring& path, std::string& contents) noexcept;
@@ -694,9 +726,9 @@ live_text::Texts profile_row_texts(Language language, bool import) {
     return import
         ? live_text::Texts{tr_in(language, L"Import settings", L"Importar ajustes", L"导入设置"),
             tr_in(language,
-                L"Replace this mod's INI with the copy in DLLs\\NativeTweaks\\profiles (a .bak backup is kept). Applies after restarting the game.",
-                L"Sustituye el INI de este mod por la copia de DLLs\\NativeTweaks\\profiles (se guarda una copia .bak). Se aplica al reiniciar el juego.",
-                L"用 DLLs\\NativeTweaks\\profiles 中的副本替换此模组的 INI（保留 .bak 备份）。重启游戏后生效。"),
+                L"Replace this mod's INI with the copy in DLLs\\NativeTweaks\\profiles (a .nativetweaks-import.bak backup is kept). Applies after restarting the game.",
+                L"Sustituye el INI de este mod por la copia de DLLs\\NativeTweaks\\profiles (se guarda una copia .nativetweaks-import.bak). Se aplica al reiniciar el juego.",
+                L"用 DLLs\\NativeTweaks\\profiles 中的副本替换此模组的 INI（保留 .nativetweaks-import.bak 备份）。重启游戏后生效。"),
             {}, {}}
         : live_text::Texts{tr_in(language, L"Export settings", L"Exportar ajustes", L"导出设置"),
             tr_in(language,
@@ -751,8 +783,13 @@ void ERUI_CALL import_profile_clicked(void* target) noexcept {
                 L"No se pudo leer el archivo exportado.", L"无法读取导出的文件。"));
             return;
         }
-        (void)CopyFileW(mod.path.c_str(), (mod.path + L".bak").c_str(), FALSE);
-        if (!CopyFileW(profile.c_str(), mod.path.c_str(), FALSE)) {
+        // Its own name: "<ini>.bak" is often the player's own backup; and no
+        // save of this INI may run while it is replaced (audit 2026-11-08).
+        AcquireSRWLockExclusive(&g_save_lock);
+        (void)CopyFileW(mod.path.c_str(), (mod.path + L".nativetweaks-import.bak").c_str(), FALSE);
+        const bool imported = CopyFileW(profile.c_str(), mod.path.c_str(), FALSE) != 0;
+        ReleaseSRWLockExclusive(&g_save_lock);
+        if (!imported) {
             log_message(L"Could not import an exported INI; the original was preserved.");
             show_alert(tr(L"Could not import the settings. The original file was preserved.",
                 L"No se pudieron importar los ajustes. El archivo original se ha conservado.",
@@ -1306,8 +1343,24 @@ bool has_matching_ini_sidecar(std::wstring_view module_path) {
     return false;
 }
 
+// Windows' own DLLs never have a mod INI next to them; skipping them saves
+// thousands of file probes through MO2 while the game starts (audit
+// 2026-11-08: the startup scan runs every 200 ms for up to 10 s).
+bool is_windows_module(std::wstring_view path) {
+    static const std::wstring windows = [] {
+        wchar_t buffer[MAX_PATH]{};
+        const UINT length = GetWindowsDirectoryW(buffer, MAX_PATH);
+        std::wstring folder(buffer, length && length < MAX_PATH ? length : 0);
+        if (!folder.empty() && folder.back() != L'\\') folder.push_back(L'\\');
+        return folder;
+    }();
+    return !windows.empty() && path.size() > windows.size() &&
+        CompareStringOrdinal(path.data(), static_cast<int>(windows.size()), windows.data(),
+            static_cast<int>(windows.size()), TRUE) == CSTR_EQUAL;
+}
+
 bool is_discoverable_mod_module(std::wstring_view path) {
-    if (is_framework_module(path)) return false;
+    if (is_framework_module(path) || is_windows_module(path)) return false;
     return is_mod_module_path(path) || has_matching_ini_sidecar(path);
 }
 
@@ -2276,10 +2329,9 @@ bool parse_generic_ini(const std::wstring& path, GenericIniMod& output) {
                             templates[ini_identity(target.substr(0, dot), target.substr(dot + 1))]
                                 [lower_ascii(key)] = value;
                         }
-                    } else if (lower_section == "nativetweaks" || lower_section == "ermodsettingshub") {
+                    } else if (lower_section == "nativetweaks") {
                         mod_fields[lower_ascii(key)] = value;
-                    } else if (ini_identity(section, "") != ini_identity("NativeTweaks", "") &&
-                        ini_identity(section, "") != ini_identity("ERModSettingsHub", "")) {
+                    } else if (ini_identity(section, "") != ini_identity("NativeTweaks", "")) {
                         std::wstring wide_label{};
                         std::wstring wide_value{};
                         const std::string label = section + " / " + key;
@@ -2654,13 +2706,6 @@ GenericLiveApplyResult request_generic_live_reload(
             GetProcAddress(module, "NativeTweaks_RequestReloadV1"));
         auto status = reinterpret_cast<StatusFn>(
             GetProcAddress(module, "NativeTweaks_GetReloadStatusV1"));
-        // Mods built against the pre-rename SDK export the ERModSettingsHub_ names.
-        if (!request || !status) {
-            request = reinterpret_cast<RequestFn>(
-                GetProcAddress(module, "ERModSettingsHub_RequestReloadV1"));
-            status = reinterpret_cast<StatusFn>(
-                GetProcAddress(module, "ERModSettingsHub_GetReloadStatusV1"));
-        }
         if (!request || !status) {
             log_message(L"Live reload: the mod DLL does not export NativeTweaks_RequestReloadV1/GetReloadStatusV1.");
             return GenericLiveApplyResult::unsupported;
@@ -2728,11 +2773,17 @@ void persist_settings(Settings current) noexcept {
             ReleaseSRWLockExclusive(&g_settings_lock);
             saved = true;
         }
-        if (saved) live_result = request_tarnished_hud_live_reload();
     } catch (...) {
         failed = true;
     }
     ReleaseSRWLockExclusive(&g_save_lock);
+    // The live reload polls for up to 2 s: not while other saves wait.
+    if (saved) {
+        try {
+            live_result = request_tarnished_hud_live_reload();
+        } catch (...) {
+        }
+    }
 
     if (saved) {
         if (live_result == LiveApplyResult::applied && !general_restart_required) {
@@ -3210,6 +3261,7 @@ DWORD WINAPI initialize_mod(void*) noexcept {
 
             add_language_row(mods);
             vanilla::add_pages(mods, template_language());
+            vanilla::add_npc_spawner_pages(mods);
 
             if (!g_target_available || !g_config_valid) {
                 // Only mention Tarnished HUD when it is loaded but its INI is
@@ -3301,6 +3353,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_own_module = module;
         DisableThreadLibraryCalls(module);
+        // Worker threads and game hooks live for the whole process: never
+        // let a FreeLibrary unmap them (audit 2026-11-08).
+        HMODULE pinned{};
+        (void)GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(&DllMain), &pinned);
         if (HANDLE thread = CreateThread(
             nullptr, 0, &initialize_mod, nullptr, 0, nullptr)) {
             CloseHandle(thread);

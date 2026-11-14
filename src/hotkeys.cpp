@@ -148,7 +148,10 @@ void reload(bool first = false) {
     const bool changed = !same_bindings(g_bindings, bindings);
     g_bindings.swap(bindings);
     const std::size_t total = g_bindings.size();
-    g_bindings_version.fetch_add(1, std::memory_order_release);
+    // Only a real change resets the held keys: NativeTweaks rewrites the
+    // INI after every option change, and clearing them then made a key
+    // still held down fire again (audit 2026-11-08).
+    if (changed || first) g_bindings_version.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_lock);
     // NativeTweaks rewrites the INI after every change; log real edits only.
     if (changed || first) logf(L"Hotkeys: %s%s%d binding(s) loaded.", L"", L"", static_cast<int>(total));

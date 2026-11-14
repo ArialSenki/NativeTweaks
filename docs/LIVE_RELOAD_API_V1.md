@@ -92,7 +92,7 @@ uint32_t __cdecl NativeTweaks_GetReloadStatusV1(uint32_t request_id);    // 0 pe
 NativeTweaks calls `RequestReloadV1` after the INI is replaced, then polls
 `GetReloadStatusV1` every 20 ms for up to 5 seconds. You may finish the work
 synchronously inside `RequestReloadV1` or on your own worker; keep each result
-queryable for at least 5 seconds. Mods built against the older SDK that export
-`ERModSettingsHub_RequestReloadV1` / `ERModSettingsHub_GetReloadStatusV1` still work.
+queryable for at least 5 seconds. The pre-rename `ERModSettingsHub_*` export
+names are no longer looked up (r157): rebuild against the current header.
 
 Mods that export neither still get their INI saved; the player is told to restart.

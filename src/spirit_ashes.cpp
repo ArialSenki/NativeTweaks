@@ -34,7 +34,14 @@ extern "C" void nt_msa_set(const NtMsaSettings* settings);
 extern "C" void nt_msa_dismiss_all();
 extern "C" std::uint8_t nt_open_game_menu(int kind);
 extern "C" void nt_msa_set_summon_anywhere(std::uint8_t enabled);
+extern "C" void nt_msa_set_free_fighting(std::uint8_t mode);
 extern "C" int nt_game_menu_last_result();
+extern "C" std::uint8_t nt_open_shop(int begin, int end);
+extern "C" std::uint8_t nt_npc_spawner_built_in();
+extern "C" std::uint8_t nt_npc_spawner_standalone(const wchar_t* dir, std::size_t len);
+extern "C" std::uint8_t nt_npc_spawner_start(const wchar_t* dir, std::size_t len, std::uintptr_t module);
+extern "C" std::uint8_t nt_npc_spawner_start_hosted(const wchar_t* dir, std::size_t len, std::uintptr_t module);
+extern "C" std::uint8_t nt_npc_spawner_add_pages(std::uint64_t provider, std::uint64_t parent_page);
 
 namespace spirit_ashes {
 
@@ -56,6 +63,10 @@ void set_summon_anywhere(bool enabled) noexcept {
     nt_msa_set_summon_anywhere(enabled ? 1 : 0);
 }
 
+void set_free_fighting(std::uint8_t mode) noexcept {
+    nt_msa_set_free_fighting(mode);
+}
+
 bool open_game_menu(int kind) noexcept {
     return nt_open_game_menu(kind) != 0;
 }
@@ -64,4 +75,32 @@ int game_menu_last_result() noexcept {
     return nt_game_menu_last_result();
 }
 
+bool open_shop(int begin, int end) noexcept {
+    return nt_open_shop(begin, end) != 0;
+}
+
 } // namespace spirit_ashes
+
+namespace npc_spawner {
+
+bool built_in() noexcept {
+    return nt_npc_spawner_built_in() != 0;
+}
+
+bool standalone_present(const std::wstring& folder) noexcept {
+    return nt_npc_spawner_standalone(folder.c_str(), folder.size()) != 0;
+}
+
+bool start(const std::wstring& folder, HMODULE own_module) noexcept {
+    return nt_npc_spawner_start(folder.c_str(), folder.size(), reinterpret_cast<std::uintptr_t>(own_module)) != 0;
+}
+
+bool start_hosted(const std::wstring& folder, HMODULE own_module) noexcept {
+    return nt_npc_spawner_start_hosted(folder.c_str(), folder.size(), reinterpret_cast<std::uintptr_t>(own_module)) != 0;
+}
+
+bool add_pages(std::uint64_t provider, std::uint64_t parent_page) noexcept {
+    return nt_npc_spawner_add_pages(provider, parent_page) != 0;
+}
+
+} // namespace npc_spawner
