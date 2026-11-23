@@ -16,15 +16,18 @@ struct NtMsaSettings {
     std::uint32_t extra_cost_percent;
     std::uint32_t damage_reduction_percent;
     std::uint8_t repeat_same_ash;
+    std::uint32_t max_regular_ashes;
+    std::uint32_t max_renowned_ashes;
 };
-static_assert(sizeof(NtMsaSettings) == 28, "must match the #[repr(C)] struct in Rust");
+static_assert(sizeof(NtMsaSettings) == 36, "must match the #[repr(C)] struct in Rust");
 
 NtMsaSettings to_rust(const spirit_ashes::Settings& settings) noexcept {
     const auto byte = [](bool value) { return static_cast<std::uint8_t>(value ? 1 : 0); };
     return {byte(settings.enabled), settings.max_active, byte(settings.log), byte(settings.toggle_dismiss),
         byte(settings.suppress_prompts), byte(settings.follow_areas), byte(settings.fast_dismissal),
         byte(settings.low_fp_dismissal), byte(settings.hud_rows), settings.extra_cost_percent,
-        settings.damage_reduction_percent, byte(settings.repeat_same_ash)};
+        settings.damage_reduction_percent, byte(settings.repeat_same_ash), settings.max_regular,
+        settings.max_renowned};
 }
 
 } // namespace

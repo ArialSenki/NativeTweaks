@@ -147,6 +147,23 @@ bool safe_write(std::uintptr_t address, const void* in, std::size_t size) noexce
     return copy_guarded(reinterpret_cast<void*>(address), in, size);
 }
 
+namespace {
+bool or_byte_guarded(volatile char* target, char bits) noexcept {
+    __try {
+        _InterlockedOr8(target, bits);
+        return true;
+    } __except (access_violation_only(GetExceptionCode())) {
+        perf::count_fault();
+        return false;
+    }
+}
+} // namespace
+
+bool or_byte(std::uintptr_t address, std::uint8_t bits) noexcept {
+    if (address < 0x10000) return false;
+    return or_byte_guarded(reinterpret_cast<volatile char*>(address), static_cast<char>(bits));
+}
+
 std::uintptr_t chain(std::uintptr_t base, std::initializer_list<std::ptrdiff_t> offsets) noexcept {
     std::uintptr_t p{};
     if (!read(base, p)) return 0;
@@ -305,7 +322,7 @@ int kind_at(const std::uint8_t* p) noexcept {
 
 int length_of(int kind) noexcept { return kind == kMovR9 ? 3 : kind == kMovEdx ? 5 : 7; }
 
-void scan_singletons() noexcept {
+void scan_singletons() {  // may throw std::bad_alloc; find_singleton catches it
     const Section text = find_section(".text");
     const Section data = find_section(".data");
     if (!text.begin || !data.begin) return;
@@ -389,10 +406,12 @@ std::uintptr_t find_singleton(const char* name, LogFn log, const char* list_filt
     bool scanned = true;
     try {
         if (!g_singletons_scanned) scan_singletons();
+        g_singletons_scanned = true;
     } catch (...) {
+        // A partial list would hide singletons for the session: retried next time.
+        g_singletons.clear();
         scanned = false;
     }
-    g_singletons_scanned = true;
     ReleaseSRWLockExclusive(&g_singleton_lock);
     if (!scanned) return 0;
     const auto base = reinterpret_cast<std::uintptr_t>(game::image());
@@ -517,15 +536,33 @@ int for_each_loaded_chr(const Statics& s,
         if (!set || !read(set + 0x10, capacity) || !capacity || capacity > 8192 ||
             !read(set + 0x18, entries) || entries < 0x10000) return;
         ++sets;
-        for (std::uint32_t i = 0; i < capacity; ++i) {
-            std::uintptr_t chr{};
-            if (read(entries + std::uintptr_t{i} * 0x10, chr) && chr >= 0x10000) visit(chr, context);
+        // Entries are {ChrIns*, extra} pairs; copied 256 at a time (one
+        // guarded copy instead of one per entry), entry by entry only when a
+        // block cannot be read whole.
+        constexpr std::uint32_t kBlock = 256;
+        std::uintptr_t block[kBlock * 2];
+        for (std::uint32_t first = 0; first < capacity; first += kBlock) {
+            const std::uint32_t n = (std::min)(kBlock, capacity - first);
+            const std::uintptr_t at = entries + std::uintptr_t{first} * 0x10;
+            if (safe_read(at, block, std::size_t{n} * 0x10)) {
+                for (std::uint32_t i = 0; i < n; ++i)
+                    if (block[i * 2] >= 0x10000) visit(block[i * 2], context);
+                continue;
+            }
+            for (std::uint32_t i = 0; i < n; ++i) {
+                std::uintptr_t chr{};
+                if (read(at + std::uintptr_t{i} * 0x10, chr) && chr >= 0x10000) visit(chr, context);
+            }
         }
     };
     visit_set(manager + 0x11040);
+    std::uintptr_t set_list[196]{};
+    const bool list_read = safe_read(manager + 0x1DED8, set_list, sizeof(set_list));
     for (int i = 0; i < 196; ++i) {
         std::uintptr_t set{};
-        if (read(manager + 0x1DED8 + i * 8, set)) visit_set(set);
+        if (list_read) set = set_list[i];
+        else if (!read(manager + 0x1DED8 + i * 8, set)) continue;
+        visit_set(set);
     }
     return sets;
 }

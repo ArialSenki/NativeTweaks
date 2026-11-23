@@ -26,6 +26,9 @@ bool layout_supported() noexcept;
 bool safe_read(std::uintptr_t address, void* out, std::size_t size) noexcept;
 bool safe_write(std::uintptr_t address, const void* in, std::size_t size) noexcept;
 
+// Atomic `*address |= bits` (for flag bytes the game also writes).
+bool or_byte(std::uintptr_t address, std::uint8_t bits) noexcept;
+
 template <class T>
 bool read(std::uintptr_t address, T& out) noexcept { return safe_read(address, &out, sizeof(T)); }
 template <class T>

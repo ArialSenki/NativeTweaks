@@ -21,6 +21,7 @@
 #include "traditional_chinese.hpp"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <intrin.h>
 
 #pragma comment(lib, "synchronization.lib")  // WaitOnAddress
@@ -154,6 +155,88 @@ bool cas_block(std::uint8_t* address, const std::uint8_t* bytes, std::size_t cou
     }
 }
 
+// A write over more than one instruction is only safe while no other thread
+// can be between those instructions. Once the game runs (after initialize,
+// when options turn hooks on mid-game), the other threads are suspended and
+// the write waits, at most 200 ms, until none of them has its instruction
+// pointer inside the region: the same idea as MinHook's freeze. At startup
+// the old path is kept (every mod installs hooks then, some freezing threads
+// themselves). Nothing here allocates or takes a lock while threads are
+// suspended; a thread that cannot be checked counts as inside.
+enum class FrozenWrite { written, busy, unavailable };
+std::atomic<bool> g_freeze_writes{false};
+
+FrozenWrite write_code_frozen(std::uint8_t* address, const std::uint8_t* bytes, std::size_t count) noexcept {
+    constexpr std::size_t kMaxThreads = 1024;
+    static DWORD ids[kMaxThreads];
+    static HANDLE handles[kMaxThreads];
+    static bool suspended[kMaxThreads];
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    std::size_t total = 0;
+    const DWORD self = GetCurrentThreadId();
+    const DWORD process = GetCurrentProcessId();
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        ReleaseSRWLockExclusive(&lock);
+        return FrozenWrite::unavailable;
+    }
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    bool overflow{};
+    for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self) continue;
+        if (total == kMaxThreads) {
+            overflow = true;
+            break;
+        }
+        ids[total++] = entry.th32ThreadID;
+    }
+    CloseHandle(snapshot);
+    if (overflow) {
+        ReleaseSRWLockExclusive(&lock);
+        return FrozenWrite::unavailable;
+    }
+    std::size_t opened = 0;
+    bool missing{};
+    for (std::size_t i = 0; i < total; ++i) {
+        const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, ids[i]);
+        if (thread) {
+            handles[opened++] = thread;
+        } else if (GetLastError() != ERROR_INVALID_PARAMETER) {  // not "the thread has exited"
+            missing = true;
+        }
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    const auto end = begin + count;
+    FrozenWrite result = missing ? FrozenWrite::unavailable : FrozenWrite::busy;
+    const ULONGLONG deadline = GetTickCount64() + 200;
+    while (!missing) {
+        bool inside{};
+        for (std::size_t i = 0; i < opened; ++i) suspended[i] = false;
+        for (std::size_t i = 0; i < opened && !inside; ++i) {
+            if (SuspendThread(handles[i]) == static_cast<DWORD>(-1)) continue;  // exited meanwhile
+            suspended[i] = true;
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            if (!GetThreadContext(handles[i], &context) || (context.Rip > begin && context.Rip < end))
+                inside = true;
+        }
+        if (!inside) {
+            std::memcpy(address, bytes, count);
+            FlushInstructionCache(GetCurrentProcess(), address, count);
+            result = FrozenWrite::written;
+        }
+        for (std::size_t i = 0; i < opened; ++i)
+            if (suspended[i]) ResumeThread(handles[i]);
+        if (result == FrozenWrite::written || GetTickCount64() >= deadline) break;
+        Sleep(1);
+    }
+    for (std::size_t i = 0; i < opened; ++i) CloseHandle(handles[i]);
+    ReleaseSRWLockExclusive(&lock);
+    return result;
+}
+
 bool write_code(std::uint8_t* address, const std::uint8_t* bytes, std::size_t count) noexcept {
     if (!address || !count) return false;
     DWORD old_protect{};
@@ -161,7 +244,15 @@ bool write_code(std::uint8_t* address, const std::uint8_t* bytes, std::size_t co
 
     bool ok{};
     const std::size_t offset = reinterpret_cast<std::uintptr_t>(address) & 15;
-    if (offset + count <= 16) {
+    // Five bytes or more can cover several instructions (jumps to hooks),
+    // even inside one 16-byte block: those go through the frozen write first.
+    const FrozenWrite frozen = count >= 5 && g_freeze_writes.load(std::memory_order_acquire)
+        ? write_code_frozen(address, bytes, count) : FrozenWrite::unavailable;
+    if (frozen == FrozenWrite::written) {
+        ok = true;
+    } else if (frozen == FrozenWrite::busy) {
+        ok = false;  // a thread stayed inside the region: writing now could crash it
+    } else if (offset + count <= 16) {
         ok = cas_block(address, bytes, count);
     } else if (count >= 3 && count <= 129 && offset <= 14) {
         // Divert execution past the region, rewrite its tail, then publish
@@ -207,7 +298,7 @@ Site g_vignette{L"vignette",
     0x17, "f3 ? 0f 59 ?", {0xF3, 0x0F, 0x5C, 0xC0, 0x90}};
 Site g_chromatic{L"chromatic aberration",
     "0f 11 ? 60 ? 8d ? 80 00 00 00 0f 10 ? a0 00 00 00 0f 11 ? f0 ? 8d ? b0 00 00 00 0f 10 ? 0f 11 ? 0f 10 ? 10",
-    0x2F, "0f 11 ? ?", {0x66, 0x0F, 0xEF, 0xC9}};
+    0x2F, "0f 11 49 20", {0x66, 0x0F, 0xEF, 0xC9}};
 // Forced sharpening (Nexus request): GXAntiAliasingFilter runs SharpenFilter.ppo
 // after TempAA only if SharpenIntensity (+0x6C) is above 0; otherwise it does the
 // game's own plain copy to the same target. jbe -> always jump to that copy.
@@ -217,7 +308,7 @@ Site g_sharpen{L"sharpening",
     0x0A, "0f 86", {0x90, 0xE9}};
 Site g_animation{L"animation distance",
     "c7 ? ? ? 01 00 00 00 f3 ? 0f 10 ? ? ? f3 ? 0f 10 ? ? ? f3 0f 59 ? ? ? ? ? ? 0f 28 ? f3 ? 0f 5c ? ? 58",
-    0x48, "f3 ? 0f 5e ? ? ?", {0x0F, 0x57, 0xC9, 0x90, 0x90, 0x90, 0x90}};
+    0x48, "f3 41 0f 5e 4c 24 54", {0x0F, 0x57, 0xC9, 0x90, 0x90, 0x90, 0x90}};
 Site g_rune_loss{L"rune loss",
     "b0 01 ? 8b ? e8 ? ? ? ? ? 8b ? ? ? 32 c0 ? 83 ? 28 c3",
     5, "e8", {0x90, 0x90, 0x90, 0x90, 0x90}};
@@ -229,10 +320,10 @@ Site g_frametime{L"frame time",
     3, "89 88 88 3c", {0x89, 0x88, 0x88, 0x3C}};
 Site g_fullscreen_cap{L"fullscreen 60 FPS cap",
     "c7 ? ef 3c 00 00 00 c7 ? f3 01 00 00 00",
-    0, "c7 ? ef 3c 00 00 00", {0xC7, 0x45, 0xEF, 0x00, 0x00, 0x00, 0x00}};
+    0, "c7 45 ef 3c 00 00 00", {0xC7, 0x45, 0xEF, 0x00, 0x00, 0x00, 0x00}};
 Site g_ultrawide{L"ultrawide",
     "48 c7 45 b8 fe ff ff ff 48 89 58 10 48 89 70 18 48 89 78 20 0f 29 70 c8 48 8b",
-    0x94, "74", {0xEB}};
+    0x94, "74 ? 45 8b 94 cc", {0xEB}};
 // WorldChrMan's respawn request: "if (state == 0) state = 1" on the field at
 // +0x1E524 (2.7.1.0), the only writer of 1. Every world reset (resting or
 // passing time at a grace, dying, the warp/fade reset) reaches it through
@@ -320,20 +411,21 @@ Site g_summon_range{L"summoning range",
 // check (CSSound+0x328 state; 0xDAA5E0 in 2.7.2.0) from five places; logged
 // with the pause menu open in combat (r158-test29-dev), three of them answer
 // for it: the crafting kit's own test (0x913400: call; test al,al; sete al),
-// a "can use" flag (sete dl; 0x5111FC) and the menus' combat state with its
-// timer (0x76B197; jz past it when out of combat). Each call there becomes
-// xor eax,eax ("not in combat"). The map's (0x9C4E94) and the message-600
+// a flag (sete dl; 0x5111FC) and the menus' combat state with its timer
+// (0x76B197; jz past it when out of combat). Only the first and the last are
+// patched: their call becomes xor eax,eax ("not in combat"). The flag is
+// ChrDataModule+0x19A bit 0x40, which only the stamina setter (0x438A80)
+// reads: out of combat, sprinting costs no stamina. Patching it gave free
+// sprinting in fights (Nexus bug report, Mickeekarlsson, 16-11), and the
+// crafting kit does not need it. The map's (0x9C4E94) and the message-600
 // one (0x7EFF7C, "cannot open the map in combat") are left alone. The idea
 // of patching the first is from Erd-Tools (Nordgaren; no code taken).
-// All unique in 2.7.0.0 to 2.7.2.1 (0x912F50 / 0x510F7C / 0x76ACE7 in
-// 2.7.0.0 and 2.7.1.x).
+// Both unique in 2.7.0.0 to 2.7.2.1 (0x912F50 / 0x76ACE7 in 2.7.0.0 and
+// 2.7.1.x).
 Site g_craft_combat{L"craft in combat",
     "48 83 ec 28 48 8b 0d ? ? ? ? 48 85 c9 75 ? 48 8d 0d ? ? ? ? e8 ? ? ? ? 4c 8b c8 4c 8d 05 ? ? ? ? "
     "ba b4 00 00 00 48 8d 0d ? ? ? ? e8 ? ? ? ? 48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 0f 94 c0 48 83 c4 28 c3",
     0x3E, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
-Site g_craft_combat_flag{L"craft in combat (flag)",
-    "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 0f 94 c2 eb 02 32 d2 f6 c3 01 74 07 83 e3 fe",
-    0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
 Site g_craft_combat_menu{L"craft in combat (menu state)",
     "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 74 67 f3 0f 10 47 0c f3 0f 11 44 24 40 8b 44 24 40 a9 ff ff 7f 00 c6 47 08 01",
     0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
@@ -352,7 +444,7 @@ Site g_map_combat_close{L"map in combat (close)",
     0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
 
 Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic, &g_sharpen,
-    &g_craft_combat, &g_craft_combat_flag, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close,
+    &g_craft_combat, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close,
     &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
     &g_summon_area, &g_summon_area_item, &g_summon_range, &g_buddy_slot_start, &g_buddy_slot_loop};
 
@@ -1463,6 +1555,13 @@ void resolve_dialog_yes_reads(bool quiet) noexcept {
                 if ((modrm >> 6) != 2 || (modrm & 7) == 4 || std::memcmp(p + 2, tail, 4) != 0) continue;
                 const std::uint8_t rex = p[-1];
                 if ((rex & 0xF0) == 0x40 && (rex & 0x08)) continue;  // 64-bit read: not this field
+                // The trampoline reads [base+10F0h] and [base+18h] after the
+                // original read and through rax, so the base register can be
+                // neither the destination (already overwritten) nor rax.
+                const unsigned has_rex = (rex & 0xF0) == 0x40 ? rex : 0u;
+                const unsigned dest = ((modrm >> 3) & 7) | ((has_rex & 0x04) ? 8u : 0u);
+                const unsigned base_reg = (modrm & 7) | ((has_rex & 0x01) ? 8u : 0u);
+                if (base_reg == dest || base_reg == 0) continue;
                 found.push_back(p);
             }
         }
@@ -1900,7 +1999,7 @@ void install_downed_hook(std::uintptr_t world_chr_man) noexcept {
 
 Site g_intro{L"intro logos",
     "c6 ? ? ? ? ? 01 ? 03 00 00 00 ? 8b ? e8 ? ? ? ? e9 ? ? ? ? ? 8d",
-    -60, "74", {0x90, 0x90}};
+    -60, "74 ? 48 8b 05", {0x90, 0x90}};
 
 // ---------------------------------------------------------------------------
 // Options
@@ -2062,6 +2161,10 @@ enum Id : std::size_t {
     craft_in_combat,
     // Map & Travel: the map opens and stays open in combat
     map_in_combat,
+    // Enemies: how far enemies chase you before they go home (Nexus request)
+    enemy_chase,
+    // Spirit Ashes: most regular / renowned ashes at once (Nexus request, PoisonParadise)
+    ash_max_regular, ash_max_renowned,
     count
 };
 
@@ -2128,6 +2231,8 @@ Option g_options[count]{
     toggle(L"SetTimeOfDay"), slider(L"TimeOfDayHour", 12, 0, 23, 1, L":00"), toggle(L"FreezeTime"),
     toggle(L"SetWeather"), slider(L"WeatherType", 4, 0, 15, 1, L""),
     toggle(L"ShowAllGraces"), toggle(L"RevealMap"), toggle(L"FastTravelAnywhere"),
+    // On by default (the user's decision of 24-10, confirmed 21-11; r159-test4
+    // had turned them off after Nexus comments, not because of a bug).
     toggle_on(L"SpiritResummonWithoutRest"), toggle_on(L"SpiritSummonFarFromStones"),
     toggle_on(L"SpiritMultipleAshes"),
     toggle_on(L"SpiritKeepAfterBoss"), toggle(L"SpiritDismissAll"),
@@ -2188,7 +2293,10 @@ Option g_options[count]{
     slider(L"ParryWindowPercent", 100, 100, 500, 10),
     toggle(L"KnockdownInvincible"), toggle(L"ItemSuperArmor"),
     general_toggle(L"ExtendedRanges"), general_toggle(L"HighlightChangedOptions"),
-    toggle(L"SpiritRepeatSameAsh"),
+    // 0 dismisses the ash, 1 summons it again (the old toggle's on), 2 leaves
+    // the item to the game: Reforged enrages a summoned ash with it (Nexus,
+    // JDdeen / skar450). Same INI key, so saved 0/1 keep their meaning.
+    slider(L"SpiritRepeatSameAsh", 0, 0, 2, 1, L""),
     slider(L"SpiritFreeFighting", 0, 0, 2, 1, L""),  // off by default (user, 08-11)
     slider(L"DeflectWindowPercent", 100, 100, 500, 25),
     toggle(L"SolidSpiritAshes"),
@@ -2225,6 +2333,8 @@ Option g_options[count]{
     slider(L"MaterialsFoundPercent", 100, 100, 1000, 25),
     toggle(L"CraftInCombat"),
     toggle(L"MapInCombat"),
+    slider(L"EnemyChaseDistancePercent", 100, 100, 1000, 25),
+    slider(L"SpiritMaxRegularAshes", 0, 0, 10, 1, L""), slider(L"SpiritMaxRenownedAshes", 0, 0, 10, 1, L""),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -2289,6 +2399,12 @@ Scale g_scales[]{
     {enemy_speed, L"EnemySpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_speed, L"TorrentSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
     {torrent_jump_speed, L"TorrentJumpSpeedScale", 25, 300, 5, 0, ERUI_INVALID_ROW},
+    // Past 500 % (Nexus request, Mickeekarlsson): the jump hook only scales
+    // the flight's root motion, so any factor is safe to apply.
+    {jump_height, L"JumpHeightScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
+    {jump_distance, L"JumpDistanceScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
+    {torrent_jump_height, L"TorrentJumpHeightScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
+    {torrent_jump_distance, L"TorrentJumpDistanceScale", 25, 500, 5, 0, ERUI_INVALID_ROW},
 };
 
 Scale* scale_of(Id id) noexcept {
@@ -2412,9 +2528,21 @@ bool restore_model_parts(std::uintptr_t chr, std::uint32_t mask) noexcept {
 void note_alive(std::uintptr_t chr) noexcept {
     std::uint32_t mask{};
     const bool known = model_mask(chr, mask);
+    // Called by the game thread for every SpEffect applied: the common case
+    // (already known alive, same parts) only takes the lock shared.
+    AcquireSRWLockShared(&g_seen_alive_lock);
+    const auto seen = g_seen_alive.find(chr);
+    const bool unchanged = seen != g_seen_alive.end() && !seen->second.dead_since &&
+        (!known || (seen->second.mask_known && seen->second.alive_mask == mask));
+    ReleaseSRWLockShared(&g_seen_alive_lock);
+    if (unchanged) return;
     AcquireSRWLockExclusive(&g_seen_alive_lock);
     try {
-        if (g_seen_alive.size() > 8192) g_seen_alive.clear();  // addresses are reused; keeps it small
+        if (g_seen_alive.size() > 8192) {  // addresses are reused; keeps it small
+            for (const auto& entry : g_seen_alive)
+                if (entry.second.dead_since && !entry.second.settled) InterlockedDecrement(&g_bodies_pending);
+            g_seen_alive.clear();
+        }
         BodyState& state = g_seen_alive[chr];
         if (state.dead_since && !state.settled) InterlockedDecrement(&g_bodies_pending);
         if (known) {
@@ -3335,9 +3463,13 @@ void sync_buddy() noexcept {
         }
         g_buddy.applied_anywhere = anywhere;
         spirit_ashes::set_summon_anywhere(anywhere);
+        // apply() patches code from the menu thread under this lock; two
+        // VirtualProtect round trips on one page must not interleave.
+        AcquireSRWLockExclusive(&g_patch_lock);
         const bool area = set_site(g_summon_area, anywhere);
         const bool area_item = set_site(g_summon_area_item, anywhere);
         const bool range = set_site(g_summon_range, anywhere);
+        ReleaseSRWLockExclusive(&g_patch_lock);
         wchar_t message[200]{};
         swprintf_s(message, L"Summon anywhere %ls: monument rules applied; summoning-area checks %ls/%ls; range %ls.",
             anywhere ? L"on" : L"off", area ? L"ok" : L"not patched", area_item ? L"ok" : L"not patched",
@@ -3474,9 +3606,11 @@ bool build_buddy_set_size() noexcept {
 spirit_ashes::Settings spirit_ash_settings() noexcept {
     // No cap on ashes (0): the spirit set's 500 bodies are the limit, and the
     // game has 94 ashes.
+    // toggle_dismiss off when the item is left to the game (Same ash again = 2)
     return {value_of(ash_multiple) != 0, 0u, g_diagnostics,
-        true, true, true, true, true, g_spirit_hud_rows, static_cast<std::uint32_t>(value_of(ash_extra_cost)),
-        static_cast<std::uint32_t>(value_of(ash_damage_per_ash)), value_of(ash_repeat) != 0};
+        value_of(ash_repeat) != 2, true, true, true, true, g_spirit_hud_rows, static_cast<std::uint32_t>(value_of(ash_extra_cost)),
+        static_cast<std::uint32_t>(value_of(ash_damage_per_ash)), value_of(ash_repeat) == 1,
+        static_cast<std::uint32_t>(value_of(ash_max_regular)), static_cast<std::uint32_t>(value_of(ash_max_renowned))};
 }
 
 // First thing in initialize(): its HUD movie hook has to be in before the game
@@ -3488,7 +3622,7 @@ bool g_npc_spawner_started{};     // started without a provider: add_npc_spawner
 void start_spirit_ashes() noexcept {
     if (!g_config_path.empty())
         g_spirit_hud_rows = GetPrivateProfileIntW(L"SpiritAshes", L"HudRows", 1, g_config_path.c_str()) != 0;
-    for (const Id id : {ash_multiple, ash_extra_cost, ash_damage_per_ash, ash_repeat}) {
+    for (const Id id : {ash_multiple, ash_extra_cost, ash_damage_per_ash, ash_repeat, ash_max_regular, ash_max_renowned}) {
         Option& option = g_options[id];
         if (!g_config_path.empty())
             option.value = clamp_value(option, static_cast<int>(GetPrivateProfileIntW(L"Vanilla", option.key,
@@ -4560,7 +4694,11 @@ void sync_charged_launch() noexcept {
     const auto apply = [&](const LaunchRow& r, bool on) {
         game::write<std::uint8_t>(r.row + kDmgLevelOffset, on ? kLaunchLevels[want] : r.level);
         game::write<std::uint16_t>(r.row + kBlowingOffset, on ? kLaunchBlowing : r.blowing);
-        game::write<std::uint8_t>(r.row + kAtkBehaviorOffset, on ? kGuaranteedReaction : r.behavior);
+        // Keep the rows that already throw harder (2, super huge blowout) and the
+        // grabs (10 start, 11 finish): 5 would weaken or break them (param audit
+        // 21-11; 1.17.2 has 3 rows with 2 and none with 10 or 11).
+        const bool keep = r.behavior == 2 || r.behavior == 10 || r.behavior == 11;
+        game::write<std::uint8_t>(r.row + kAtkBehaviorOffset, on && !keep ? kGuaranteedReaction : r.behavior);
     };
     for (const LaunchRow& r : state.cells) apply(r, want != 0);
     for (const LaunchRow& r : state.others) apply(r, all);
@@ -6107,6 +6245,110 @@ struct DamageCutState {
 };
 DamageCutState g_damage_cut{};
 
+// A rebuilt param table must come from the game's own allocator: the game
+// owns the table and frees it when it exits, with its CRT's _aligned_free
+// (2.7.2.0 0x25234E8: reads the real block at ptr-8). A VirtualAlloc block
+// crashed every exit from the world (0xC0000005 at +0x25234F5, 21-11).
+// Its _aligned_malloc(size, alignment) follows right after (0x2523504);
+// both are unique in 2.7.0.0 to 2.7.2.1.
+// That only matches while nobody replaces the game's heaps: me3's mem_patch
+// (Reforged; MO2's me3 compat) turns them into mimalloc, and its free then
+// crashed on our CRT block at exit (review-er-plugin, 21-11). The game frees
+// any block through the DLAllocator that owns it (2.7.2.0 0x1EBD608: owner =
+// 0x1EC9340(block), then owner->vtable[0x68] deallocate), so the new table is
+// allocated by the owner of the table it replaces: vtable[0x50]
+// allocate_aligned(size, 16). The CRT pair stays as the fallback. The lookup
+// call is unique in 2.7.0.0 to 2.7.2.1 too.
+using GameAlignedMalloc = void* (*)(std::size_t, std::size_t);
+using GameAlignedFree = void (*)(void*);
+using GameAllocatorOf = void* (*)(const void*);
+using DlAllocateAligned = void* (*)(void*, std::size_t, std::size_t);
+using DlDeallocate = void (*)(void*, void*);
+GameAlignedMalloc g_game_aligned_malloc{};
+GameAlignedFree g_game_aligned_free{};
+GameAllocatorOf g_game_allocator_of{};
+bool g_game_heap_searched{};
+
+void search_game_heap() noexcept {
+    if (g_game_heap_searched) return;
+    g_game_heap_searched = true;
+    std::uint8_t* hit = find_unique(parse_pattern(
+        "48 83 ec 28 48 85 c9 74 0d 48 83 e1 f8 48 8b 49 f8 e8 ? ? ? ? 48 83 c4 28 c3 ? "
+        "48 89 5c 24 08 57 48 83 ec 20 33 db 48 85 d2 74 ? 48 8d 42 ff 48 85 c2 75 ? "
+        "8d 43 08 48 3b d0 48 0f 47 c2 48 8d 78 ff 48 8d 41 08 48 03 c7"));
+    if (hit) {
+        g_game_aligned_free = reinterpret_cast<GameAlignedFree>(hit);
+        g_game_aligned_malloc = reinterpret_cast<GameAlignedMalloc>(hit + 0x1C);
+    }
+    std::uint8_t* owner = find_unique(parse_pattern(
+        "48 8b ce e8 ? ? ? ? 48 8b d8 48 85 c0 75 ? 4c 8d 05 ? ? ? ? 8d 50 64 48 8d 0d ? ? ? ? "
+        "e8 ? ? ? ? 4c 8b 03 48 8b d6 48 8b cb 41 ff 50 68"));
+    if (owner) {
+        std::int32_t rel{};
+        std::memcpy(&rel, owner + 4, 4);
+        g_game_allocator_of = reinterpret_cast<GameAllocatorOf>(owner + 8 + rel);
+    }
+    wchar_t message[200]{};
+    swprintf_s(message, L"Param tables: the game's allocator lookup %ls, aligned allocator %ls.",
+        owner ? L"found" : L"not found", hit ? L"found" : L"not found");
+    log(message);
+}
+
+void* allocator_of(const void* block) noexcept {
+    if (!g_game_allocator_of || !block) return nullptr;
+    __try {
+        return g_game_allocator_of(block);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+void* call_allocate_aligned(void* allocator, std::size_t size) noexcept {
+    __try {
+        const auto vtable = *static_cast<void***>(allocator);
+        return reinterpret_cast<DlAllocateAligned>(vtable[0x50 / 8])(allocator, size, 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// `original` is the block of the table being replaced (its file - 16).
+std::uint8_t* game_table_alloc(std::size_t size, const void* original) noexcept {
+    search_game_heap();
+    std::uint8_t* block = nullptr;
+    if (void* allocator = allocator_of(original)) {
+        block = static_cast<std::uint8_t*>(call_allocate_aligned(allocator, size));
+        // The game must find the same owner for the new block.
+        if (block && allocator_of(block) != allocator) {
+            __try {
+                reinterpret_cast<DlDeallocate>((*static_cast<void***>(allocator))[0x68 / 8])(allocator, block);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+            }
+            block = nullptr;
+        }
+    }
+    const bool from_owner = block != nullptr;
+    if (!block && g_game_aligned_malloc) block = static_cast<std::uint8_t*>(g_game_aligned_malloc(size, 16));
+    if (block) std::memset(block, 0, size);
+    wchar_t message[160]{};
+    swprintf_s(message, L"Param tables: %zu bytes from %ls.", size,
+        from_owner ? L"the allocator of the table it replaces" : block ? L"the game's CRT" : L"nowhere (not extended)");
+    log(message);
+    return block;
+}
+
+void game_table_free(std::uint8_t* block) noexcept {
+    if (!block) return;
+    if (void* allocator = allocator_of(block)) {
+        __try {
+            reinterpret_cast<DlDeallocate>((*static_cast<void***>(allocator))[0x68 / 8])(allocator, block);
+            return;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    if (g_game_aligned_free) g_game_aligned_free(block);
+}
+
 // Appends rows (ids ascending, above every existing one) to a param table
 // that keeps its rows sorted, rebuilding the table with its prefix and id
 // index once; returns the new rows' data, or nothing.
@@ -6153,11 +6395,11 @@ std::vector<std::uint8_t*> append_param_rows(const wchar_t* name, std::size_t ro
     const std::uint64_t index_offset = (file_size + 0xF) & ~std::uint64_t{0xF};
     const std::uint64_t new_count = count + added.size();
     const std::uint64_t total = 16 + index_offset + new_count * 8 + 16;
-    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    auto* block = game_table_alloc(total, reinterpret_cast<const void*>(file - 16));
     if (!block) return result;
     std::uint8_t* out = block + 16;
     if (!game::safe_read(file, out, 0x40) || !game::safe_read(file + data_start, out + new_data_start, body)) {
-        VirtualFree(block, 0, MEM_RELEASE);
+        game_table_free(block);
         return result;
     }
     for (Row& r : rows) {
@@ -6188,7 +6430,7 @@ std::vector<std::uint8_t*> append_param_rows(const wchar_t* name, std::size_t ro
         std::memcpy(out + index_offset + i * 8ull, entry, 8);
     }
     if (!game::write<std::uintptr_t>(slot, reinterpret_cast<std::uintptr_t>(out))) {
-        VirtualFree(block, 0, MEM_RELEASE);
+        game_table_free(block);
         return result;
     }
     ++g_param_appends;
@@ -6677,13 +6919,13 @@ void sync_item_shop() noexcept {
     const std::uint64_t file_size = new_type_offset + tail_size;
     const std::uint64_t index_offset = (file_size + 0xF) & ~std::uint64_t{0xF};
     const std::uint64_t total = 16 + index_offset + new_count * 8 + 16;
-    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    auto* block = game_table_alloc(total, reinterpret_cast<const void*>(file - 16));
     if (!block) return;
     std::uint8_t* out = block + 16;
     if (!game::safe_read(file, out, 0x40) ||
         !game::safe_read(file + data_start, out + new_data_start, data_size) ||
         !game::safe_read(file + type_offset, out + new_type_offset, tail_size)) {
-        VirtualFree(block, 0, MEM_RELEASE);
+        game_table_free(block);
         return;
     }
     // Merge the rows by id (both lists are sorted).
@@ -6776,7 +7018,7 @@ void sync_item_shop() noexcept {
     }
     // Point the holder at the new table (the old one stays allocated).
     if (!game::write<std::uintptr_t>(slot, reinterpret_cast<std::uintptr_t>(out))) {
-        VirtualFree(block, 0, MEM_RELEASE);
+        game_table_free(block);
         for (auto& section_rows : g_shop_rows) section_rows[0].clear(), section_rows[1].clear();
         for (auto& section_layout : g_shop_layout) section_layout[0].clear(), section_layout[1].clear();
         state.attempted = true;
@@ -6890,6 +7132,79 @@ struct FoundMaterialsState {
 };
 FoundMaterialsState g_found{};
 
+// Enemy chase distance: the three distances the AI's COMMON_SetBattleActLogic
+// takes from NpcThinkParam (u16 metres; NPC_THINK_PARAM_ST is 0xE4 bytes):
+// +0x3C "goes home whatever happens" (85 m for most enemies in 2.7.2.0),
+// +0x3E "goes home while fighting" (30 m) and +0x40 "gives up going home and
+// fights" (12 m). All three scale together, so they keep their order; 9999
+// (never) only grows, 0 is left alone. Checked offline on 2.7.2.0's
+// regulation.bin (2215 rows, stride 0xE4). Enemies still stop where their
+// navmesh ends (a cave mouth, another map tile).
+struct ChaseCell {
+    std::uintptr_t address;
+    std::uint16_t original;
+};
+
+struct ChaseState {
+    bool attempted{};
+    bool ready{};
+    std::vector<ChaseCell> cells{};
+    int applied{100};
+};
+
+ChaseState g_chase{};
+
+void sync_enemy_chase() noexcept {
+    auto& state = g_chase;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"NpcThinkParam", 0xE4, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        std::vector<std::uint16_t> battle;
+        try {
+            state.cells.reserve(table.rows.size() * 3);
+            for (const auto row : table.rows) {
+                for (const std::ptrdiff_t offset : {0x3C, 0x3E, 0x40}) {
+                    std::uint16_t distance{};
+                    if (!game::read(row + offset, distance) || distance == 0) continue;
+                    state.cells.push_back({row + offset, distance});
+                    if (offset == 0x40) battle.push_back(distance);
+                }
+            }
+        } catch (...) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        std::uint16_t median{};
+        if (!battle.empty()) {
+            std::nth_element(battle.begin(), battle.begin() + battle.size() / 2, battle.end());
+            median = battle[battle.size() / 2];
+        }
+        // Tens of metres in the game's data; another layout shows another spread.
+        const bool ok = battle.size() >= 100 && median >= 5 && median <= 1000;
+        wchar_t message[200]{};
+        swprintf_s(message, L"Enemy chase distance: %zu NpcThinkParam distances (%zu in battle, median %u m)%ls.",
+            state.cells.size(), battle.size(), median, ok ? L"" : L" -> option disabled");
+        log(message);
+        if (!ok) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(enemy_chase);
+    if (want == state.applied) return;
+    for (const auto& cell : state.cells)
+        game::write<std::uint16_t>(cell.address, static_cast<std::uint16_t>(
+            std::clamp<std::int64_t>(static_cast<std::int64_t>(cell.original) * want / 100, 1, 65535)));
+    state.applied = want;
+}
+
 void sync_found_materials() noexcept {
     if (g_found.attempted) return;
     if (!g_found.ready) {
@@ -6947,6 +7262,7 @@ bool all_params_ready() noexcept {
         (g_buffs.ready || g_buffs.attempted) && (g_buddy.ready || g_buddy.attempted) &&
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted && (g_found.ready || g_found.attempted) &&
+        (g_chase.ready || g_chase.attempted) &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_projectile_range.ready || g_projectile_range.attempted) && (g_charm.ready || g_charm.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
@@ -7002,6 +7318,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_flasks();
         sync_materials();
         sync_found_materials();
+        sync_enemy_chase();
         sync_helmet();
     }
 }
@@ -8820,7 +9137,6 @@ void apply(Id id) noexcept {
         break;
     case craft_in_combat:
         set_site(g_craft_combat, on(id));
-        set_site(g_craft_combat_flag, on(id));
         set_site(g_craft_combat_menu, on(id));
         break;
     case chromatic_off: set_site(g_chromatic, on(id)); break;
@@ -8869,6 +9185,9 @@ void apply(Id id) noexcept {
         break;
     }
     case ultrawide: set_site(g_ultrawide, on(id)); break;
+    case ash_max_regular: case ash_max_renowned:
+        spirit_ashes::update(spirit_ash_settings());
+        break;
     case ash_multiple: case ash_extra_cost: case ash_damage_per_ash: case ash_repeat: {
         spirit_ashes::update(spirit_ash_settings());
         const bool shared = on(ash_multiple) && g_spirit_ashes_started && build_buddy_slot_search();
@@ -8934,6 +9253,7 @@ void apply(Id id) noexcept {
     case npc_spawner: break;  // read once at startup (start_npc_spawner)
     case healing_aura:  // param_worker (sync_healing_aura)
     case materials_found:  // param_worker (sync_found_materials)
+    case enemy_chase:      // param_worker (sync_enemy_chase)
         if (g_param_event) SetEvent(g_param_event);
         break;
     case keep_bodies:
@@ -9025,7 +9345,7 @@ bool available(Id id) noexcept {
     case camera_reset_off: return g_camera_reset.ready;
     case vignette_off: return g_vignette.ready;
     case sharpen_off: return g_sharpen.ready;
-    case craft_in_combat: return g_craft_combat.ready && g_craft_combat_flag.ready && g_craft_combat_menu.ready;
+    case craft_in_combat: return g_craft_combat.ready && g_craft_combat_menu.ready;
     case map_in_combat: return g_map_combat_open.ready && g_map_combat_close.ready;
     case chromatic_off: return g_chromatic.ready;
     case animation_distance: return g_animation.ready;
@@ -9035,7 +9355,7 @@ bool available(Id id) noexcept {
     case fps_unlock: case fps_limit: return g_frametime.ready && g_fullscreen_cap.ready;
     case ultrawide: return g_ultrawide.ready;
     case ash_multiple: case ash_dismiss_all: case ash_extra_cost: case ash_damage_per_ash:
-    case ash_repeat: case ash_free_fighting:
+    case ash_repeat: case ash_free_fighting: case ash_max_regular: case ash_max_renowned:
         return g_spirit_ashes_started;
     case refresh_rate: return g_fullscreen_cap.ready;
     case skip_intro: return g_intro.ready;
@@ -9085,6 +9405,7 @@ bool available(Id id) noexcept {
     case keep_bodies: return g_timed_fade_site != nullptr;
     case healing_aura: return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_aura.found != 0;
     case materials_found: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_found.attempted;
+    case enemy_chase: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_chase.attempted;
     case one_hit_kill: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_damage_cut.attempted;
     case shop_weapon_level: case shop_spirit_level: case shop_item_price: return g_item_gib != nullptr;
     case npc_spawner: return g_npc_spawner_built_in && !g_npc_spawner_standalone;
@@ -9244,7 +9565,8 @@ void ERUI_CALL named_slider_changed(void* target, const ERUI_CustomSliderChangeC
 }
 
 bool is_named(Id i) noexcept {
-    return i == weather_type || i == charged_launch || i == world_journey || i == ash_free_fighting;
+    return i == weather_type || i == charged_launch || i == world_journey || i == ash_free_fighting ||
+        i == ash_repeat;
 }
 
 // Fork export (r115) that colours labels away from their default; null when
@@ -9826,13 +10148,66 @@ void resolve_chr_enable() noexcept {
     log(message);
 }
 
-bool call_chr_enable(ChrEnableFn function, std::uintptr_t chr) noexcept {
+bool call_chr_enable_here(ChrEnableFn function, std::uintptr_t chr) noexcept {
     __try {
         function(chr);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// The setters do a plain read-modify-write of ChrIns+0x539 and touch the
+// character it rides: run them in the game's task loop (GameMan step, msa
+// game_thread.rs), not on this worker, so a frame that changes the same byte
+// cannot lose a bit (21-11). Before msa's task is registered (or in the audit
+// tool) they run here, as before. Not taken within 250 ms (a loading
+// screen): not run; the worker's next pass tries again.
+extern "C" std::uint8_t nt_msa_game_thread_ready();
+extern "C" std::uint8_t nt_msa_on_game_thread(std::uint8_t (*function)(std::uintptr_t), std::uintptr_t argument,
+    std::uint32_t timeout_ms);
+
+struct ChrEnableCall {
+    ChrEnableFn function;
+    std::uintptr_t chr;
+};
+
+std::uint8_t chr_enable_on_game_thread(std::uintptr_t argument) noexcept {
+    const auto* call = reinterpret_cast<const ChrEnableCall*>(argument);
+    return call_chr_enable_here(call->function, call->chr) ? 1 : 0;
+}
+
+std::uint8_t game_thread_noop(std::uintptr_t argument) noexcept {
+    *reinterpret_cast<DWORD*>(argument) = GetCurrentThreadId();
+    return 1;
+}
+
+// Once a character is loaded: one empty call through the queue, so the log
+// shows it works and how long the game takes to run it.
+DWORD WINAPI game_thread_probe_worker(LPVOID) {
+    for (int i = 0; i < 1800; ++i) {  // up to 30 minutes
+        Sleep(1000);
+        std::uintptr_t manager{}, player{};
+        if (!nt_msa_game_thread_ready() || !game::read(g_statics.world_chr_man, manager) || !manager ||
+            !game::read(manager + game::kPlayerIns, player) || !player)
+            continue;
+        DWORD thread{};
+        const ULONGLONG start = GetTickCount64();
+        const std::uint8_t result =
+            nt_msa_on_game_thread(&game_thread_noop, reinterpret_cast<std::uintptr_t>(&thread), 1000);
+        wchar_t message[160]{};
+        swprintf_s(message, L"Game-thread calls: %ls in %llu ms (game thread T%lu, worker T%lu).",
+            result == 2 ? L"ready" : L"not taken", GetTickCount64() - start, thread, GetCurrentThreadId());
+        log(message);
+        if (result == 2) return 0;
+    }
+    return 0;
+}
+
+bool call_chr_enable(ChrEnableFn function, std::uintptr_t chr) noexcept {
+    if (!nt_msa_game_thread_ready()) return call_chr_enable_here(function, chr);
+    const ChrEnableCall call{function, chr};
+    return nt_msa_on_game_thread(&chr_enable_on_game_thread, reinterpret_cast<std::uintptr_t>(&call), 250) == 2;
 }
 
 bool chr_disabled(std::uintptr_t chr) noexcept {
@@ -9944,15 +10319,25 @@ void collect_chr(std::uintptr_t chr, void* context) noexcept {
 DWORD WINAPI bodies_worker(void*) noexcept {
     constexpr ULONGLONG kSettleMs = 6000;
     std::vector<std::uintptr_t> loaded{};
+    struct Settle {
+        std::uintptr_t chr;
+        std::uint32_t mask;
+        bool mask_known;
+    };
+    std::vector<Settle> settle{};
     int logged = 0;
     for (;;) {
         Sleep(250);
         try {
             if (!g_keep_bodies_on || g_bodies_pending <= 0) continue;
             loaded.clear();
+            settle.clear();
             game::for_each_loaded_chr(g_statics, &collect_chr, &loaded);
             std::sort(loaded.begin(), loaded.end());
+            settle.reserve(16);
             const ULONGLONG now = GetTickCount64();
+            // Only the bookkeeping under the lock: the game thread waits on it
+            // in the ApplySpEffect hook, so game writes and logging come after.
             AcquireSRWLockExclusive(&g_seen_alive_lock);
             for (auto it = g_seen_alive.begin(); it != g_seen_alive.end();) {
                 BodyState& state = it->second;
@@ -9966,25 +10351,29 @@ DWORD WINAPI bodies_worker(void*) noexcept {
                     it = g_seen_alive.erase(it);
                     continue;
                 }
-                if (now - state.dead_since >= kSettleMs) {
-                    std::uint8_t flags{};
-                    if (game::read(chr + 0x539, flags)) game::write<std::uint8_t>(chr + 0x539, flags | 0x01);
-                    const bool parts = state.mask_known && restore_model_parts(chr, state.alive_mask);
+                if (now - state.dead_since >= kSettleMs && settle.size() < settle.capacity()) {
+                    settle.push_back({chr, state.alive_mask, state.mask_known});
                     state.settled = true;
                     InterlockedDecrement(&g_bodies_pending);
-                    if (logged < 40) {
-                        ++logged;
-                        std::int32_t model{-1};
-                        game::read(chr + 0x64, model);
-                        wchar_t message[128]{};
-                        swprintf_s(message, L"Keep bodies: c%04d frozen in place%ls.", model,
-                            parts ? L", its model parts put back" : L"");
-                        log(message);
-                    }
                 }
                 ++it;
             }
             ReleaseSRWLockExclusive(&g_seen_alive_lock);
+            for (const Settle& body : settle) {
+                // Bit 0 of +0x539 is ours; the game sets other bits of the same
+                // byte from its own thread, so the set is one locked OR.
+                game::or_byte(body.chr + 0x539, 0x01);
+                const bool parts = body.mask_known && restore_model_parts(body.chr, body.mask);
+                if (logged < 40) {
+                    ++logged;
+                    std::int32_t model{-1};
+                    game::read(body.chr + 0x64, model);
+                    wchar_t message[128]{};
+                    swprintf_s(message, L"Keep bodies: c%04d frozen in place%ls.", model,
+                        parts ? L", its model parts put back" : L"");
+                    log(message);
+                }
+            }
         } catch (...) {
         }
     }
@@ -11068,7 +11457,7 @@ const Texts kEnglish{
         {L"Super armour while using items (beta)", L"BETA: the game's super armour while you drink a flask or use an item: weaker hits no longer interrupt you, very strong ones still can, and you still take the damage. Your character only."},
         {L"Extended ranges", L"Off by default. Many sliders of this menu go further and get a Scale row (x1 to x100) under them that multiplies their value. Applies when you restart the game."},
         {L"Highlight changed options", L"Off by default. The names of options set away from the game's default are coloured, so you can see at a glance what you changed. Applies at once."},
-        {L"Same ash again", L"With Several ashes at once, using a summoned spirit ash's item summons it once more instead of dismissing it, so you can have the same ash several times; each one pays its FP. Dismiss all ashes removes them. Off by default: the item dismisses that ash."},
+        {L"Item of a summoned ash", L"With Several ashes at once, what using the item of a spirit ash that is already summoned does. Dismisses it (default): only that ash leaves. Summons it again: you get the same ash once more, and each one pays its FP; Dismiss all ashes removes them. Game decides: the item is left to the game, or to a mod that gives it another use, instead of dismissing the ash."},
         {L"Free fighting", L"Off by default. Where summoned spirit ashes fight freely, with no warp to your side cutting into the fight: Boss arenas, only there; Everywhere, in boss arenas and in any fight on foot. When a fight ends, ashes left far away come back to you. In every mode they still cross fog gates with you. Applies right away."},
         {L"Deflect window (%) (beta)", L"BETA: with the Deflecting Hardtear, makes its perfect guard window last longer. 100% is the game's (6 frames when you raise your guard, fewer after several deflects in a row); 200% doubles the first window. Your character only."},
         {L"Solid spirit ashes", L"Summoned spirit ashes (and Seluvis's puppets) lose their blue ghostly look and appear as solid characters. They work exactly the same. Applies to the next ash you summon."},
@@ -11105,6 +11494,9 @@ const Texts kEnglish{
         {L"Materials found (%)", L"How many crafting materials you get from each gathering spot, corpse, chest and enemy drop: 200% gives twice as many. Only materials used in crafting recipes. Item drop rate changes how often enemies drop things. Applies to the next pick-up."},
         {L"Craft in combat", L"Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
         {L"Map in combat", L"The map opens while enemies are fighting you, and stays open when a fight starts. Fast travel still follows the game's rules (or Fast travel anywhere). Applies at once."},
+        {L"Enemy chase distance (%)", L"How far enemies follow you away from where they stand before they give up and walk back: 300% is three times as far. They still stop where they cannot walk (cave mouths, cliffs, the edge of their area). To be sure it applies, rest at a site of grace or reload the area after changing it."},
+        {L"Most regular ashes at once", L"With Several ashes at once: how many regular spirit ashes (upgraded with Grave Glovewort) can be out together. Summoning one more dismisses one of them with a short fade; renowned ashes stay. 0 = no limit."},
+        {L"Most renowned ashes at once", L"With Several ashes at once: how many renowned spirit ashes (upgraded with Ghost Glovewort, like the Mimic Tear or Black Knife Tiche) can be out together. Summoning one more dismisses one of them with a short fade; regular ashes stay. 0 = no limit."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -11295,7 +11687,7 @@ const Texts kSpanish{
         {L"Superarmadura al usar objetos (beta)", L"BETA: la superarmadura del juego mientras bebes un frasco o usas un objeto: los golpes más débiles ya no te interrumpen, los muy fuertes sí pueden, y el daño lo recibes igual. Solo para tu personaje."},
         {L"Rangos ampliados", L"Desactivado por defecto. Muchos deslizadores de este menú llegan más lejos y tienen debajo una fila de Escala (x1 a x100) que multiplica su valor. Se aplica al reiniciar el juego."},
         {L"Resaltar opciones cambiadas", L"Desactivado por defecto. Los nombres de las opciones que no están en el valor del juego salen en color, para ver de un vistazo qué has cambiado. Se aplica al momento."},
-        {L"Repetir la misma ceniza", L"Con «Varias cenizas a la vez», usar el objeto de una ceniza ya invocada la invoca otra vez en lugar de retirarla, para tener la misma ceniza varias veces; cada una cobra sus PC. «Retirar todas las cenizas» las quita todas. Desactivada por defecto: el objeto retira esa ceniza."},
+        {L"Objeto de una ceniza invocada", L"Con «Varias cenizas a la vez», qué hace usar el objeto de una ceniza que ya está invocada. La retira (por defecto): solo se va esa ceniza. La invoca otra vez: tienes la misma ceniza una vez más, y cada una cobra sus PC; «Retirar todas las cenizas» las quita todas. Lo decide el juego: el objeto se deja al juego, o a un mod que le dé otro uso, en vez de retirar la ceniza."},
         {L"Lucha libre", L"Desactivada por defecto. Dónde pelean libres las cenizas invocadas, sin que un teletransporte a tu lado corte la pelea: Arenas de jefe, solo ahí; En todas partes, en arenas de jefe y en cualquier pelea a pie. Al acabar una pelea, las que se hayan quedado lejos vuelven contigo. En todos los modos siguen cruzando la niebla contigo. Se aplica al momento."},
         {L"Ventana de desvío (%) (beta)", L"BETA: con la Lágrima de desvío, alarga la ventana de la guardia perfecta. El 100 % es la del juego (6 fotogramas al alzar la guardia, menos tras varios desvíos seguidos); el 200 % duplica la primera ventana. Solo para tu personaje."},
         {L"Cenizas sin aspecto fantasmal", L"Las cenizas espirituales invocadas (y las marionetas de Seluvis) pierden su aspecto fantasmal azul y se ven como personajes sólidos. Funcionan exactamente igual. Se aplica a la siguiente ceniza que invoques."},
@@ -11332,6 +11724,9 @@ const Texts kSpanish{
         {L"Materiales obtenidos (%)", L"Cuántos materiales de fabricación consigues de cada punto de recolección, cadáver, cofre y botín de enemigos: con 200% el doble. Solo los materiales que usan las recetas. La tasa de botín cambia cada cuánto sueltan cosas los enemigos. Se aplica a la siguiente recogida."},
         {L"Fabricar en combate", L"Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
         {L"Mapa en combate", L"El mapa se abre mientras luchas contra enemigos y no se cierra cuando empieza un combate. El viaje rápido sigue las reglas del juego (o Viaje rápido en cualquier sitio). Se aplica al momento."},
+        {L"Distancia de persecución (%)", L"Hasta dónde te siguen los enemigos lejos de su sitio antes de rendirse y volver: al 300 % llegan tres veces más lejos. Siguen parándose donde no pueden caminar (entradas de cuevas, acantilados, el borde de su zona). Para asegurarte de que se aplica, descansa en un lugar de gracia o recarga la zona tras cambiarla."},
+        {L"Máximo de cenizas normales", L"Con «Varias cenizas a la vez»: cuántas cenizas normales (las que se mejoran con Hierba sepulcral) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las renombradas se quedan. 0 = sin límite."},
+        {L"Máximo de cenizas renombradas", L"Con «Varias cenizas a la vez»: cuántas cenizas renombradas (las que se mejoran con Hierba sepulcral fantasmal, como el Espejismo o Tiche) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las normales se quedan. 0 = sin límite."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -11522,7 +11917,7 @@ const Texts kChinese{
         {L"使用道具时霸体（测试版）", L"测试版：喝圣杯瓶或使用道具时获得游戏的霸体：较弱的攻击不再打断你，极强的攻击仍可能打断，伤害照常承受。仅对你的角色生效。"},
         {L"扩展范围", L"默认关闭。此菜单中的许多滑块可调范围更大，下方另有一行“倍率”（x1 至 x100）用于放大数值。重启游戏后生效。"},
         {L"高亮已更改的选项", L"默认关闭。不在游戏默认值的选项名称会以颜色显示，一眼就能看出改过什么。立即生效。"},
-        {L"重复召唤同一骨灰", L"开启“同时召唤多个骨灰”时，再次使用已召唤骨灰的道具会再召唤一次，而不是解除它，这样可以同时拥有多个相同的骨灰；每次都会消耗 FP。“解除所有骨灰”可将其全部解除。默认关闭：道具会解除该骨灰。"},
+        {L"已召唤骨灰的道具", L"开启“同时召唤多个骨灰”时，再次使用已召唤骨灰的道具会怎样。解除（默认）：只解除该骨灰。再次召唤：再召唤一个相同的骨灰，每个都会消耗 FP；“解除所有骨灰”可将其全部解除。交给游戏：道具交由游戏（或为其赋予其他用途的模组）处理，而不是解除骨灰。"},
         {L"自由战斗", L"默认关闭。召唤的骨灰在哪里自由战斗，不会被传送回你身边而打断战斗：头目场地，仅在那里；全部，头目场地和任何徒步战斗。战斗结束后，留在远处的骨灰会回到你身边。所有模式下骨灰仍会和你一起穿过雾门。立即生效。"},
         {L"偏转判定时间 (%)（测试版）", L"测试版：使用偏转硬泪滴时，延长完美防御的判定时间。100% 为游戏原本的判定（举盾时 6 帧，连续偏转后会变短）；200% 将第一次的判定时间翻倍。仅作用于你的角色。"},
         {L"骨灰不再呈幽灵外观", L"召唤的骨灰（以及瑟留斯的人偶）不再呈现蓝色幽灵外观，而是显示为实体角色。效果完全不变。从下一次召唤的骨灰开始生效。"},
@@ -11559,6 +11954,9 @@ const Texts kChinese{
         {L"获得材料 (%)", L"每个采集点、尸体、宝箱和敌人掉落给你的制作材料数量：200% 为两倍。仅限制作配方使用的材料。物品掉落率决定敌人掉落的频率。下次拾取时生效。"},
         {L"战斗中制作", L"与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
         {L"战斗中查看地图", L"与敌人战斗时也能打开地图，战斗开始时地图也不会关闭。快速传送仍遵循游戏规则（或随处快速传送）。立即生效。"},
+        {L"敌人追击距离（%）", L"敌人离开原位追击你多远才会放弃并返回：300% 即三倍距离。它们仍会在无法行走的地方停下（洞口、悬崖、区域边缘）。更改后在赐福处休息或重新载入区域以确保生效。"},
+        {L"普通骨灰同时上限", L"开启“同时召唤多个骨灰”时：普通骨灰（用坟地钟形花强化）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；名人骨灰不受影响。0 = 无上限。"},
+        {L"名人骨灰同时上限", L"开启“同时召唤多个骨灰”时：名人骨灰（用灵魂坟地钟形花强化，如仿身泪滴、黑刀蒂秋）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；普通骨灰不受影响。0 = 无上限。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -11590,12 +11988,13 @@ const Layout kLayout[]{
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
     {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
-    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, charm_all_enemies, charm_bosses,
+    {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemy_chase, charm_all_enemies, charm_bosses,
         enemies_no_attack, enemies_no_move,
         enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable, npc_spawner}},
     // Summon Melina and Melina companion (summon_melina, melina_companion) stay out
     // of the menu: work in progress, moving to a separate mod (2026-10-28).
     {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_free_fighting, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
+        ash_max_regular, ash_max_renowned,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
     {cat_runes, {rune_loss_off, runes_gained, loot_drop, materials_found, shop_price, upgrade_cost, upgrade_free, craft_free,
         craft_in_combat}},
@@ -12377,13 +12776,22 @@ int audit(LogFn log_fn) noexcept {
     g_log = log_fn;
     for (Site* site : kSites) resolve(*site);
     resolve(g_buddy_set_size);
-    resolve_dialog_yes_reads(false);
+    // The hook installers run as in the game: they check their bytes and
+    // write their jumps into this process's copy of the mapped exe, which
+    // never runs. That covers the options a pattern alone does not prove.
+    // (In the order initialize() uses.)
+    install_dialog_yes_hooks();
+    install_window_hooks();
     resolve(g_intro);
     resolve_window();
     resolve_map_flags();
     resolve_fov_site();
     resolve_downed_site();
     resolve_jump_site();
+    install_camera_shake_hook();
+    install_ragdoll_hook();
+    resolve_keep_bodies();
+    resolve_item_gib();
     const bool fall_site = find_unique(parse_pattern(
         "48 8b c4 55 53 56 57 41 54 41 56 41 57 48 8d 68 b1 48 81 ec c0 00 00 00 48 c7 45 b7 fe ff ff ff "
         "0f 29 70 b8 0f 29 78 a8 44 0f 29 40 98 44 0f 29 48 88 48 8b 05 ? ? ? ? 48 33 c4 48 89 45 cf "
@@ -12417,18 +12825,45 @@ int audit(LogFn log_fn) noexcept {
             swprintf_s(message, L"Vanilla site 'lock-on range %S' not found (or ambiguous).", site.name);
         log(message);
     }
+    // The write used for hooks turned on mid-game (other threads suspended),
+    // once, through the jump hook: it has no worker and starts nothing.
+    g_freeze_writes.store(true, std::memory_order_release);
+    install_jump_hook();
+    g_freeze_writes.store(false, std::memory_order_release);
     g_statics = game::resolve_statics(g_log);
     int unavailable = fall_site ? 0 : 1;
+    int elsewhere = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        if (available(static_cast<Id>(i))) continue;
-        ++unavailable;
-        wchar_t message[160]{};
-        swprintf_s(message, L"AUDIT: option %ls would be greyed out.", g_options[i].key);
+        const Id id = static_cast<Id>(i);
+        if (available(id)) continue;
+        // Not decided by eldenring.exe here: Multiple Spirit Ashes and the
+        // HUD layout are checked by msa's own offline tests (every exe);
+        // the rest need the INI, the built-in NPC Spawner or are off on purpose.
+        const wchar_t* reason = nullptr;
+        switch (id) {
+        case ash_multiple: case ash_dismiss_all: case ash_extra_cost: case ash_damage_per_ash:
+        case ash_repeat: case ash_free_fighting: case ash_max_regular: case ash_max_renowned:
+            reason =L"Multiple Spirit Ashes (msa tests: native_rvas_match_every_executable)"; break;
+        case hud_screen_edges: case hud_scale: case menu_edges:
+            reason = L"HUD layout (msa tests: scaleform_targets_resolve_on_every_executable)"; break;
+        case extended_ranges: case highlight_changed: reason = L"needs NativeTweaks.ini only"; break;
+        case npc_spawner: reason = L"built-in NPC Spawner"; break;
+        case summon_melina: case melina_companion: reason = L"off on purpose (separate mod)"; break;
+        default: break;
+        }
+        wchar_t message[200]{};
+        if (reason) {
+            ++elsewhere;
+            swprintf_s(message, L"AUDIT: option %ls not checked here: %ls.", g_options[i].key, reason);
+        } else {
+            ++unavailable;
+            swprintf_s(message, L"AUDIT: option %ls would be greyed out.", g_options[i].key);
+        }
         log(message);
     }
-    wchar_t summary[160]{};
-    swprintf_s(summary, L"AUDIT: %d of %d options would be unavailable.", unavailable,
-        static_cast<int>(count));
+    wchar_t summary[200]{};
+    swprintf_s(summary, L"AUDIT: %d of %d options would be unavailable (%d checked elsewhere).", unavailable,
+        static_cast<int>(count), elsewhere);
     log(summary);
     return unavailable;
 }
@@ -12479,11 +12914,14 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
         if (!available(static_cast<Id>(i))) continue;
         if (value_of(static_cast<Id>(i)) != g_options[i].fallback) apply(static_cast<Id>(i));
     }
-    // On by default, and only apply() patches the spirit slot search
-    // (audit 2026-11-08: with default settings it stayed at 10 per player).
+    // Only apply() patches the spirit slot search (audit 2026-11-08: with
+    // the old on-by-default setting it stayed at 10 per player).
     if (available(ash_multiple) && value_of(ash_multiple) != 0) apply(ash_multiple);
     // The layout options are skipped above while ERNativeUI.dll is not loaded yet.
     send_hud_layout(L"startup");
+    // From here on, hooks turned on from the menu are written frozen.
+    g_freeze_writes.store(true, std::memory_order_release);
+    start_thread(&game_thread_probe_worker, L"game thread probe");
     if (!g_config_path.empty()) {
         g_save_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (g_save_event) start_thread(&save_worker, L"save");
@@ -12641,6 +13079,10 @@ constexpr std::size_t kFreeFightCount = 3;
 constexpr const wchar_t* kFreeFightEnglish[kFreeFightCount]{L"Off", L"Boss arenas", L"Everywhere"};
 constexpr const wchar_t* kFreeFightSpanish[kFreeFightCount]{L"Desactivada", L"Arenas de jefe", L"En todas partes"};
 constexpr const wchar_t* kFreeFightChinese[kFreeFightCount]{L"关闭", L"头目场地", L"全部"};
+constexpr std::size_t kRepeatCount = 3;
+constexpr const wchar_t* kRepeatEnglish[kRepeatCount]{L"Dismisses it", L"Summons it again", L"Game decides"};
+constexpr const wchar_t* kRepeatSpanish[kRepeatCount]{L"La retira", L"La invoca otra vez", L"Lo decide el juego"};
+constexpr const wchar_t* kRepeatChinese[kRepeatCount]{L"解除", L"再次召唤", L"交给游戏"};
 constexpr const wchar_t* kWeatherChinese[kWeatherCount]{
     L"晴天", L"晴朗", L"少云", L"多云", L"雨", L"雨云", L"风雨", L"风雾", L"雪",
     L"大雪", L"雾", L"浓雾", L"大风多云", L"雨雾", L"雪雾", L"阵雨"};
@@ -12682,6 +13124,9 @@ std::vector<std::wstring> value_names(std::string_view lang, Id i) {
     } else if (i == ash_free_fighting) {
         english = kFreeFightEnglish, spanish = kFreeFightSpanish, chinese = kFreeFightChinese;
         count = kFreeFightCount;
+    } else if (i == ash_repeat) {
+        english = kRepeatEnglish, spanish = kRepeatSpanish, chinese = kRepeatChinese;
+        count = kRepeatCount;
     }
     const wchar_t* const* names = english;
     if (lang == "es") names = spanish;

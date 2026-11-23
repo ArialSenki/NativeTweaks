@@ -23,6 +23,8 @@ struct Settings {
     std::uint32_t extra_cost_percent;        // FP cost of each additional ash (100 = native)
     std::uint32_t damage_reduction_percent;  // damage lost per extra living ash (0 = native)
     bool repeat_same_ash;    // a summoned ash's item summons it again instead of dismissing it
+    std::uint32_t max_regular;   // most regular (Grave Glovewort) ashes at once, 0 = no limit
+    std::uint32_t max_renowned;  // most renowned (Ghost Glovewort) ashes at once, 0 = no limit
 };
 
 // Once, early (the HUD hook must be in before the HUD movie opens). False when

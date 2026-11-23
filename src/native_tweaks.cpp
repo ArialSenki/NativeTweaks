@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <iterator>
@@ -34,7 +35,7 @@ namespace {
 HMODULE g_own_module{};
 erui::Registration g_registration{};
 // Build tag shown in the log and, with ERUI 1.3, on the title screen.
-constexpr wchar_t kBuildTag[] = L"r158";
+constexpr wchar_t kBuildTag[] = L"r159";
 SRWLOCK g_settings_lock = SRWLOCK_INIT;
 SRWLOCK g_save_lock = SRWLOCK_INIT;
 SRWLOCK g_log_lock = SRWLOCK_INIT;
@@ -718,8 +719,26 @@ std::wstring profile_path_for(const GenericIniMod& mod) {
     const std::size_t config_slash = g_config_path.find_last_of(L'\\');
     const std::size_t ini_slash = mod.path.find_last_of(L"\\/");
     if (config_slash == std::wstring::npos || ini_slash == std::wstring::npos) return {};
-    return g_config_path.substr(0, config_slash + 1) + L"NativeTweaks\\profiles\\" +
-        mod.path.substr(ini_slash + 1);
+    const std::wstring file = mod.path.substr(ini_slash + 1);
+    // Two mods with the same INI name (config.ini, settings.ini) would share
+    // one profile and import each other's file: then the mod's DLL name goes
+    // in front. A unique name keeps the old profile file name.
+    std::size_t same_name = 0;
+    for (const auto& other : g_generic_mods) {
+        const std::size_t slash = other.path.find_last_of(L"\\/");
+        const std::wstring other_file = slash == std::wstring::npos ? other.path : other.path.substr(slash + 1);
+        if (CompareStringOrdinal(other_file.c_str(), -1, file.c_str(), -1, TRUE) == CSTR_EQUAL) ++same_name;
+    }
+    std::wstring prefix;
+    if (same_name > 1) {
+        const std::size_t module_slash = mod.module_path.find_last_of(L"\\/");
+        std::wstring module = module_slash == std::wstring::npos
+            ? mod.module_path : mod.module_path.substr(module_slash + 1);
+        const std::size_t dot = module.find_last_of(L'.');
+        if (dot != std::wstring::npos) module.resize(dot);
+        prefix = (module.empty() ? std::wstring(L"mod") : module) + L"-";
+    }
+    return g_config_path.substr(0, config_slash + 1) + L"NativeTweaks\\profiles\\" + prefix + file;
 }
 
 live_text::Texts profile_row_texts(Language language, bool import) {
@@ -769,9 +788,22 @@ void ERUI_CALL import_profile_clicked(void* target) noexcept {
     if (!target) return;
     try {
         const auto& mod = *static_cast<const GenericIniMod*>(target);
-        const std::wstring profile = profile_path_for(mod);
+        std::wstring profile = profile_path_for(mod);
         std::string contents;
         std::wstring checked;
+        if (!profile.empty() && GetFileAttributesW(profile.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            // Exported before another mod with the same INI name was added:
+            // the file has no DLL name in front.
+            const std::size_t ini_slash = mod.path.find_last_of(L"\\/");
+            const std::size_t profile_slash = profile.find_last_of(L'\\');
+            if (ini_slash != std::wstring::npos && profile_slash != std::wstring::npos) {
+                const std::wstring plain = profile.substr(0, profile_slash + 1) + mod.path.substr(ini_slash + 1);
+                if (plain != profile && GetFileAttributesW(plain.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    log_message((L"Import: using the older profile name " + plain).c_str());
+                    profile = plain;
+                }
+            }
+        }
         if (profile.empty() || GetFileAttributesW(profile.c_str()) == INVALID_FILE_ATTRIBUTES) {
             show_alert(tr(L"No exported settings were found for this mod.",
                 L"No hay ajustes exportados para este mod.", L"未找到此模组已导出的设置。"));
@@ -1067,6 +1099,10 @@ bool replace_ini_value(
     std::size_t equals = 0;
     std::size_t matches = 0;
     bool in_section = false;
+    bool section_seen = false;
+    bool first_section_closed = false;  // a key goes into the first copy, the one readers use
+    std::size_t section_insert = std::string::npos;  // after the last key line of the section
+    const bool crlf = contents.find("\r\n") != std::string::npos;
 
     while (line_start < contents.size()) {
         const std::size_t newline = contents.find('\n', line_start);
@@ -1087,7 +1123,15 @@ bool replace_ini_value(
             in_section = ascii_equal(
                 trim_ascii(std::string_view(trimmed).substr(1, trimmed.size() - 2)),
                 section);
+            if (section_seen && !in_section) first_section_closed = true;
+            if (in_section && !section_seen) {
+                section_seen = true;
+                section_insert = newline == std::string::npos ? contents.size() : newline + 1;
+            }
         } else if (in_section) {
+            if (!trimmed.empty() && trimmed.front() != ';' && trimmed.front() != '#' &&
+                section_insert != std::string::npos && !first_section_closed)
+                section_insert = newline == std::string::npos ? contents.size() : newline + 1;
             const std::size_t separator = line.find('=');
             if (separator != std::string_view::npos &&
                 ascii_equal(trim_ascii(line.substr(0, separator)), key)) {
@@ -1102,6 +1146,29 @@ bool replace_ini_value(
         line_start = newline + 1;
     }
 
+    if (matches == 0) {
+        // An older INI without this key: add it instead of failing the whole
+        // save (all edits of a save are applied together or not at all).
+        const char* const eol = crlf ? "\r\n" : "\n";
+        std::string line_text(key);
+        line_text += '=';
+        line_text.append(replacement);
+        line_text += eol;
+        if (!section_seen) {
+            if (!contents.empty() && contents.back() != '\n') contents += eol;
+            contents += '[';
+            contents.append(section);
+            contents += ']';
+            contents += eol;
+            contents += line_text;
+        } else {
+            if (section_insert > contents.size()) section_insert = contents.size();
+            if (section_insert == contents.size() && !contents.empty() && contents.back() != '\n')
+                line_text.insert(0, eol);
+            contents.insert(section_insert, line_text);
+        }
+        return true;
+    }
     if (matches != 1) return false;
 
     const std::string_view line(contents.data() + match_start, match_end - match_start);
@@ -1378,18 +1445,26 @@ bool snapshot_loaded_mod_modules(std::vector<std::wstring>& paths) {
     }
     if (snapshot == INVALID_HANDLE_VALUE) return false;
 
-    MODULEENTRY32W module{};
-    module.dwSize = sizeof(module);
-    if (Module32FirstW(snapshot, &module)) {
-        do {
-            const std::wstring_view module_path(module.szExePath);
-            if (!is_discoverable_mod_module(module_path)) continue;
-            paths.push_back(lowercase_path(std::wstring(module_path)));
-        } while (Module32NextW(snapshot, &module));
+    // Callers include noexcept functions: an allocation failure here must
+    // not reach them (std::terminate) nor leak the snapshot handle.
+    try {
+        MODULEENTRY32W module{};
+        module.dwSize = sizeof(module);
+        if (Module32FirstW(snapshot, &module)) {
+            do {
+                const std::wstring_view module_path(module.szExePath);
+                if (!is_discoverable_mod_module(module_path)) continue;
+                paths.push_back(lowercase_path(std::wstring(module_path)));
+            } while (Module32NextW(snapshot, &module));
+        }
+        CloseHandle(snapshot);
+        std::sort(paths.begin(), paths.end());
+        return true;
+    } catch (...) {
+        CloseHandle(snapshot);
+        paths.clear();
+        return false;
     }
-    CloseHandle(snapshot);
-    std::sort(paths.begin(), paths.end());
-    return true;
 }
 
 // Config files that are not <Name>.ini / <Name>_config.ini, by DLL name.
@@ -1893,9 +1968,14 @@ void apply_setting_template(GenericIniSetting& setting, const TemplateFields& fi
         }
     }
     std::vector<double> values;
-    for (double value = minimum; value <= maximum + coarse * 1e-9; value += coarse) {
+    // Bounded: with huge Min/Max the step can be lost to rounding
+    // (value + coarse == value), which would never end.
+    for (double value = minimum; value <= maximum + coarse * 1e-9 && values.size() < kMaxChoices - 2;
+         value += coarse) {
+        if (!values.empty() && value <= values.back()) break;
         values.push_back(value);
     }
+    if (values.empty()) values.push_back(minimum);
     if (values.back() < maximum - coarse * 1e-9) values.push_back(maximum);
     const double snapped = minimum + static_cast<double>(nearest) * step;
     if (std::none_of(values.begin(), values.end(),
@@ -2697,10 +2777,19 @@ GenericLiveApplyResult request_generic_live_reload(
                 slash == std::wstring_view::npos ? 0 : slash + 1));
             module = GetModuleHandleW(file_name.c_str());
         }
-        if (!module) {
+        // A reference for the whole exchange (up to 5 s): a mod unloaded
+        // meanwhile must not leave status() pointing at unmapped code.
+        HMODULE held{};
+        if (!module || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(module), &held) || !held) {
             log_message(L"Live reload: the mod DLL is no longer loaded.");
             return GenericLiveApplyResult::unsupported;
         }
+        struct Release {
+            HMODULE module;
+            ~Release() { FreeLibrary(module); }
+        } const release{held};
+        module = held;
 
         auto request = reinterpret_cast<RequestFn>(
             GetProcAddress(module, "NativeTweaks_RequestReloadV1"));
@@ -3347,11 +3436,135 @@ DWORD WINAPI initialize_mod(void*) noexcept {
     }
 }
 
+// Fault log (21-11, the game's free() crashing at exit, eldenring+0x25234F5
+// in 2.7.2.0, only with NativeTweaks loaded). The first few access
+// violations raised outside NativeTweaks and ERNativeUI are written to
+// NativeTweaks.faults.log next to the DLL: where, what address was read,
+// what memory that is (module, heap, freed), the registers that hold
+// pointers, and 12 callers. It never handles anything (the game's or the
+// MO2 bridge's handlers still run) and does no allocation.
+wchar_t g_fault_path[MAX_PATH]{};
+std::atomic<int> g_faults_logged{0};
+std::uintptr_t g_game_base{}, g_game_end{};
+
+void fault_describe(std::uintptr_t address, char* out, std::size_t size) noexcept {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) {
+        _snprintf_s(out, size, _TRUNCATE, "0x%llX (no info)", static_cast<unsigned long long>(address));
+        return;
+    }
+    HMODULE module{};
+    char name[MAX_PATH]{};
+    if (info.Type == MEM_IMAGE && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(address), &module) &&
+        GetModuleFileNameA(module, name, MAX_PATH)) {
+        const char* base = std::strrchr(name, '\\');
+        _snprintf_s(out, size, _TRUNCATE, "%s+0x%llX", base ? base + 1 : name,
+            static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+        return;
+    }
+    const char* state = info.State == MEM_FREE ? "free" : info.State == MEM_RESERVE ? "reserved" : "committed";
+    const char* type = info.Type == MEM_IMAGE ? "image" : info.Type == MEM_MAPPED ? "mapped" :
+        info.Type == MEM_PRIVATE ? "private" : "-";
+    _snprintf_s(out, size, _TRUNCATE, "0x%llX (%s %s, region 0x%llX+0x%llX, protect 0x%lX)",
+        static_cast<unsigned long long>(address), state, type,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.AllocationBase)),
+        static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(info.AllocationBase)),
+        static_cast<unsigned long>(info.Protect));
+}
+
+LONG CALLBACK fault_logger(EXCEPTION_POINTERS* pointers) noexcept {
+    const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
+    const std::uintptr_t rip = reinterpret_cast<std::uintptr_t>(record.ExceptionAddress);
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    // Not our own modules: NativeTweaks and ERNativeUI read game memory with
+    // guarded reads that fault on purpose.
+    HMODULE owner{};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(rip), &owner) &&
+        (owner == g_own_module || owner == GetModuleHandleW(L"ERNativeUI.dll")))
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_faults_logged.fetch_add(1) >= 4) return EXCEPTION_CONTINUE_SEARCH;
+    static char line[4096];
+    static char part[400];
+    std::size_t used = 0;
+    const auto add = [&](const char* text) noexcept {
+        const std::size_t n = std::strlen(text);
+        if (used + n < sizeof(line)) { std::memcpy(line + used, text, n); used += n; }
+    };
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char at[300]{};
+    fault_describe(rip, at, sizeof(at));
+    _snprintf_s(part, _TRUNCATE, "%02u:%02u:%02u.%03u T%lu access violation at %s",
+        now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentThreadId(), at);
+    add(part);
+    if (record.NumberParameters >= 2) {
+        char where[300]{};
+        fault_describe(record.ExceptionInformation[1], where, sizeof(where));
+        _snprintf_s(part, _TRUNCATE, ", %s %s\r\n", record.ExceptionInformation[0] == 1 ? "writing" : "reading", where);
+        add(part);
+    }
+    const CONTEXT& c = *pointers->ContextRecord;
+    const struct { const char* name; DWORD64 value; } regs[]{{"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rbx", c.Rbx},
+        {"rsi", c.Rsi}, {"rdi", c.Rdi}, {"rax", c.Rax}, {"r8", c.R8}, {"r14", c.R14}};
+    for (const auto& reg : regs) {
+        char where[300]{};
+        fault_describe(static_cast<std::uintptr_t>(reg.value), where, sizeof(where));
+        _snprintf_s(part, _TRUNCATE, "  %s = %s\r\n", reg.name, where);
+        add(part);
+    }
+    CONTEXT context = c;
+    for (int depth = 0; depth < 12; ++depth) {
+        DWORD64 image{};
+        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(context.Rip, &image, nullptr);
+        if (!entry) {
+            if (!context.Rsp) break;
+            context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);  // leaf function
+            context.Rsp += 8;
+        } else {
+            void* handler_data{};
+            DWORD64 frame{};
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, context.Rip, entry, &context, &handler_data, &frame, nullptr);
+        }
+        if (!context.Rip) break;
+        char where[300]{};
+        fault_describe(static_cast<std::uintptr_t>(context.Rip), where, sizeof(where));
+        _snprintf_s(part, _TRUNCATE, "  < %s\r\n", where);
+        add(part);
+    }
+    if (g_fault_path[0]) {
+        const HANDLE file = CreateFileW(g_fault_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            DWORD written{};
+            WriteFile(file, line, static_cast<DWORD>(used), &written, nullptr);
+            CloseHandle(file);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void install_fault_logger(HMODULE module) noexcept {
+    const HMODULE game = GetModuleHandleW(nullptr);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(game);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const std::uint8_t*>(game) + dos->e_lfanew);
+    g_game_base = reinterpret_cast<std::uintptr_t>(game);
+    g_game_end = g_game_base + nt->OptionalHeader.SizeOfImage;
+    DWORD length = GetModuleFileNameW(module, g_fault_path, MAX_PATH);
+    if (!length || length >= MAX_PATH) { g_fault_path[0] = 0; return; }
+    wchar_t* slash = std::wcsrchr(g_fault_path, L'\\');
+    if (!slash || static_cast<std::size_t>(slash + 1 - g_fault_path) + 24 >= MAX_PATH) { g_fault_path[0] = 0; return; }
+    wcscpy_s(slash + 1, MAX_PATH - static_cast<std::size_t>(slash + 1 - g_fault_path), L"NativeTweaks.faults.log");
+    AddVectoredExceptionHandler(1, &fault_logger);
+}
+
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_own_module = module;
+        install_fault_logger(module);
         DisableThreadLibraryCalls(module);
         // Worker threads and game hooks live for the whole process: never
         // let a FreeLibrary unmap them (audit 2026-11-08).

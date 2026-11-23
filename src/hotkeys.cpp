@@ -136,7 +136,9 @@ bool same_bindings(const std::vector<Binding>& a, const std::vector<Binding>& b)
 void logf(const wchar_t* format, const std::wstring& a, const std::wstring& b = {}, int n = 0) {
     if (!g_target.log) return;
     wchar_t buffer[512]{};
-    swprintf_s(buffer, format, a.c_str(), b.c_str(), n);
+    // _TRUNCATE: an overlong INI key must shorten the line, not end the game
+    // (swprintf_s calls the invalid-parameter handler when the text does not fit).
+    _snwprintf_s(buffer, _TRUNCATE, format, a.c_str(), b.c_str(), n);
     g_target.log(buffer);
 }
 

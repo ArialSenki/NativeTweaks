@@ -6,6 +6,10 @@
 extern "C" std::uint8_t nt_set_deflect_window(std::uint32_t) { return 0; }
 extern "C" std::uint8_t nt_summon_melina() { return 0; }
 extern "C" std::uint8_t nt_set_player_clean(std::uint8_t) { return 0; }
+extern "C" std::uint8_t nt_msa_game_thread_ready() { return 0; }
+extern "C" std::uint8_t nt_msa_on_game_thread(std::uint8_t (*)(std::uintptr_t), std::uintptr_t, std::uint32_t) {
+    return 0;
+}
 
 namespace spirit_ashes {
 
