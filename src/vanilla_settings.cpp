@@ -443,8 +443,34 @@ Site g_map_combat_close{L"map in combat (close)",
     "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 75 ? 38 83 ? ? ? ? 75 ? 83 e6 fe",
     0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
 
+// Torrent anywhere (r160, user request). Where riding is forbidden comes from
+// the map files (collision parts and DisableHorseOverride regions), not the
+// params (see sync_travel). Two places read it:
+// - CSChrRideModule's "riding disabled here" query (0x474F50 in 2.7.2.0, a leaf
+//   with no unwind data): four tri-state bytes (+0x1A3, then +0x166 region,
+//   +0x165, +0x164 the ground's collision part), first one set wins. The item
+//   check (0x68F310, whistle greyed out) and the player's ride state read it.
+//   Its first instruction becomes xor eax,eax; ret: never disabled.
+// - the search for a spot to make Torrent appear (0x65ED90): for each candidate
+//   point under the player it rejects a collision part that forbids the horse
+//   (byte +0x36 of its map part data, 0x707450) and a DisableHorseOverride
+//   region of type 1 (0xA6C7E0 finds the region; type 2 allows). Both jumps
+//   to "next candidate" become a 6-byte nop; the geometry and clearance checks
+//   after them stay, so Torrent still needs room and ground.
+// All unique in 2.7.0.0 to 2.7.2.1 (0x474E70 / 0x65EFAE in 2.7.0.0 and 2.7.1.x).
+Site g_torrent_query{L"Torrent anywhere (ride query)",
+    "0f b6 81 a3 01 00 00 84 c0 79 0b 0f b6 81 66 01 00 00 84 c0 78 04 0f 95 c0 c3",
+    0, "0f b6 81 a3 01 00 00", {0x31, 0xC0, 0xC3, 0x0F, 0x1F, 0x40, 0x00}};
+constexpr const char* kTorrentSpawnPattern =
+    "83 e8 01 0f 84 ? ? ? ? 83 e8 01 75 06 88 44 24 60 eb 0b 80 7c 24 60 00 0f 85 ? ? ? ?";
+Site g_torrent_spawn_region{L"Torrent anywhere (no-ride region)", kTorrentSpawnPattern,
+    0x03, "0f 84 ? ? ? ?", {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}};
+Site g_torrent_spawn_ground{L"Torrent anywhere (no-ride ground)", kTorrentSpawnPattern,
+    0x19, "0f 85 ? ? ? ?", {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}};
+
 Site* const kSites[]{&g_camera_rotate, &g_camera_reset, &g_vignette, &g_chromatic, &g_sharpen,
     &g_craft_combat, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close,
+    &g_torrent_query, &g_torrent_spawn_region, &g_torrent_spawn_ground,
     &g_animation, &g_rune_loss, &g_pause, &g_frametime, &g_fullscreen_cap, &g_ultrawide, &g_enemy_respawn,
     &g_summon_area, &g_summon_area_item, &g_summon_range, &g_buddy_slot_start, &g_buddy_slot_loop};
 
@@ -2165,6 +2191,12 @@ enum Id : std::size_t {
     enemy_chase,
     // Spirit Ashes: most regular / renowned ashes at once (Nexus request, PoisonParadise)
     ash_max_regular, ash_max_renowned,
+    // Map & Travel: the Spectral Steed Whistle works where riding is forbidden (r160, user request)
+    torrent_anywhere,
+    // Buffs & Durations: the equipped Great Rune works without a Rune Arc (r160, user request)
+    great_rune_always,
+    // Runes, Shops & Upgrades: pick up items and runes from further away (r160, user request)
+    pickup_radius,
     count
 };
 
@@ -2335,6 +2367,9 @@ Option g_options[count]{
     toggle(L"MapInCombat"),
     slider(L"EnemyChaseDistancePercent", 100, 100, 1000, 25),
     slider(L"SpiritMaxRegularAshes", 0, 0, 10, 1, L""), slider(L"SpiritMaxRenownedAshes", 0, 0, 10, 1, L""),
+    toggle(L"TorrentAnywhere"),
+    toggle(L"GreatRuneWithoutRuneArc"),
+    slider(L"ItemPickupRadiusPercent", 100, 100, 500, 25),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -7205,6 +7240,83 @@ void sync_enemy_chase() noexcept {
     state.applied = want;
 }
 
+// Item pickup radius (r160, user request): ActionButtonParam (0x64 bytes per
+// row) gives each prompt its reach: radius (+0x0C, f32 m), height (+0x1C) and
+// baseHeightOffset (+0x20), with the prompt text at +0x34. Scaled: every row
+// whose text is a pick-up (2000 "Pick up item", 2010 "Pillage corpse", 2020
+// "Pillage remains", 2800-2899 and 202800-202899 "Acquire materials") and the
+// lost runes (rows 1000/1010, texts 50000200/50000205). Chests (2030), talking,
+// doors, levers and graces keep theirs. The height grows half as much (at most
+// x2) round the same centre, so items a little above or below still count.
+// Checked offline on 2.7.2.0's regulation.bin: 400 rows, 132 of them pick-ups.
+struct PickupCell {
+    std::uintptr_t row;
+    float radius;
+    float height;
+    float base;
+};
+
+struct PickupState {
+    bool attempted{};
+    bool ready{};
+    std::vector<PickupCell> cells{};
+    int applied{100};
+};
+
+PickupState g_pickup{};
+
+bool is_pickup_prompt(std::int32_t row_id, std::int32_t text) noexcept {
+    if (row_id == 1000 || row_id == 1010) return text == 50000200 || text == 50000205;
+    return text == 2000 || text == 2010 || text == 2020 || (text >= 2800 && text <= 2899) ||
+        (text >= 202800 && text <= 202899);
+}
+
+void sync_pickup_radius() noexcept {
+    auto& state = g_pickup;
+    if (state.attempted) return;
+    if (!state.ready) {
+        game::ParamTable table;
+        if (!game::find_param(g_statics, L"ActionButtonParam", 0x64, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        for (std::size_t i = 0; i < table.rows.size(); ++i) {
+            std::int32_t id{}, text{};
+            PickupCell cell{table.rows[i]};
+            if (!game::read(table.file + 0x40 + i * 0x18, id) || !game::read(cell.row + 0x34, text) ||
+                !is_pickup_prompt(id, text) || !game::read(cell.row + 0x0C, cell.radius) ||
+                !game::read(cell.row + 0x1C, cell.height) || !game::read(cell.row + 0x20, cell.base))
+                continue;
+            if (!(cell.radius > 0.1f && cell.radius < 50.0f) || !(cell.height >= 0.0f && cell.height < 50.0f))
+                continue;
+            state.cells.push_back(cell);
+        }
+        // 132 rows in the game's data; far fewer means another layout.
+        const bool ok = state.cells.size() >= 20;
+        wchar_t message[160]{};
+        swprintf_s(message, L"Item pickup radius: %zu of %zu ActionButtonParam rows are pick-ups%ls.",
+            state.cells.size(), table.rows.size(), ok ? L"" : L" -> option disabled");
+        log(message);
+        if (!ok) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(pickup_radius);
+    if (want == state.applied) return;
+    const float factor = static_cast<float>(want) / 100.0f;
+    const float height_factor = std::min(1.0f + (factor - 1.0f) / 2.0f, 2.0f);
+    for (const auto& cell : state.cells) {
+        const float height = cell.height * height_factor;
+        game::write<float>(cell.row + 0x0C, cell.radius * factor);
+        game::write<float>(cell.row + 0x1C, height);
+        game::write<float>(cell.row + 0x20, cell.base - (height - cell.height) / 2.0f);
+    }
+    state.applied = want;
+}
+
 void sync_found_materials() noexcept {
     if (g_found.attempted) return;
     if (!g_found.ready) {
@@ -7262,7 +7374,7 @@ bool all_params_ready() noexcept {
         (g_buffs.ready || g_buffs.attempted) && (g_buddy.ready || g_buddy.attempted) &&
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted && (g_found.ready || g_found.attempted) &&
-        (g_chase.ready || g_chase.attempted) &&
+        (g_chase.ready || g_chase.attempted) && (g_pickup.ready || g_pickup.attempted) &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_projectile_range.ready || g_projectile_range.attempted) && (g_charm.ready || g_charm.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
@@ -7319,6 +7431,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_materials();
         sync_found_materials();
         sync_enemy_chase();
+        sync_pickup_radius();
         sync_helmet();
     }
 }
@@ -8710,6 +8823,57 @@ void sync_god_mode() noexcept {
     }
 }
 
+// Great Rune without Rune Arc (r160, user request): PlayerGameData +0xFF is
+// "Rune Arc active" (GameDataMan -> +0x8; rune_arc_active in fromsoftware-rs,
+// TGA's table reads the same byte). The player's per-frame update (0x65BC30 in
+// 2.7.2.0) sets it when the Rune Arc's state (SpEffect state 0x115) shows up,
+// and while it is set applies the equipped Great Rune's effects; dying clears
+// it. So it is held at 1 while the option is on and the character is alive.
+// Only a 1 written here is taken back when the option turns off (a Rune Arc
+// used meanwhile is not told apart). The byte is part of the save. The
+// pattern of that update checks the offset is still +0xFF.
+constexpr const char* kRuneArcPattern = "80 bb ff 00 00 00 00 75 ? ba 15 01 00 00";
+bool g_rune_arc_site{};
+std::uintptr_t g_rune_arc_forced{};  // PlayerGameData whose byte NativeTweaks set, 0 = none
+
+void resolve_rune_arc() noexcept {
+    const std::uint8_t* hit = find_unique(parse_pattern(kRuneArcPattern));
+    g_rune_arc_site = hit != nullptr;
+    wchar_t message[128]{};
+    if (hit)
+        swprintf_s(message, L"Vanilla site 'Rune Arc state' found at eldenring.exe+0x%llX.",
+            static_cast<unsigned long long>(hit - reinterpret_cast<const std::uint8_t*>(game::image())));
+    else
+        swprintf_s(message, L"Vanilla site 'Rune Arc state' not found (or ambiguous); option disabled.");
+    log(message);
+}
+
+void sync_great_rune() noexcept {
+    const bool want = value_of(great_rune_always) != 0 && g_rune_arc_site;
+    if (!want && !g_rune_arc_forced) return;
+    std::uintptr_t manager{}, data{};
+    if (!g_statics.game_data_man || !game::read(g_statics.game_data_man, manager) || !manager ||
+        !game::read(manager + 0x8, data) || !data)
+        return;
+    if (g_rune_arc_forced && g_rune_arc_forced != data) g_rune_arc_forced = 0;  // another character loaded
+    std::uint8_t active{};
+    if (!game::read(data + 0xFF, active)) return;
+    if (!want) {
+        if (active == 1) game::write<std::uint8_t>(data + 0xFF, 0);
+        g_rune_arc_forced = 0;
+        log(L"Great Rune without Rune Arc: off, Rune Arc state taken back.");
+        return;
+    }
+    if (active) return;
+    // Only in the world with the character alive: dying clears it, the next life gets it again.
+    const auto points = game::player_points(g_statics);
+    std::int32_t hp{};
+    if (!points || !game::read(points, hp) || hp <= 0) return;
+    if (!game::write<std::uint8_t>(data + 0xFF, 1)) return;
+    if (!g_rune_arc_forced) log(L"Great Rune without Rune Arc: Rune Arc state set on the loaded character.");
+    g_rune_arc_forced = data;
+}
+
 DWORD WINAPI regen_worker(void*) noexcept {
     float carry[3]{};
     constexpr std::ptrdiff_t kCurrent[3]{0x0, 0x10, 0x1C};
@@ -8729,8 +8893,10 @@ DWORD WINAPI regen_worker(void*) noexcept {
             if (maximum_percent[i] != 100 || g_maximum[i].written) maximum_work = true;
         sync_live_poise();
         sync_god_mode();
+        sync_great_rune();
         if (!flat[0] && !flat[1] && !flat[2] &&
-            !free_skills && !maximum_work && !value_of(player_poise_lock) && !value_of(god_mode)) {
+            !free_skills && !maximum_work && !value_of(player_poise_lock) && !value_of(god_mode) &&
+            !value_of(great_rune_always)) {
             idle_wait(loop);
             continue;
         }
@@ -9139,6 +9305,21 @@ void apply(Id id) noexcept {
         set_site(g_craft_combat, on(id));
         set_site(g_craft_combat_menu, on(id));
         break;
+    case torrent_anywhere: {
+        const bool query = set_site(g_torrent_query, on(id));
+        const bool region = set_site(g_torrent_spawn_region, on(id));
+        const bool ground = set_site(g_torrent_spawn_ground, on(id));
+        wchar_t message[160]{};
+        swprintf_s(message, L"Torrent anywhere %ls (ride query %ls, spawn region %ls, spawn ground %ls).",
+            on(id) ? L"on" : L"off", query ? L"ok" : L"not written", region ? L"ok" : L"not written",
+            ground ? L"ok" : L"not written");
+        log(message);
+        break;
+    }
+    case great_rune_always: break;  // regen_worker (sync_great_rune)
+    case pickup_radius:  // param_worker (sync_pickup_radius)
+        if (g_param_event) SetEvent(g_param_event);
+        break;
     case chromatic_off: set_site(g_chromatic, on(id)); break;
     case animation_distance: set_site(g_animation, on(id)); break;
     case rune_loss_off: set_site(g_rune_loss, on(id)); break;
@@ -9347,6 +9528,11 @@ bool available(Id id) noexcept {
     case sharpen_off: return g_sharpen.ready;
     case craft_in_combat: return g_craft_combat.ready && g_craft_combat_menu.ready;
     case map_in_combat: return g_map_combat_open.ready && g_map_combat_close.ready;
+    case torrent_anywhere:
+        return g_torrent_query.ready && g_torrent_spawn_region.ready && g_torrent_spawn_ground.ready;
+    case great_rune_always:
+        return g_rune_arc_site && g_statics.layout_2_7_1 && g_statics.game_data_man && g_statics.world_chr_man;
+    case pickup_radius: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_pickup.attempted;
     case chromatic_off: return g_chromatic.ready;
     case animation_distance: return g_animation.ready;
     case rune_loss_off: return g_rune_loss.ready;
@@ -11427,7 +11613,7 @@ const Texts kEnglish{
         {L"HUD to screen edges", L"On screens wider than 16:9, moves the gauges, equipment, runes and other corner elements to the screen edges. Use with Allow ultrawide. Restart the game to apply: it loads the HUD once at startup. Turn it off if another mod already places the HUD for ultrawide."},
         {L"HUD scale (%)", L"Resizes the gauges, equipment, compass, boss bars, runes and other corner elements, each one from its own corner. Restart the game to apply: it loads the HUD once at startup."},
         {L"Menus to screen edges", L"On screens wider than 16:9, moves the pause menu and the other menus (equipment, inventory, status, shops, level up, spells, storage, options, loading and title screens) to the screen edges and widens their backgrounds. Restart the game to apply: it loads the menus once at startup. Turn it off if another mod replaces these menus."},
-        {L"Enemies stay dead", L"Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turning it off brings everyone back with the next rest. Turning it on or off during play starts the save's list over (the old one is kept as .bak), so only enemies killed while it is on count; on from the start of the game, the list carries over between sessions."},
+        {L"Enemies stay dead (beta)", L"BETA: Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turning it off brings everyone back with the next rest. Turning it on or off during play starts the save's list over (the old one is kept as .bak), so only enemies killed while it is on count; on from the start of the game, the list carries over between sessions."},
         {L"Yes/No questions start on Yes (beta)", L"BETA: Yes/No questions open with the cursor on Yes instead of No: travel, quit, use an item and the like; with the mouse, the pointer is moved onto Yes too. It applies to every Yes/No question, risky ones too, so check before confirming. Other windows, such as item quantities, do not change."},
         {L"Hit downed enemies", L"Like Nightreign, enemies knocked to the ground by a critical hit or a riposte take damage while they lie there and get up. They get super armour instead, so your hits do not stagger them again, but they still take posture damage. Spirit ashes can also hit them during the critical hit. You keep your own protection when an enemy grabs you."},
         {L"Torrent jump speed (%)", L"Scales Torrent's animation speed during jumps and double jumps, spiritspring jumps included. At 100% the double jump is as easy to get as in the base game, even with a faster run speed. Applies instantly."},
@@ -11492,11 +11678,14 @@ const Texts kEnglish{
         {L"Skill speed (%)", L"Your weapon skills (Ashes of War and unique skills). They use this instead of Attack speed, so normal attacks keep theirs. Multiplies the overall speed."},
         {L"Healing aura (HP/s)", L"The Deathbed Dress's aura without wearing it, stronger: you and allies within 7 m, spirit ashes included, recover this many HP every second. The dress alone gives allies 2 HP/s and you nothing. 0 turns it off. Applies within a second."},
         {L"Materials found (%)", L"How many crafting materials you get from each gathering spot, corpse, chest and enemy drop: 200% gives twice as many. Only materials used in crafting recipes. Item drop rate changes how often enemies drop things. Applies to the next pick-up."},
-        {L"Craft in combat", L"Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
+        {L"Craft in combat (beta)", L"BETA: Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
         {L"Map in combat", L"The map opens while enemies are fighting you, and stays open when a fight starts. Fast travel still follows the game's rules (or Fast travel anywhere). Applies at once."},
-        {L"Enemy chase distance (%)", L"How far enemies follow you away from where they stand before they give up and walk back: 300% is three times as far. They still stop where they cannot walk (cave mouths, cliffs, the edge of their area). To be sure it applies, rest at a site of grace or reload the area after changing it."},
+        {L"Enemy chase distance (%) (beta)", L"BETA: How far enemies follow you away from where they stand before they give up and walk back: 300% is three times as far. They still stop where they cannot walk (cave mouths, cliffs, the edge of their area). To be sure it applies, rest at a site of grace or reload the area after changing it."},
         {L"Most regular ashes at once", L"With Several ashes at once: how many regular spirit ashes (upgraded with Grave Glovewort) can be out together. Summoning one more dismisses one of them with a short fade; renowned ashes stay. 0 = no limit."},
         {L"Most renowned ashes at once", L"With Several ashes at once: how many renowned spirit ashes (upgraded with Ghost Glovewort, like the Mimic Tear or Black Knife Tiche) can be out together. Summoning one more dismisses one of them with a short fade; regular ashes stay. 0 = no limit."},
+        {L"Torrent anywhere (beta)", L"BETA: The Spectral Steed Whistle also works where the game forbids riding: legacy dungeons, caves, catacombs, indoors and boss arenas. Torrent still needs room to appear and ground to stand on. Scripted scenes may not expect Torrent: turn it off if one goes wrong. Applies at once."},
+        {L"Great Rune without Rune Arc (beta)", L"BETA: Your equipped Great Rune works all the time, as if you had used a Rune Arc, and comes back by itself after you die. Change Great Runes at a Site of Grace as usual. The game keeps the Rune Arc state in the save; turning this off takes back only what this option set, so a Rune Arc used meanwhile is lost too. Applies within a second."},
+        {L"Item pickup radius (%) (beta)", L"BETA: How far away you can pick up items, loot corpses, gather materials and retrieve your lost runes: 300% is three times as far. Chests, doors, levers, graces and talking keep their reach. Applies at once."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -11657,7 +11846,7 @@ const Texts kSpanish{
         {L"HUD hasta los bordes", L"En pantallas más anchas que 16:9, lleva las barras, el equipo, las runas y los demás elementos de las esquinas hasta los bordes de la pantalla. Úsalo con Permitir ultrapanorámico. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar. Desactívalo si otro mod ya coloca el HUD para ultrapanorámico."},
         {L"Escala del HUD (%)", L"Cambia el tamaño de las barras, el equipo, la brújula, las barras de jefe, las runas y los demás elementos de las esquinas, cada uno desde su esquina. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar."},
         {L"Menús hasta los bordes", L"En pantallas más anchas que 16:9, lleva el menú de pausa y los demás menús (equipo, inventario, estado, tiendas, subir de nivel, hechizos, cofre, opciones, pantallas de carga y de título) hasta los bordes y ensancha sus fondos. Reinicia el juego para aplicarlo: carga los menús una sola vez al arrancar. Desactívalo si otro mod sustituye estos menús."},
-        {L"Los enemigos no reaparecen", L"Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos. Activarla o desactivarla durante la partida empieza la lista de cero (la anterior se guarda como .bak), así que solo cuentan los enemigos que matas con ella activa; si está activa desde que arranca el juego, la lista se conserva entre sesiones."},
+        {L"Los enemigos no reaparecen (beta)", L"BETA: Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos. Activarla o desactivarla durante la partida empieza la lista de cero (la anterior se guarda como .bak), así que solo cuentan los enemigos que matas con ella activa; si está activa desde que arranca el juego, la lista se conserva entre sesiones."},
         {L"Preguntas Sí/No empiezan en Sí (beta)", L"BETA: las preguntas Sí/No se abren con el cursor en Sí en vez de en No: viajar, salir, usar un objeto, etc.; con el ratón, el puntero también se coloca sobre Sí. Afecta a todas las preguntas Sí/No, también a las arriesgadas, así que comprueba antes de confirmar. Las demás ventanas, como las de cantidad de objetos, no cambian."},
         {L"Golpear enemigos derribados", L"Como en Nightreign, los enemigos que caen al suelo por un golpe crítico o un contraataque reciben daño mientras están tendidos y al levantarse. A cambio tienen superarmadura, así que tus golpes no los vuelven a aturdir, pero sí dañan su postura. Las cenizas espirituales también pueden golpearlos durante el crítico. Tú sigues protegido cuando un enemigo te agarra."},
         {L"Velocidad de salto de Torrent (%)", L"Escala la velocidad de animación de Torrent en los saltos y dobles saltos, también en los de los manantiales espirituales. Al 100 % el doble salto sale tan fácil como en el juego base, aunque la carrera vaya más rápida. Se aplica al momento."},
@@ -11722,11 +11911,14 @@ const Texts kSpanish{
         {L"Velocidad de habilidades (%)", L"Tus habilidades de arma (cenizas de guerra y habilidades únicas). Usan esto en lugar de la velocidad de ataque, así que los ataques normales mantienen la suya. Se multiplica por la velocidad general."},
         {L"Aura curativa (PV/s)", L"El aura del Vestido del lecho de muerte sin llevarlo, y más fuerte: tú y los aliados a menos de 7 m, cenizas de espíritu incluidas, recuperáis estos PV cada segundo. El vestido solo da 2 PV/s a los aliados y nada a quien lo lleva. Con 0 se apaga. Se aplica en un segundo."},
         {L"Materiales obtenidos (%)", L"Cuántos materiales de fabricación consigues de cada punto de recolección, cadáver, cofre y botín de enemigos: con 200% el doble. Solo los materiales que usan las recetas. La tasa de botín cambia cada cuánto sueltan cosas los enemigos. Se aplica a la siguiente recogida."},
-        {L"Fabricar en combate", L"Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
+        {L"Fabricar en combate (beta)", L"BETA: Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
         {L"Mapa en combate", L"El mapa se abre mientras luchas contra enemigos y no se cierra cuando empieza un combate. El viaje rápido sigue las reglas del juego (o Viaje rápido en cualquier sitio). Se aplica al momento."},
-        {L"Distancia de persecución (%)", L"Hasta dónde te siguen los enemigos lejos de su sitio antes de rendirse y volver: al 300 % llegan tres veces más lejos. Siguen parándose donde no pueden caminar (entradas de cuevas, acantilados, el borde de su zona). Para asegurarte de que se aplica, descansa en un lugar de gracia o recarga la zona tras cambiarla."},
+        {L"Distancia de persecución (%) (beta)", L"BETA: Hasta dónde te siguen los enemigos lejos de su sitio antes de rendirse y volver: al 300 % llegan tres veces más lejos. Siguen parándose donde no pueden caminar (entradas de cuevas, acantilados, el borde de su zona). Para asegurarte de que se aplica, descansa en un lugar de gracia o recarga la zona tras cambiarla."},
         {L"Máximo de cenizas normales", L"Con «Varias cenizas a la vez»: cuántas cenizas normales (las que se mejoran con Hierba sepulcral) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las renombradas se quedan. 0 = sin límite."},
         {L"Máximo de cenizas renombradas", L"Con «Varias cenizas a la vez»: cuántas cenizas renombradas (las que se mejoran con Hierba sepulcral fantasmal, como el Espejismo o Tiche) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las normales se quedan. 0 = sin límite."},
+        {L"Torrent en cualquier sitio (beta)", L"BETA: El Silbato del corcel espectral también funciona donde el juego no deja montar: mazmorras legendarias, cuevas, catacumbas, interiores y arenas de jefes. Torrent sigue necesitando sitio para aparecer y suelo donde ponerse. Las escenas con guion pueden no contar con Torrent: apágalo si alguna falla. Se aplica al momento."},
+        {L"Gran runa sin Arco rúnico (beta)", L"BETA: Tu Gran runa equipada funciona siempre, como si hubieras usado un Arco rúnico, y vuelve sola después de morir. Cambia de Gran runa en un lugar de gracia como siempre. El juego guarda el estado del Arco rúnico en la partida; al apagarla solo se quita lo que puso esta opción, así que también se pierde un Arco rúnico usado mientras tanto. Se aplica en un segundo."},
+        {L"Radio para recoger objetos (%) (beta)", L"BETA: Desde cuán lejos puedes recoger objetos, saquear cadáveres, recolectar materiales y recuperar tus runas perdidas: al 300 % el triple. Cofres, puertas, palancas, gracias y conversaciones mantienen su alcance. Se aplica al momento."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -11887,7 +12079,7 @@ const Texts kChinese{
         {L"HUD 延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将血条、装备、卢恩和其他角落元素移到屏幕边缘。请与“允许超宽屏”一起使用。需重启游戏才能生效：游戏只在启动时加载一次 HUD。如果其他模组已为超宽屏调整 HUD，请关闭此项。"},
         {L"HUD 缩放 (%)", L"调整血条、装备、指南针、头目血条、卢恩和其他角落元素的大小，每个元素以其所在角落为基准缩放。需重启游戏才能生效：游戏只在启动时加载一次 HUD。"},
         {L"菜单延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将暂停菜单和其他菜单（装备、物品栏、状态、商店、升级、法术、仓库、选项、读取画面和标题画面）移到屏幕边缘，并加宽其背景。需重启游戏才能生效：游戏只在启动时加载一次菜单。如果其他模组替换了这些菜单，请关闭此项。"},
-        {L"敌人不再复活", L"被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活。在游戏中开启或关闭此选项会让该存档的名单重新开始（旧名单保存为 .bak），因此只计算开启期间击杀的敌人；若从游戏启动时就已开启，名单会在多次游玩之间保留。"},
+        {L"敌人不再复活（测试版）", L"测试版：被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活。在游戏中开启或关闭此选项会让该存档的名单重新开始（旧名单保存为 .bak），因此只计算开启期间击杀的敌人；若从游戏启动时就已开启，名单会在多次游玩之间保留。"},
         {L"是/否询问默认选“是”（测试版）", L"测试版：是/否询问打开时光标位于“是”而不是“否”：传送、退出、使用物品等；使用鼠标时，指针也会移到“是”上。对所有是/否询问生效，包括有风险的操作，确认前请看清楚。其他窗口（如物品数量）不变。"},
         {L"可攻击倒地敌人", L"与《艾尔登法环 黑夜君临》相同，被致命一击或弹反后处决击倒在地的敌人，在倒地和起身期间会受到伤害。作为代价，敌人获得霸体，你的攻击不会再次使其硬直，但仍会削减其架势。致命一击期间，骨灰也能攻击它们。敌人抓住你时，你仍受保护。"},
         {L"灵马跳跃速度 (%)", L"缩放灵马跳跃和二段跳时的动作速度，包括借助上升气流的大跳跃。保持 100% 时，即使奔跑速度更快，二段跳也和原版一样容易。立即生效。"},
@@ -11952,11 +12144,14 @@ const Texts kChinese{
         {L"战技速度 (%)", L"你的武器战技（战灰与专属战技）。它们使用此项而不是攻击速度，普通攻击保持各自的速度。与整体速度相乘。"},
         {L"治愈光环（HP/秒）", L"无需穿着即可获得更强的临终礼服光环：你和 7 米内的同伴（包括骨灰）每秒恢复这么多血量。礼服本身只为同伴每秒恢复 2 点，不会治疗穿着者。设为 0 关闭。约一秒内生效。"},
         {L"获得材料 (%)", L"每个采集点、尸体、宝箱和敌人掉落给你的制作材料数量：200% 为两倍。仅限制作配方使用的材料。物品掉落率决定敌人掉落的频率。下次拾取时生效。"},
-        {L"战斗中制作", L"与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
+        {L"战斗中制作（测试版）", L"测试版：与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
         {L"战斗中查看地图", L"与敌人战斗时也能打开地图，战斗开始时地图也不会关闭。快速传送仍遵循游戏规则（或随处快速传送）。立即生效。"},
-        {L"敌人追击距离（%）", L"敌人离开原位追击你多远才会放弃并返回：300% 即三倍距离。它们仍会在无法行走的地方停下（洞口、悬崖、区域边缘）。更改后在赐福处休息或重新载入区域以确保生效。"},
+        {L"敌人追击距离（%）（测试版）", L"测试版：敌人离开原位追击你多远才会放弃并返回：300% 即三倍距离。它们仍会在无法行走的地方停下（洞口、悬崖、区域边缘）。更改后在赐福处休息或重新载入区域以确保生效。"},
         {L"普通骨灰同时上限", L"开启“同时召唤多个骨灰”时：普通骨灰（用坟地钟形花强化）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；名人骨灰不受影响。0 = 无上限。"},
         {L"名人骨灰同时上限", L"开启“同时召唤多个骨灰”时：名人骨灰（用灵魂坟地钟形花强化，如仿身泪滴、黑刀蒂秋）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；普通骨灰不受影响。0 = 无上限。"},
+        {L"随处召唤托雷特（测试版）", L"测试版：灵马哨笛在游戏禁止骑马的地方也能使用：传说地下城、洞窟、地下墓地、室内和头目战场地。托雷特仍需要足够的空间出现和可站立的地面。剧情场景可能不适应托雷特：如果出错请关闭。立即生效。"},
+        {L"无需卢恩弧的大卢恩（测试版）", L"测试版：装备的大卢恩一直生效，就像使用了卢恩弧，死亡后也会自动恢复。照常在赐福处更换大卢恩。游戏会在存档中保存卢恩弧状态；关闭时只撤销本选项设置的状态，因此期间使用的卢恩弧也会失去。约一秒内生效。"},
+        {L"拾取范围 (%)（测试版）", L"测试版：可以从多远拾取物品、搜刮尸体、采集材料和取回遗失的卢恩：300% 为三倍距离。宝箱、门、拉杆、赐福和对话保持原有范围。立即生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -11987,7 +12182,8 @@ const Layout kLayout[]{
     {cat_status, {status_buildup, buildup_bleed, buildup_poison, buildup_rot, buildup_frost, buildup_sleep,
         buildup_madness, buildup_blight, status_instant, status_immunity, enemies_no_immunity}},
     {cat_weapon, {weapon_bleed, weapon_poison, weapon_rot, weapon_frost, weapon_sleep, weapon_effects_enemies}},
-    {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy}},
+    {cat_buffs, {buff_weapon, buff_weapon_forever, stack_weapon_buffs, buff_self, buff_self_forever, stack_buffs, buff_enemy,
+        great_rune_always}},
     {cat_enemies, {world_journey, journey_keep_runes, enemy_hp, boss_hp, enemy_speed, enemy_chase, charm_all_enemies, charm_bosses,
         enemies_no_attack, enemies_no_move,
         enemies_no_ai, enemies_no_respawn, enemy_respawn_kills, enemies_downed_vulnerable, npc_spawner}},
@@ -11996,10 +12192,10 @@ const Layout kLayout[]{
     {cat_spirits, {ash_cost, ash_multiple, ash_repeat, ash_free_fighting, ash_dismiss_all, ash_extra_cost, ash_damage_per_ash,
         ash_max_regular, ash_max_renowned,
         ash_anywhere, ash_keep_after_boss, ash_no_rest}},
-    {cat_runes, {rune_loss_off, runes_gained, loot_drop, materials_found, shop_price, upgrade_cost, upgrade_free, craft_free,
+    {cat_runes, {rune_loss_off, runes_gained, loot_drop, materials_found, pickup_radius, shop_price, upgrade_cost, upgrade_free, craft_free,
         craft_in_combat}},
     {cat_item_shop, {shop_weapon_level, shop_spirit_level, shop_item_price}},
-    {cat_map, {all_graces, reveal_map, map_in_combat, fast_travel_anywhere, open_mirror, open_level_up, open_rebirth}},
+    {cat_map, {all_graces, reveal_map, map_in_combat, fast_travel_anywhere, torrent_anywhere, open_mirror, open_level_up, open_rebirth}},
     {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on,
         lock_on_distance, camera_shake_off}},
@@ -12785,6 +12981,7 @@ int audit(LogFn log_fn) noexcept {
     resolve(g_intro);
     resolve_window();
     resolve_map_flags();
+    resolve_rune_arc();
     resolve_fov_site();
     resolve_downed_site();
     resolve_jump_site();
@@ -12887,6 +13084,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     resolve(g_intro);
     resolve_window();
     resolve_map_flags();
+    resolve_rune_arc();
     resolve_fov_site();
     resolve_downed_site();
     resolve_jump_site();
