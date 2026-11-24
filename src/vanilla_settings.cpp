@@ -6384,6 +6384,167 @@ void game_table_free(std::uint8_t* block) noexcept {
     if (g_game_aligned_free) g_game_aligned_free(block);
 }
 
+// Exit free guard (r161). When the game closes, the DLFileDeviceManager's
+// destructor (2.7.2.0: from the shutdown call at 0xC91E30, after the main
+// loop) frees each archive device's MicrosoftDiskFileOperator. Those live in
+// one of the game's own DL heaps, but by then that heap has left the range
+// registry (0x1EC9A20), so the owner lookup falls back to the CRT allocator
+// and its _aligned_free (0x25234E8) calls free() with whatever 8 bytes lie
+// before the block. Usually 0 or an unaligned value (nothing happens); now and
+// then 0x200000000, and HeapFree faults reading its header (ntdll+0x2730D,
+// dlc1's operator, r159 and r160). A block from _aligned_malloc always keeps
+// its real block just below it (8 to alignment + 8 bytes). The guard calls
+// free() as before for those; for any other value it frees nothing, but only
+// while the shutdown call is on the stack: during play it still calls free()
+// as the game did. Both patterns are unique in 2.7.0.0 to 2.7.2.1.
+using CrtFree = void (*)(void*);
+CrtFree g_crt_free{};
+std::uintptr_t g_shutdown_return{};  // address right after the shutdown call
+std::uintptr_t g_guard_image{}, g_guard_image_end{};
+volatile LONG g_guard_shutdown{};
+volatile LONG g_guard_skipped{};
+wchar_t g_guard_log_path[MAX_PATH]{};
+constexpr std::uintptr_t kAlignedSlack = 0x10000 + 8;
+
+bool guard_in_shutdown() noexcept {
+    if (g_guard_shutdown) return true;
+    void* frames[48]{};
+    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+    for (USHORT i = 0; i < count; ++i) {
+        if (reinterpret_cast<std::uintptr_t>(frames[i]) == g_shutdown_return) {
+            InterlockedExchange(&g_guard_shutdown, 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Straight to the log file: at exit the log's writer thread may never run
+// again. Static buffer, no allocation (this runs inside the game's free).
+void guard_write(const char* text, int length) noexcept {
+    if (!g_guard_log_path[0] || length <= 0) return;
+    const HANDLE file = CreateFileW(g_guard_log_path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written{};
+    WriteFile(file, text, static_cast<DWORD>(length), &written, nullptr);
+    CloseHandle(file);
+}
+
+void guard_log_skip(std::uintptr_t block, std::uintptr_t stored, LONG count) noexcept {
+    // the first 16, then at 32, 64, 128...
+    if (count > 16 && (count & (count - 1)) != 0) return;
+    static char line[400];
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    void* frames[6]{};
+    const USHORT depth = RtlCaptureStackBackTrace(1, 6, frames, nullptr);
+    char callers[200]{};
+    std::size_t used = 0;
+    for (USHORT i = 0; i < depth && used + 24 < sizeof(callers); ++i) {
+        const auto at = reinterpret_cast<std::uintptr_t>(frames[i]);
+        const int n = at >= g_guard_image && at < g_guard_image_end
+            ? _snprintf_s(callers + used, sizeof(callers) - used, _TRUNCATE, " +0x%llX",
+                static_cast<unsigned long long>(at - g_guard_image))
+            : _snprintf_s(callers + used, sizeof(callers) - used, _TRUNCATE, " 0x%llX",
+                static_cast<unsigned long long>(at));
+        if (n > 0) used += static_cast<std::size_t>(n);
+    }
+    const int length = _snprintf_s(line, _TRUNCATE,
+        "%04u-%02u-%02u %02u:%02u:%02u.%03u [NativeTweaks] Exit free guard: skipped free %ld at 0x%llX "
+        "(stored 0x%llX is not a CRT block); callers%s.\n",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds,
+        count, static_cast<unsigned long long>(block), static_cast<unsigned long long>(stored), callers);
+    guard_write(line, length);
+}
+
+// Replaces the game's _aligned_free (entered by a jump, so the stack is the
+// original's). The same steps as the original, plus the check.
+void guarded_aligned_free(void* pointer) noexcept {
+    if (!pointer) return;
+    const auto block = reinterpret_cast<std::uintptr_t>(pointer);
+    const std::uintptr_t stored = *reinterpret_cast<const std::uintptr_t*>((block & ~std::uintptr_t{7}) - 8);
+    if (stored && stored < block && block - stored <= kAlignedSlack) {
+        g_crt_free(reinterpret_cast<void*>(stored));
+        return;
+    }
+    if (!guard_in_shutdown()) {
+        g_crt_free(reinterpret_cast<void*>(stored));  // as the game does
+        return;
+    }
+    guard_log_skip(block, stored, InterlockedIncrement(&g_guard_skipped));
+}
+
+struct ExitGuardSites {
+    std::uint8_t* aligned_free{};
+    std::uint8_t* shutdown_call{};  // the E8 of the call after the main loop
+};
+
+ExitGuardSites find_exit_guard_sites() noexcept {
+    ExitGuardSites sites;
+    search_game_heap();
+    if (g_game_aligned_free) sites.aligned_free = reinterpret_cast<std::uint8_t*>(g_game_aligned_free);
+    if (std::uint8_t* hit = find_unique(parse_pattern(
+            "ba 02 00 00 00 ff 15 ? ? ? ? e8 ? ? ? ? 8b d8 e8 ? ? ? ? e8 ? ? ? ? 48 8b cf ff 15")))
+        sites.shutdown_call = hit + 0x12;
+    return sites;
+}
+
+void install_exit_free_guard() noexcept {
+    const ExitGuardSites sites = find_exit_guard_sites();
+    if (!sites.aligned_free || !sites.shutdown_call) {
+        log(L"Exit free guard: the game's _aligned_free or its shutdown call was not found; not installed.");
+        return;
+    }
+    std::uint8_t* site = sites.aligned_free;
+    // the unpatched function: sub rsp,28h ... call free ... add rsp,28h ; ret
+    static const std::uint8_t kExpected[]{0x48, 0x83, 0xEC, 0x28, 0x48, 0x85, 0xC9, 0x74, 0x0D,
+        0x48, 0x83, 0xE1, 0xF8, 0x48, 0x8B, 0x49, 0xF8, 0xE8};
+    if (std::memcmp(site, kExpected, sizeof(kExpected)) != 0 || site[0x16] != 0x48 || site[0x1A] != 0xC3) {
+        log(L"Exit free guard: _aligned_free was changed by another mod; not installed.");
+        return;
+    }
+    std::int32_t relative{};
+    std::memcpy(&relative, site + 0x12, 4);
+    g_crt_free = reinterpret_cast<CrtFree>(site + 0x16 + relative);
+    g_shutdown_return = reinterpret_cast<std::uintptr_t>(sites.shutdown_call) + 5;
+    g_guard_image = reinterpret_cast<std::uintptr_t>(game::image());
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_guard_image);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(g_guard_image + dos->e_lfanew);
+    g_guard_image_end = g_guard_image + nt->OptionalHeader.SizeOfImage;
+    if (g_diagnostics && !g_config_path.empty() && g_config_path.size() < MAX_PATH) {
+        wcscpy_s(g_guard_log_path, g_config_path.c_str());
+        if (wchar_t* slash = std::wcsrchr(g_guard_log_path, L'\\'))
+            wcscpy_s(slash + 1, MAX_PATH - static_cast<std::size_t>(slash + 1 - g_guard_log_path), L"NativeTweaks.log");
+        else
+            g_guard_log_path[0] = 0;
+    }
+    // jmp [rip+0] over the first 14 bytes. Only with the other threads
+    // suspended and none of them inside those bytes: a thread inside free()
+    // returns to +0x16, which stays as it was.
+    std::uint8_t patch[14]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const auto target = reinterpret_cast<std::uint64_t>(&guarded_aligned_free);
+    std::memcpy(patch + 6, &target, 8);
+    DWORD old_protect{};
+    if (!VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        log(L"Exit free guard: _aligned_free could not be made writable; not installed.");
+        return;
+    }
+    const FrozenWrite written = write_code_frozen(site, patch, sizeof(patch));
+    DWORD ignored{};
+    VirtualProtect(site, sizeof(patch), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+    wchar_t message[200]{};
+    if (written != FrozenWrite::written) {
+        log(L"Exit free guard: _aligned_free could not be patched safely; not installed.");
+        return;
+    }
+    swprintf_s(message, L"Exit free guard installed: _aligned_free at eldenring.exe+0x%llX, shutdown call returns to +0x%llX.",
+        static_cast<unsigned long long>(site - reinterpret_cast<std::uint8_t*>(g_guard_image)),
+        static_cast<unsigned long long>(g_shutdown_return - g_guard_image));
+    log(message);
+}
+
 // Appends rows (ids ascending, above every existing one) to a param table
 // that keeps its rows sorted, rebuilding the table with its prefix and id
 // index once; returns the new rows' data, or nothing.
@@ -7167,27 +7328,51 @@ struct FoundMaterialsState {
 };
 FoundMaterialsState g_found{};
 
-// Enemy chase distance: the three distances the AI's COMMON_SetBattleActLogic
-// takes from NpcThinkParam (u16 metres; NPC_THINK_PARAM_ST is 0xE4 bytes):
-// +0x3C "goes home whatever happens" (85 m for most enemies in 2.7.2.0),
-// +0x3E "goes home while fighting" (30 m) and +0x40 "gives up going home and
-// fights" (12 m). All three scale together, so they keep their order; 9999
-// (never) only grows, 0 is left alone. Checked offline on 2.7.2.0's
-// regulation.bin (2215 rows, stride 0xE4). Enemies still stop where their
-// navmesh ends (a cave mouth, another map tile).
+// Enemy chase distance: the three distances the AI's _COMMON_SetBattleActLogic
+// (aicommon common_logic_func.lua) takes from NpcThinkParam (u16 metres;
+// NPC_THINK_PARAM_ST is 0xE4 bytes): +0x3C maxBackhomeDist "goes home
+// whatever happens" (85 m for most enemies in 2.7.2.0), +0x3E backhomeDist
+// "goes home while fighting" (30 m) and +0x40 backhomeBattleDist "gives up
+// going home and fights" (12 m, distance to you). All three scale together, so
+// they keep their order; 9999 (never) only grows, 0 is left alone. Checked
+// offline on 2.7.2.0's regulation.bin (2215 rows, stride 0xE4).
+//
+// r160 in game (24-11): at 1000 % enemies barely followed further and went
+// back and forth. The distances were not what sent them back: the Lua only
+// compares them while the enemy still has you as its target, and it loses you
+// after SightTargetForgetTime (+0x20, f32 s; 8 s for most enemies) out of
+// sight and MemoryTargetForgetTime (+0xA0, f32 s; 5 s) after that. A chase
+// longer than ~20 m (eye_dist) breaks line of sight, so they forgot you
+// halfway, walked home, saw you again and turned. Both times now scale by the
+// same percentage (9999 and 0 left alone, capped at 9999): they keep chasing
+// as long as they keep sight of you or have lost it for less than that, then
+// give up and walk home as in the game. Search times (+0x14/+0x18, before a
+// fight starts), sight and hearing ranges are not touched: stealth and
+// detection stay as in the game. Enemies still stop where their navmesh ends
+// (a cave mouth, another map tile).
 struct ChaseCell {
     std::uintptr_t address;
     std::uint16_t original;
+};
+
+struct ChaseTime {
+    std::uintptr_t address;
+    float original;
 };
 
 struct ChaseState {
     bool attempted{};
     bool ready{};
     std::vector<ChaseCell> cells{};
+    std::vector<ChaseTime> times{};
     int applied{100};
 };
 
 ChaseState g_chase{};
+
+constexpr std::ptrdiff_t kChaseDistances[]{0x3C, 0x3E, 0x40};  // maxBackhome, backhome, backhomeBattle
+constexpr std::ptrdiff_t kChaseTimes[]{0x20, 0xA0};             // SightTargetForgetTime, MemoryTargetForgetTime
+constexpr float kChaseTimeNever = 9999.0f;
 
 void sync_enemy_chase() noexcept {
     auto& state = g_chase;
@@ -7199,18 +7384,29 @@ void sync_enemy_chase() noexcept {
             return;
         }
         std::vector<std::uint16_t> battle;
+        std::vector<float> sight;
         try {
             state.cells.reserve(table.rows.size() * 3);
+            state.times.reserve(table.rows.size() * 2);
             for (const auto row : table.rows) {
-                for (const std::ptrdiff_t offset : {0x3C, 0x3E, 0x40}) {
+                for (const std::ptrdiff_t offset : kChaseDistances) {
                     std::uint16_t distance{};
                     if (!game::read(row + offset, distance) || distance == 0) continue;
                     state.cells.push_back({row + offset, distance});
                     if (offset == 0x40) battle.push_back(distance);
                 }
+                for (const std::ptrdiff_t offset : kChaseTimes) {
+                    float seconds{};
+                    // NaN, 0 and "never" stay as they are.
+                    if (!game::read(row + offset, seconds) || !(seconds > 0.0f) || seconds >= kChaseTimeNever)
+                        continue;
+                    state.times.push_back({row + offset, seconds});
+                    if (offset == 0x20) sight.push_back(seconds);
+                }
             }
         } catch (...) {
             state.cells.clear();
+            state.times.clear();
             state.attempted = true;
             return;
         }
@@ -7219,14 +7415,26 @@ void sync_enemy_chase() noexcept {
             std::nth_element(battle.begin(), battle.begin() + battle.size() / 2, battle.end());
             median = battle[battle.size() / 2];
         }
-        // Tens of metres in the game's data; another layout shows another spread.
+        float sight_median{};
+        if (!sight.empty()) {
+            std::nth_element(sight.begin(), sight.begin() + sight.size() / 2, sight.end());
+            sight_median = sight[sight.size() / 2];
+        }
+        // Tens of metres and a few seconds in the game's data; another layout
+        // shows another spread. The times are only used when they look right.
         const bool ok = battle.size() >= 100 && median >= 5 && median <= 1000;
-        wchar_t message[200]{};
-        swprintf_s(message, L"Enemy chase distance: %zu NpcThinkParam distances (%zu in battle, median %u m)%ls.",
-            state.cells.size(), battle.size(), median, ok ? L"" : L" -> option disabled");
+        const bool times_ok = ok && sight.size() >= 100 && sight_median >= 1.0f && sight_median <= 120.0f;
+        if (!times_ok) state.times.clear();
+        wchar_t message[260]{};
+        swprintf_s(message,
+            L"Enemy chase distance: %zu NpcThinkParam distances (%zu in battle, median %u m), "
+            L"%zu forget times (median %.0f s)%ls.",
+            state.cells.size(), battle.size(), median, state.times.size(), sight_median,
+            !ok ? L" -> option disabled" : !times_ok ? L"; forget times left alone" : L"");
         log(message);
         if (!ok) {
             state.cells.clear();
+            state.times.clear();
             state.attempted = true;
             return;
         }
@@ -7237,6 +7445,9 @@ void sync_enemy_chase() noexcept {
     for (const auto& cell : state.cells)
         game::write<std::uint16_t>(cell.address, static_cast<std::uint16_t>(
             std::clamp<std::int64_t>(static_cast<std::int64_t>(cell.original) * want / 100, 1, 65535)));
+    for (const auto& time : state.times)
+        game::write<float>(time.address, want == 100 ? time.original
+            : std::clamp(time.original * static_cast<float>(want) / 100.0f, 0.001f, kChaseTimeNever));
     state.applied = want;
 }
 
@@ -9920,7 +10131,7 @@ DWORD WINAPI pause_worker(void*) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Enemies stay dead (beta). Resting, fast travel and loading the save bring
+// Enemies stay dead. Resting, fast travel and loading the save bring
 // every enemy back (the game only remembers kills in memory); the respawn
 // request (g_enemy_respawn) is left alone so living enemies reset as usual
 // (until r135 it was skipped, which kept the living ones in place). So while the
@@ -10404,6 +10615,21 @@ bool chr_disabled(std::uintptr_t chr) noexcept {
 // CSFade (fromsoftware-rs): nine fade plates from +0x10; a plate's current
 // colour is at +0x10, alpha at +0x1C. The game fades to black before every
 // loading screen and back in once the world is ready.
+// The darkest fade plate's alpha (0 clear, 1 black); -1 when unreadable.
+float fade_alpha(std::uintptr_t fade_slot) noexcept {
+    std::uintptr_t fade{};
+    if (!fade_slot || !game::read(fade_slot, fade) || !fade) return -1.0f;
+    float darkest = 0.0f;
+    for (int i = 0; i < 9; ++i) {
+        std::uintptr_t plate{};
+        float alpha{};
+        if (game::read(fade + 0x10 + i * 8, plate) && plate >= 0x10000 && game::read(plate + 0x1C, alpha) &&
+            alpha > darkest && alpha <= 1.0f)
+            darkest = alpha;
+    }
+    return darkest;
+}
+
 bool screen_faded(std::uintptr_t fade_slot) noexcept {
     std::uintptr_t fade{};
     if (!fade_slot || !game::read(fade_slot, fade) || !fade) return true;
@@ -10415,6 +10641,470 @@ bool screen_faded(std::uintptr_t fade_slot) noexcept {
             return true;
     }
     return false;
+}
+
+// Enemies stay dead inside the game's respawn (r161). r160 in game (24-11):
+// after resting, the listed enemies showed for a moment before they went
+// away. The worker below polls every 50 ms and then waits for a game frame to
+// run the setter, so the revived enemy was drawn for a few frames. Now the
+// game's own respawn step disables them before any frame shows them:
+// WorldChrMan's member task at +0x1ECF8 (2.7.2.0; the task object keeps the
+// owner at +0x20 and the member function at +0x28, called every frame by its
+// Execute, vtable +0x18) runs the respawn state at +0x1E524 (1 asked, 2
+// reviving the ChrSets a few at a time, 3-5 finishing, 0 idle). That function
+// pointer is swapped for respawn_task_hook, which calls the game's function
+// and then, on the game thread, disables every listed enemy that is alive
+// again, each frame while the respawn runs and for 2 s after it. Found at
+// runtime: the WorldChrMan word next to the owner (WorldChrMan itself) whose
+// code compares that respawn state within its first 0x200 bytes; one function
+// in each of the 5 exes (audit). Only when the respawn starts in the world
+// (rest, pass time: the worker saw the world running within the last 1.5 s,
+// the screen is not faded and the player is alive); a reset behind a loading screen (fast travel, death, load)
+// is left to the worker, as in r135 disabling during a load kept the loading
+// screen up.
+using RespawnTaskFn = std::uint64_t (*)(std::uintptr_t manager, std::uintptr_t data);
+RespawnTaskFn g_respawn_task_original{};
+std::uintptr_t g_respawn_task_slot{};
+std::ptrdiff_t g_respawn_state_offset{};
+// Last time the worker saw the world running (screen clear of fades for 1 s,
+// player animating; GetTickCount, 0 = never). Not reset when the worker
+// briefly loses the save (a rest can do that), only on the title screen.
+volatile LONG g_world_seen_tick{};
+std::atomic<std::uintptr_t> g_fade_slot{};  // CSFade singleton slot, once the worker found it
+constexpr DWORD kWorldSeenMs = 1500;
+SRWLOCK g_dead_shared_lock = SRWLOCK_INIT;
+std::vector<DeadEnemy> g_dead_shared{};  // sorted copy of the worker's list, for the game thread
+std::vector<std::uintptr_t> g_disabled_shared{};  // sorted: characters the worker or the step disabled (same lock)
+volatile LONG g_dead_count{};  // size of g_dead_shared, read without the lock
+// Characters the respawn step disabled, for the worker's own bookkeeping.
+SRWLOCK g_sync_disabled_lock = SRWLOCK_INIT;
+std::uintptr_t g_sync_disabled[256]{};
+std::size_t g_sync_disabled_count{};
+volatile LONG g_sync_dropped{};
+volatile LONG g_respawn_cycles{}, g_respawn_cycles_skipped{};
+constexpr int kRespawnTailFrames = 120;  // ~2 s at 60 FPS after the respawn ends
+
+struct RespawnTaskState {  // game thread only
+    std::uint32_t last_state{};
+    bool allowed{};
+    int tail{};
+    float last_alpha{-1.0f};
+    bool fading_in{};  // the screen got lighter since the step started (or was clear)
+};
+RespawnTaskState g_respawn_task{};
+
+struct SyncScan {
+    const std::vector<DeadEnemy>* dead{};
+    std::uintptr_t player{};
+    bool act{};       // disable them (else only count, for the log)
+    int alive{};      // listed, alive and enabled this frame
+    int disabled{};
+    int scripted{};   // listed and alive, but with an event entity ID: left to the worker
+};
+
+void respawn_sync_visit(std::uintptr_t chr, void* context) noexcept {
+    auto& scan = *static_cast<SyncScan*>(context);
+    if (chr == scan.player) return;
+    std::uint8_t flags{}, enable{}, drops{};
+    std::uint32_t selector{}, block{}, entity{};
+    std::int32_t npc_param{}, hp{};
+    std::uintptr_t modules{}, data{};
+    if (!game::read(chr + kChrDisabledByte, enable) || (enable & kChrDisabledBit) ||
+        !game::read(chr + 0x1C5, flags) || (flags & 0x80) || !game::read(chr + 0x8, selector) ||
+        !game::read(chr + 0xC, block) || !game::read(chr + 0x60, npc_param) ||
+        !game::read(chr + game::kModules, modules) || !modules || !game::read(modules, data) || !data ||
+        !game::read(data + 0x138, hp) || hp <= 0)
+        return;
+    const DeadEnemy key{block, selector & 0xFFFFFu, npc_param};
+    if (!std::binary_search(scan.dead->begin(), scan.dead->end(), key)) return;
+    // r161-test4 in game (24-11): the second rest after killing an enemy with
+    // an event entity ID (NpcParam 10000000, entity 1042360750 at The First
+    // Step, a scripted human that dies again whenever it is disabled) froze
+    // the game (AppHangB1, no NativeTweaks line for that rest). Characters
+    // with an entity ID belong to event scripts: the respawn step never
+    // touches them; the worker disables them after the fade, as in r160.
+    if (!game::read(chr + 0x1E8, entity)) return;
+    if (entity) {
+        ++scan.scripted;
+        return;
+    }
+    ++scan.alive;
+    if (!scan.act || !game::read(chr + 0x1C6, drops)) return;
+    game::write<std::uint8_t>(chr + 0x1C6, static_cast<std::uint8_t>(drops | 0x3));
+    if (!call_chr_enable_here(g_chr_disable, chr) || !chr_disabled(chr)) return;
+    ++scan.disabled;
+    AcquireSRWLockExclusive(&g_sync_disabled_lock);
+    if (g_sync_disabled_count < std::size(g_sync_disabled)) g_sync_disabled[g_sync_disabled_count++] = chr;
+    else InterlockedIncrement(&g_sync_dropped);
+    ReleaseSRWLockExclusive(&g_sync_disabled_lock);
+}
+
+// One respawn cycle as the game thread saw it, for the worker's log (r161-test3:
+// in the user's test of test2 the hook never hid anything; these lines say
+// whether the step ran at rest / pass time, why it did not act and how long
+// the step took).
+struct RespawnCycle {
+    DWORD start{}, end{};
+    int frames{};
+    std::uint32_t max_state{};
+    bool allowed{}, faded{}, player_alive{};
+    std::int32_t anim{-1};
+    DWORD world_age{};       // ms since the worker last saw the world running (~0u: never)
+    int listed_alive_max{};  // listed enemies alive and enabled after one frame of the step, most seen
+    int first_alive_frame{-1};
+    int hidden{};
+    float darkest{};      // darkest fade seen during the cycle
+    DWORD fade_in_ms{};   // from the start of the step to the first frame the fade got lighter (0: none seen)
+    bool held{};          // listed enemies were left alive behind the black screen until the fade-in
+    int scripted_max{};   // listed enemies with an entity ID seen alive in a frame (not touched)
+    long black_before_ms{-1};  // grace animation with a black screen this long before the step started (-1: not seen)
+    int released{};       // listed enemies enabled again behind that black screen before the step
+    int still_disabled{}; // listed enemies left disabled then (an entity ID)
+};
+SRWLOCK g_cycle_lock = SRWLOCK_INIT;
+RespawnCycle g_cycles[16]{};
+std::size_t g_cycle_count{};
+volatile LONG g_cycles_dropped{};
+
+// Grace animations (sitting down, resting, passing time, getting up):
+// c0000's 68xxx events (68043, 68110 bonfire level-up...).
+bool grace_animation(std::int32_t anim) noexcept {
+    return anim >= 68000 && anim < 69000;
+}
+
+// Whether the hook may disable listed enemies in this respawn: the player is
+// alive, the worker saw the world running a moment ago, and the screen is not
+// faded, or it is faded for a rest at a grace (the player is in a grace
+// animation). Fast travel, the player's death and loading a save are left to
+// the worker (r135: disabling during a load kept the loading screen up).
+bool respawn_in_world(RespawnCycle& cycle) noexcept {
+    const auto seen = static_cast<DWORD>(g_world_seen_tick);
+    cycle.world_age = seen ? GetTickCount() - seen : ~0u;
+    const std::uintptr_t fade_slot = g_fade_slot.load(std::memory_order_acquire);
+    cycle.faded = !fade_slot || screen_faded(fade_slot);
+    std::int32_t hp{};
+    const std::uintptr_t points = game::player_points(g_statics);
+    cycle.player_alive = points && game::read(points, hp) && hp > 0;
+    const std::uintptr_t animation = game::player_anim_id(g_statics);
+    if (!animation || !game::read(animation, cycle.anim)) cycle.anim = -1;
+    return cycle.player_alive && cycle.world_age <= kWorldSeenMs && (!cycle.faded || grace_animation(cycle.anim));
+}
+
+// r161-test5 in game (24-11): resting was fast, but Pass time still kept the
+// screen black 8-10 s with the option on (instant with it off), all of it
+// before the respawn step (which then faded back in after ~1 s). Passing time
+// waits for the loaded characters before it runs, and the listed enemies kept
+// disabled since earlier never answer, so it waits for its timeout. So while
+// the player is in a grace animation and the screen is black (rest or Pass
+// time, before the step), the listed enemies without an entity ID that the
+// worker or the step disabled are enabled again, out of sight; the step that
+// follows hides them again when the screen starts to clear (see below).
+// Scripted ones (entity ID) stay as they are (r161-test4 hang).
+struct ReleaseScan {
+    int released{}, still_disabled{};
+};
+
+void release_visit(std::uintptr_t chr, void* context) noexcept {
+    auto& scan = *static_cast<ReleaseScan*>(context);
+    std::uint8_t enable{};
+    std::uint32_t selector{}, block{}, entity{};
+    std::int32_t npc_param{};
+    if (!game::read(chr + kChrDisabledByte, enable) || !(enable & kChrDisabledBit) ||
+        !std::binary_search(g_disabled_shared.begin(), g_disabled_shared.end(), chr) ||
+        !game::read(chr + 0x8, selector) || !game::read(chr + 0xC, block) || !game::read(chr + 0x60, npc_param) ||
+        !std::binary_search(g_dead_shared.begin(), g_dead_shared.end(), DeadEnemy{block, selector & 0xFFFFFu, npc_param}) ||
+        !game::read(chr + 0x1E8, entity))
+        return;
+    if (entity) {
+        ++scan.still_disabled;
+        return;
+    }
+    if (call_chr_enable_here(g_chr_enable, chr) && !chr_disabled(chr)) ++scan.released;
+}
+
+struct BlackState {  // game thread only
+    DWORD since{};      // grace animation + black screen since then (0: not now)
+    bool released{};    // the release ran for this black screen
+    int released_count{}, still_disabled{};
+};
+BlackState g_black{};
+
+// Every black screen (fade 0.95 or darker) while the list is not empty, for
+// the log: how long it lasted, whether it was a grace one, and how many
+// listed enemies were loaded and disabled when it began. Fast travel, death,
+// entering an area, cutscene fades: if one of them also waits for the
+// disabled enemies, it shows up here as a long one (compare with the option
+// off or an empty list). Measured on the game thread, logged by the worker.
+struct BlackPeriod {
+    DWORD start{}, length{};
+    bool grace{};
+    int listed_disabled{};  // listed enemies loaded and disabled at the start
+    int released{};
+};
+SRWLOCK g_black_log_lock = SRWLOCK_INIT;
+BlackPeriod g_black_log[16]{};
+std::size_t g_black_log_count{};
+
+struct CountDisabledScan {
+    int count{};
+};
+
+void count_disabled_visit(std::uintptr_t chr, void* context) noexcept {
+    std::uint8_t enable{};
+    std::uint32_t selector{}, block{};
+    std::int32_t npc_param{};
+    if (game::read(chr + kChrDisabledByte, enable) && (enable & kChrDisabledBit) && game::read(chr + 0x8, selector) &&
+        game::read(chr + 0xC, block) && game::read(chr + 0x60, npc_param) &&
+        std::binary_search(g_dead_shared.begin(), g_dead_shared.end(), DeadEnemy{block, selector & 0xFFFFFu, npc_param}))
+        ++static_cast<CountDisabledScan*>(context)->count;
+}
+
+void track_black(float alpha) noexcept {
+    static BlackPeriod period{};
+    static bool dark = false;
+    const bool now_dark = alpha >= 0.95f;
+    if (now_dark && !dark) {
+        period = BlackPeriod{};
+        period.start = GetTickCount();
+        if (g_dead_count && TryAcquireSRWLockShared(&g_dead_shared_lock)) {
+            CountDisabledScan scan{};
+            game::for_each_loaded_chr(g_statics, &count_disabled_visit, &scan);
+            ReleaseSRWLockShared(&g_dead_shared_lock);
+            period.listed_disabled = scan.count;
+        }
+    } else if (now_dark) {
+        std::int32_t anim{-1};
+        const std::uintptr_t animation = game::player_anim_id(g_statics);
+        if (animation && game::read(animation, anim) && grace_animation(anim)) period.grace = true;
+    } else if (dark) {
+        period.length = GetTickCount() - period.start;
+        period.released = g_black.released_count;
+        if (g_dead_count) {
+            AcquireSRWLockExclusive(&g_black_log_lock);
+            if (g_black_log_count < std::size(g_black_log)) g_black_log[g_black_log_count++] = period;
+            ReleaseSRWLockExclusive(&g_black_log_lock);
+        }
+    }
+    dark = now_dark;
+}
+
+// Every frame the step is idle: watch for a grace black screen and release once.
+void watch_grace_black(float alpha) noexcept {
+    auto& black = g_black;
+    if (alpha < 0.95f || !value_of(enemies_no_respawn) || !g_chr_enable || !g_dead_count) {
+        black = BlackState{};
+        return;
+    }
+    std::int32_t anim{-1};
+    const std::uintptr_t animation = game::player_anim_id(g_statics);
+    if (!animation || !game::read(animation, anim) || !grace_animation(anim)) {
+        black = BlackState{};
+        return;
+    }
+    if (!black.since) black.since = GetTickCount() | 1;
+    if (black.released) return;
+    if (!TryAcquireSRWLockShared(&g_dead_shared_lock)) return;  // next frame
+    ReleaseScan scan{};
+    if (!g_disabled_shared.empty() && !g_dead_shared.empty())
+        game::for_each_loaded_chr(g_statics, &release_visit, &scan);
+    ReleaseSRWLockShared(&g_dead_shared_lock);
+    black.released = true;
+    black.released_count = scan.released;
+    black.still_disabled = scan.still_disabled;
+}
+
+// r161-test3 in game (24-11): hidden before they were drawn, but with at
+// least one listed enemy the screen stayed black for 8-10 s after a rest or
+// Pass time (the step itself took 250 ms; with an empty list it was normal).
+// The fade back in after a rest waits for the revived characters, and a
+// disabled one never updates, so the game waited for its timeout. Now the
+// revived listed enemies are left alone while the screen is black: they run
+// their first frames out of sight, the game fades back in, and they are
+// disabled on the first frame the fade gets lighter (still nearly black), or
+// at once when there is no fade. Held for at most 20 s.
+constexpr DWORD kHoldBehindFadeMs = 20000;
+
+void respawn_task_after(std::uintptr_t manager, std::uint32_t before) noexcept {
+    auto& task = g_respawn_task;
+    static RespawnCycle cycle{};
+    std::uint32_t after{};
+    if (!game::read(manager + g_respawn_state_offset, after)) return;
+    const bool running = before != 0 || after != 0;
+    const std::uintptr_t fade_slot = g_fade_slot.load(std::memory_order_acquire);
+    const float alpha = fade_alpha(fade_slot);
+    track_black(alpha);
+    if (running && task.last_state == 0) {  // a respawn starts (the request set the state to 1)
+        cycle = RespawnCycle{};
+        cycle.start = GetTickCount();
+        if (g_black.since) {
+            cycle.black_before_ms = static_cast<long>(cycle.start - g_black.since);
+            cycle.released = g_black.released_count;
+            cycle.still_disabled = g_black.still_disabled;
+        }
+        task.allowed = respawn_in_world(cycle) && value_of(enemies_no_respawn) && g_chr_disable;
+        cycle.allowed = task.allowed;
+        task.last_alpha = alpha;
+        task.fading_in = alpha <= 0.05f;  // no fade: act at once
+        InterlockedIncrement(task.allowed ? &g_respawn_cycles : &g_respawn_cycles_skipped);
+    }
+    const bool was_running = task.last_state != 0 || task.tail > 0;
+    task.last_state = after;
+    if (!was_running && !running) {
+        watch_grace_black(alpha);
+        return;
+    }
+    if (alpha > cycle.darkest) cycle.darkest = alpha;
+    if (!task.fading_in && (alpha < 0.0f || alpha <= 0.05f || alpha < task.last_alpha - 0.001f)) {
+        task.fading_in = true;
+        cycle.fade_in_ms = GetTickCount() - cycle.start;
+    }
+    task.last_alpha = alpha;
+    const bool hold = task.allowed && !task.fading_in && GetTickCount() - cycle.start < kHoldBehindFadeMs;
+    if (running || hold) {
+        task.tail = kRespawnTailFrames;
+        if (running) {
+            cycle.end = GetTickCount();
+            cycle.max_state = std::max(cycle.max_state, std::max(before, after));
+        }
+    } else if (task.tail > 0) {
+        --task.tail;
+    }
+    ++cycle.frames;
+    if (value_of(enemies_no_respawn) && TryAcquireSRWLockShared(&g_dead_shared_lock)) {
+        // The worker holds the lock only to swap the list in; a frame is skipped then.
+        SyncScan scan{&g_dead_shared};
+        scan.act = task.allowed && !hold;
+        if (!g_dead_shared.empty()) {
+            game::read(manager + game::kPlayerIns, scan.player);
+            game::for_each_loaded_chr(g_statics, &respawn_sync_visit, &scan);
+        }
+        ReleaseSRWLockShared(&g_dead_shared_lock);
+        if (scan.alive && cycle.first_alive_frame < 0) cycle.first_alive_frame = cycle.frames;
+        if (hold && scan.alive) cycle.held = true;
+        if (!hold) cycle.listed_alive_max = std::max(cycle.listed_alive_max, scan.alive - scan.disabled);
+        cycle.hidden += scan.disabled;
+        cycle.scripted_max = std::max(cycle.scripted_max, scan.scripted);
+    }
+    if (task.tail <= 0) {  // the cycle and its 2 s tail are over: hand it to the worker's log
+        AcquireSRWLockExclusive(&g_cycle_lock);
+        if (g_cycle_count < std::size(g_cycles)) g_cycles[g_cycle_count++] = cycle;
+        else InterlockedIncrement(&g_cycles_dropped);
+        ReleaseSRWLockExclusive(&g_cycle_lock);
+        task.allowed = false;
+    }
+}
+
+std::uint64_t respawn_task_hook(std::uintptr_t manager, std::uintptr_t data) {
+    std::uint32_t before{};
+    if (g_respawn_state_offset) game::read(manager + g_respawn_state_offset, before);
+    const std::uint64_t result = g_respawn_task_original(manager, data);
+    try {
+        if (g_respawn_state_offset) respawn_task_after(manager, before);
+    } catch (...) {
+    }
+    return result;
+}
+
+// The respawn step's state test, "cmp dword [rbx+state],0; je" with the
+// state offset of the respawn request (g_enemy_respawn): one place in each of
+// the 5 exes, 0x15D bytes into the step (audit). nullptr when not found.
+std::uint8_t* find_respawn_step(std::int32_t& state_offset) noexcept {
+    state_offset = 0;
+    const std::uint8_t* request = g_enemy_respawn.address;  // cmp dword [rcx+disp32],0
+    if (!request || request[0] != 0x83 || request[1] != 0xB9) return nullptr;
+    std::int32_t disp{};
+    std::memcpy(&disp, request + 2, 4);
+    if (disp <= 0 || disp >= 0x40000) return nullptr;
+    char pattern[64]{};
+    std::snprintf(pattern, sizeof(pattern), "83 bb %02x %02x %02x %02x 00 0f 84", disp & 0xFF, (disp >> 8) & 0xFF,
+        (disp >> 16) & 0xFF, (disp >> 24) & 0xFF);
+    std::uint8_t* site = find_unique(parse_pattern(pattern));
+    if (site) state_offset = disp;
+    return site;
+}
+
+// Once WorldChrMan exists (the worker sees the player). Returns true when
+// there is nothing more to try (installed, or not possible in this game).
+bool install_respawn_task_hook(std::uintptr_t manager) noexcept {
+    if (g_respawn_task_original) return true;
+    if (!g_chr_disable) return true;
+    std::int32_t disp{};
+    const auto site = reinterpret_cast<std::uintptr_t>(find_respawn_step(disp));
+    if (!site) {
+        log(L"Enemies stay dead: the game's respawn step was not found (or ambiguous); listed enemies are hidden "
+            L"right after it instead (they may show for a moment after a rest).");
+        return true;
+    }
+    // The member task's function pointer: next to its owner (WorldChrMan), and
+    // the function holds the state test in its first 0x200 bytes.
+    std::uintptr_t found_slot{}, found_function{};
+    int candidates = 0;
+    std::uintptr_t page[512];
+    for (std::ptrdiff_t at = 0; at < 0x30000; at += sizeof(page)) {
+        if (!game::safe_read(manager + at, page, sizeof(page))) continue;
+        for (std::size_t i = 1; i < std::size(page); ++i) {
+            const std::uintptr_t function = page[i];
+            if (page[i - 1] != manager || function > site || site - function >= 0x200) continue;
+            ++candidates;
+            found_slot = manager + at + i * sizeof(std::uintptr_t);
+            found_function = function;
+        }
+    }
+    const auto image = reinterpret_cast<std::uintptr_t>(game::image());
+    if (candidates != 1) {
+        wchar_t message[200]{};
+        swprintf_s(message, L"Enemies stay dead: the game's respawn step was %ls; listed enemies are hidden right after "
+            L"it instead (they may show for a moment after a rest).", candidates ? L"ambiguous" : L"not found");
+        log(message);
+        return true;
+    }
+    g_respawn_state_offset = disp;
+    g_respawn_task_original = reinterpret_cast<RespawnTaskFn>(found_function);
+    const auto previous = static_cast<std::uintptr_t>(InterlockedCompareExchange64(
+        reinterpret_cast<volatile LONG64*>(found_slot), static_cast<LONG64>(reinterpret_cast<std::uintptr_t>(&respawn_task_hook)),
+        static_cast<LONG64>(found_function)));
+    if (previous != found_function) {
+        g_respawn_task_original = nullptr;
+        log(L"Enemies stay dead: the game's respawn step changed while it was hooked; not hooked.");
+        return true;
+    }
+    g_respawn_task_slot = found_slot;
+    wchar_t message[200]{};
+    swprintf_s(message, L"Enemies stay dead: respawn step hooked (WorldChrMan+0x%llX -> eldenring.exe+0x%llX, state +0x%X).",
+        static_cast<unsigned long long>(found_slot - manager), static_cast<unsigned long long>(found_function - image),
+        static_cast<unsigned>(disp));
+    log(message);
+    return true;
+}
+
+// The characters the worker disabled, for the pass-time release below.
+void publish_disabled(const std::set<std::uintptr_t>& disabled) noexcept {
+    try {
+        std::vector<std::uintptr_t> copy(disabled.begin(), disabled.end());
+        AcquireSRWLockExclusive(&g_dead_shared_lock);
+        g_disabled_shared.swap(copy);
+        ReleaseSRWLockExclusive(&g_dead_shared_lock);
+    } catch (...) {
+        AcquireSRWLockExclusive(&g_dead_shared_lock);
+        g_disabled_shared.clear();
+        ReleaseSRWLockExclusive(&g_dead_shared_lock);
+    }
+}
+
+// The worker's list, for the respawn step.
+void publish_dead(const std::set<DeadEnemy>& dead) noexcept {
+    try {
+        std::vector<DeadEnemy> copy(dead.begin(), dead.end());  // a set is already sorted
+        AcquireSRWLockExclusive(&g_dead_shared_lock);
+        g_dead_shared.swap(copy);
+        InterlockedExchange(&g_dead_count, static_cast<LONG>(g_dead_shared.size()));
+        ReleaseSRWLockExclusive(&g_dead_shared_lock);
+    } catch (...) {
+        AcquireSRWLockExclusive(&g_dead_shared_lock);
+        g_dead_shared.clear();
+        InterlockedExchange(&g_dead_count, 0);
+        ReleaseSRWLockExclusive(&g_dead_shared_lock);
+    }
 }
 
 // Loaded characters that are on the list: disabled at once (or killed again,
@@ -10693,6 +11383,10 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
     bool fade_logged{};
     DWORD clear_since{};  // the screen has had no fade since then (0 = faded)
     bool dirty{};
+    bool dead_changed{};
+    bool disabled_changed{};           // the set changed without changing size
+    std::size_t published_disabled{};  // size of the set last published
+    bool respawn_hook_done{};  // install_respawn_task_hook has nothing more to try
     int recorded{}, prevented{};
     DWORD last_save = GetTickCount();
     DWORD next_summary = GetTickCount();
@@ -10743,7 +11437,11 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
         event_lines = 0;
         seen.clear();
         disabled.clear();  // their characters are gone or about to be
+        disabled_changed = true;
         force_full = true;
+        AcquireSRWLockExclusive(&g_sync_disabled_lock);
+        g_sync_disabled_count = 0;  // characters of the area that is gone
+        ReleaseSRWLockExclusive(&g_sync_disabled_lock);
     };
     // Turning the option off in game: the enemies it disabled come back where
     // they are (the next rest also resets them).
@@ -10763,6 +11461,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
         swprintf_s(message, L"Enemies stay dead: option off, %d disabled enemies enabled again.", enabled);
         log(message);
         disabled.clear();
+        disabled_changed = true;
     };
     // The save's list starts over when the option is turned off with a save
     // loaded, and when it is turned on during the session: only enemies killed
@@ -10783,6 +11482,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
         }
         kills.clear();
         dead.clear();
+        publish_dead(dead);
         dirty = false;
     };
     perf::Loop loop(L"dead_enemy");
@@ -10794,6 +11494,8 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 if (!path.empty()) reset_list(L"option off");
                 was_on = false;
                 close();
+                publish_dead(dead);  // empty
+                InterlockedExchange(&g_world_seen_tick, 0);
                 idle_wait(loop);
                 continue;
             }
@@ -10807,10 +11509,13 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 !game::read(manager + game::kPlayerIns, player) || !player ||
                 !game::save_identity(g_statics, id)) {
                 close();  // title screen or loading
+                if (!manager || !player) InterlockedExchange(&g_world_seen_tick, 0);
                 continue;
             }
             const std::wstring current = dead_enemy_path(id);
             if (current != path) {
+                // The shared list stays until the new one is published below
+                // (kills_limit 0): a rest can drop the save for a moment.
                 close();
                 path = current;
                 load_dead_enemies(path, kills);
@@ -10826,9 +11531,11 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 kills_limit = 0;
             }
 
+            if (!respawn_hook_done) respawn_hook_done = install_respawn_task_hook(manager);
             const int limit = value_of(enemy_respawn_kills);
             if (limit != kills_limit) {
                 listed_dead(kills, limit, dead);
+                publish_dead(dead);
                 // A higher limit: enemies this worker disabled that now need
                 // more kills come back where they are, without a rest.
                 int back = 0;
@@ -10841,6 +11548,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                             !chr_disabled(chr) || !call_chr_enable(g_chr_enable, chr))
                             continue;
                         disabled.erase(chr);
+                        disabled_changed = true;
                         ++back;
                     }
                 }
@@ -10883,6 +11591,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
             }
             if (!fade_slot && g_chr_disable && static_cast<LONG>(GetTickCount() - next_fade_lookup) >= 0) {
                 fade_slot = game::find_singleton("CSFade", fade_logged ? nullptr : g_log);
+                g_fade_slot.store(fade_slot, std::memory_order_release);
                 fade_logged = true;
                 next_fade_lookup = GetTickCount() + 5000;
             }
@@ -10895,6 +11604,82 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 clear_since && GetTickCount() - clear_since >= 1000;
             if (running_now && !world_running) force_full = true;  // disable the listed ones at once
             world_running = running_now;
+            if (world_running && player_hp > 0) InterlockedExchange(&g_world_seen_tick, static_cast<LONG>(GetTickCount() | 1));
+
+            // Listed enemies the game's respawn step disabled (rest, pass time).
+            std::uintptr_t synced[std::size(g_sync_disabled)];
+            std::size_t synced_count{};
+            AcquireSRWLockExclusive(&g_sync_disabled_lock);
+            synced_count = g_sync_disabled_count;
+            std::copy(g_sync_disabled, g_sync_disabled + synced_count, synced);
+            g_sync_disabled_count = 0;
+            ReleaseSRWLockExclusive(&g_sync_disabled_lock);
+            if (synced_count) {
+                for (std::size_t i = 0; i < synced_count; ++i) {
+                    try {
+                        disabled_changed |= disabled.insert(synced[i]).second;
+                    } catch (...) {
+                    }
+                }
+                prevented += static_cast<int>(synced_count);
+                dirty = true;  // reported with the next save
+                wchar_t message[220]{};
+                swprintf_s(message,
+                    L"Enemies stay dead: %zu listed enemies hidden inside the game's respawn, before they were drawn "
+                    L"(%ld in-world respawns, %ld behind a loading screen so far).",
+                    synced_count, g_respawn_cycles, g_respawn_cycles_skipped);
+                line(message);
+            }
+            {
+                RespawnCycle cycles[std::size(g_cycles)];
+                std::size_t count{};
+                AcquireSRWLockExclusive(&g_cycle_lock);
+                count = g_cycle_count;
+                std::copy(g_cycles, g_cycles + count, cycles);
+                g_cycle_count = 0;
+                ReleaseSRWLockExclusive(&g_cycle_lock);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const RespawnCycle& c = cycles[i];
+                    wchar_t message[800]{};
+                    swprintf_s(message,
+                        L"Enemies stay dead: respawn step ran %lu ms (%d frames with the 2 s after it, states up to %u); "
+                        L"%ls (world seen %ld ms ago, screen %ls, player %ls, animation %d); screen darkest %.2f, "
+                        L"fading back in %lu ms after the step started%ls; listed enemies alive after it: %d at most "
+                        L"(first at frame %d); %d hidden; %d with an entity ID left to the worker; grace black screen "
+                        L"%ld ms before the step (%d enabled again behind it, %d left disabled).",
+                        c.end - c.start, c.frames, c.max_state, c.allowed ? L"acted" : L"left to the worker",
+                        c.world_age == ~0u ? -1L : static_cast<long>(c.world_age), c.faded ? L"faded" : L"clear",
+                        c.player_alive ? L"alive" : L"not alive", c.anim, c.darkest, c.fade_in_ms,
+                        c.held ? L" (listed enemies left alive behind the black screen until then)" : L"",
+                        c.listed_alive_max, c.first_alive_frame, c.hidden, c.scripted_max, c.black_before_ms,
+                        c.released, c.still_disabled);
+                    log(message);
+                }
+            }
+            {
+                BlackPeriod periods[std::size(g_black_log)];
+                std::size_t count{};
+                AcquireSRWLockExclusive(&g_black_log_lock);
+                count = g_black_log_count;
+                std::copy(g_black_log, g_black_log + count, periods);
+                g_black_log_count = 0;
+                ReleaseSRWLockExclusive(&g_black_log_lock);
+                for (std::size_t i = 0; i < count; ++i) {
+                    wchar_t message[260]{};
+                    swprintf_s(message,
+                        L"Enemies stay dead: black screen for %lu ms (%ls); %d listed enemies loaded and disabled when it "
+                        L"began%ls.",
+                        periods[i].length, periods[i].grace ? L"rest or Pass time" : L"loading, death, fade or cutscene",
+                        periods[i].listed_disabled, periods[i].grace && periods[i].released
+                            ? L", enabled again behind it" : L"");
+                    log(message);
+                }
+            }
+            if (const LONG lost = InterlockedExchange(&g_sync_dropped, 0)) {
+                wchar_t message[120]{};
+                swprintf_s(message, L"Enemies stay dead: %ld respawn-step entries dropped (list full).", lost);
+                log(message);
+            }
 
             // Deaths the game paid for (death hook).
             std::vector<DeathEvent> deaths;
@@ -10933,7 +11718,12 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                     dead.insert(key);
                     ++recorded;
                     force_full = true;  // a loaded character may share the new key
+                    dead_changed = true;
                 }
+            }
+            if (dead_changed) {
+                publish_dead(dead);
+                dead_changed = false;
             }
             const LONG dropped = InterlockedExchange(&g_death_dropped, 0);
             if (dropped) {
@@ -10985,7 +11775,7 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                 seen.swap(seen_next);
                 for (const std::uintptr_t chr : pass.disabled_now) {
                     try {
-                        disabled.insert(chr);
+                        disabled_changed |= disabled.insert(chr).second;
                     } catch (...) {
                     }
                 }
@@ -11031,6 +11821,11 @@ DWORD WINAPI dead_enemy_worker(void*) noexcept {
                     L"Enemies stay dead: 45 s after your death: %d respawns prevented, %d listed enemies alive now "
                     L"(0 expected).", prevented_after_death, alive_listed_now);
                 log(message);
+            }
+            if (disabled.size() != published_disabled || disabled_changed) {
+                publish_disabled(disabled);
+                published_disabled = disabled.size();
+                disabled_changed = false;
             }
             if (dirty && GetTickCount() - last_save >= 3000) flush();
         } catch (...) {
@@ -11613,7 +12408,7 @@ const Texts kEnglish{
         {L"HUD to screen edges", L"On screens wider than 16:9, moves the gauges, equipment, runes and other corner elements to the screen edges. Use with Allow ultrawide. Restart the game to apply: it loads the HUD once at startup. Turn it off if another mod already places the HUD for ultrawide."},
         {L"HUD scale (%)", L"Resizes the gauges, equipment, compass, boss bars, runes and other corner elements, each one from its own corner. Restart the game to apply: it loads the HUD once at startup."},
         {L"Menus to screen edges", L"On screens wider than 16:9, moves the pause menu and the other menus (equipment, inventory, status, shops, level up, spells, storage, options, loading and title screens) to the screen edges and widens their backgrounds. Restart the game to apply: it loads the menus once at startup. Turn it off if another mod replaces these menus."},
-        {L"Enemies stay dead (beta)", L"BETA: Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turning it off brings everyone back with the next rest. Turning it on or off during play starts the save's list over (the old one is kept as .bak), so only enemies killed while it is on count; on from the start of the game, the list carries over between sessions."},
+        {L"Enemies stay dead", L"Enemies you kill stay dead after resting at a grace, passing time, dying, fast travel or loading the save. Each save keeps its list in DLLs\\NativeTweaks\\dead-enemies; an enemy that loads again is removed at once: no body, no runes or drops. Bosses and NPCs work as usual, and enemies still alive reset as usual. Turning it off brings everyone back with the next rest. Turning it on or off during play starts the save's list over (the old one is kept as .bak), so only enemies killed while it is on count; on from the start of the game, the list carries over between sessions."},
         {L"Yes/No questions start on Yes (beta)", L"BETA: Yes/No questions open with the cursor on Yes instead of No: travel, quit, use an item and the like; with the mouse, the pointer is moved onto Yes too. It applies to every Yes/No question, risky ones too, so check before confirming. Other windows, such as item quantities, do not change."},
         {L"Hit downed enemies", L"Like Nightreign, enemies knocked to the ground by a critical hit or a riposte take damage while they lie there and get up. They get super armour instead, so your hits do not stagger them again, but they still take posture damage. Spirit ashes can also hit them during the critical hit. You keep your own protection when an enemy grabs you."},
         {L"Torrent jump speed (%)", L"Scales Torrent's animation speed during jumps and double jumps, spiritspring jumps included. At 100% the double jump is as easy to get as in the base game, even with a faster run speed. Applies instantly."},
@@ -11678,14 +12473,14 @@ const Texts kEnglish{
         {L"Skill speed (%)", L"Your weapon skills (Ashes of War and unique skills). They use this instead of Attack speed, so normal attacks keep theirs. Multiplies the overall speed."},
         {L"Healing aura (HP/s)", L"The Deathbed Dress's aura without wearing it, stronger: you and allies within 7 m, spirit ashes included, recover this many HP every second. The dress alone gives allies 2 HP/s and you nothing. 0 turns it off. Applies within a second."},
         {L"Materials found (%)", L"How many crafting materials you get from each gathering spot, corpse, chest and enemy drop: 200% gives twice as many. Only materials used in crafting recipes. Item drop rate changes how often enemies drop things. Applies to the next pick-up."},
-        {L"Craft in combat (beta)", L"BETA: Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
+        {L"Craft in combat", L"Item Crafting stays open in the menu while enemies are fighting you, as out of combat. Applies at once."},
         {L"Map in combat", L"The map opens while enemies are fighting you, and stays open when a fight starts. Fast travel still follows the game's rules (or Fast travel anywhere). Applies at once."},
-        {L"Enemy chase distance (%) (beta)", L"BETA: How far enemies follow you away from where they stand before they give up and walk back: 300% is three times as far. They still stop where they cannot walk (cave mouths, cliffs, the edge of their area). To be sure it applies, rest at a site of grace or reload the area after changing it."},
+        {L"Enemy chase distance (%)", L"How far enemies follow you away from where they stand before they give up and walk back: 300% is three times as far. They also keep track of you that much longer once they lose sight of you, so they do not give up halfway; how far they see and hear you is unchanged. They still stop where they cannot walk (cave mouths, cliffs, the edge of their area). To be sure it applies, rest at a site of grace or reload the area after changing it."},
         {L"Most regular ashes at once", L"With Several ashes at once: how many regular spirit ashes (upgraded with Grave Glovewort) can be out together. Summoning one more dismisses one of them with a short fade; renowned ashes stay. 0 = no limit."},
         {L"Most renowned ashes at once", L"With Several ashes at once: how many renowned spirit ashes (upgraded with Ghost Glovewort, like the Mimic Tear or Black Knife Tiche) can be out together. Summoning one more dismisses one of them with a short fade; regular ashes stay. 0 = no limit."},
-        {L"Torrent anywhere (beta)", L"BETA: The Spectral Steed Whistle also works where the game forbids riding: legacy dungeons, caves, catacombs, indoors and boss arenas. Torrent still needs room to appear and ground to stand on. Scripted scenes may not expect Torrent: turn it off if one goes wrong. Applies at once."},
-        {L"Great Rune without Rune Arc (beta)", L"BETA: Your equipped Great Rune works all the time, as if you had used a Rune Arc, and comes back by itself after you die. Change Great Runes at a Site of Grace as usual. The game keeps the Rune Arc state in the save; turning this off takes back only what this option set, so a Rune Arc used meanwhile is lost too. Applies within a second."},
-        {L"Item pickup radius (%) (beta)", L"BETA: How far away you can pick up items, loot corpses, gather materials and retrieve your lost runes: 300% is three times as far. Chests, doors, levers, graces and talking keep their reach. Applies at once."},
+        {L"Torrent anywhere", L"The Spectral Steed Whistle also works where the game forbids riding: legacy dungeons, caves, catacombs, indoors and boss arenas. Torrent still needs room to appear and ground to stand on. Scripted scenes may not expect Torrent: turn it off if one goes wrong. Applies at once."},
+        {L"Great Rune without Rune Arc", L"Your equipped Great Rune works all the time, as if you had used a Rune Arc, and comes back by itself after you die. Change Great Runes at a Site of Grace as usual. The game keeps the Rune Arc state in the save; turning this off takes back only what this option set, so a Rune Arc used meanwhile is lost too. Applies within a second."},
+        {L"Item pickup radius (%)", L"How far away you can pick up items, loot corpses, gather materials and retrieve your lost runes: 300% is three times as far. Chests, doors, levers, graces and talking keep their reach. Applies at once."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -11846,7 +12641,7 @@ const Texts kSpanish{
         {L"HUD hasta los bordes", L"En pantallas más anchas que 16:9, lleva las barras, el equipo, las runas y los demás elementos de las esquinas hasta los bordes de la pantalla. Úsalo con Permitir ultrapanorámico. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar. Desactívalo si otro mod ya coloca el HUD para ultrapanorámico."},
         {L"Escala del HUD (%)", L"Cambia el tamaño de las barras, el equipo, la brújula, las barras de jefe, las runas y los demás elementos de las esquinas, cada uno desde su esquina. Reinicia el juego para aplicarlo: carga el HUD una sola vez al arrancar."},
         {L"Menús hasta los bordes", L"En pantallas más anchas que 16:9, lleva el menú de pausa y los demás menús (equipo, inventario, estado, tiendas, subir de nivel, hechizos, cofre, opciones, pantallas de carga y de título) hasta los bordes y ensancha sus fondos. Reinicia el juego para aplicarlo: carga los menús una sola vez al arrancar. Desactívalo si otro mod sustituye estos menús."},
-        {L"Los enemigos no reaparecen (beta)", L"BETA: Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos. Activarla o desactivarla durante la partida empieza la lista de cero (la anterior se guarda como .bak), así que solo cuentan los enemigos que matas con ella activa; si está activa desde que arranca el juego, la lista se conserva entre sesiones."},
+        {L"Los enemigos no reaparecen", L"Los enemigos que matas siguen muertos tras descansar en una gracia, pasar el tiempo, morir, viajar rápido o cargar la partida. Cada partida guarda su lista en DLLs\\NativeTweaks\\dead-enemies; un enemigo que vuelve a cargarse desaparece al momento: sin cuerpo, runas ni botín. Los jefes y los PNJ funcionan como siempre, y los que siguen vivos se reinician como siempre. Al desactivarla, el siguiente descanso los devuelve a todos. Activarla o desactivarla durante la partida empieza la lista de cero (la anterior se guarda como .bak), así que solo cuentan los enemigos que matas con ella activa; si está activa desde que arranca el juego, la lista se conserva entre sesiones."},
         {L"Preguntas Sí/No empiezan en Sí (beta)", L"BETA: las preguntas Sí/No se abren con el cursor en Sí en vez de en No: viajar, salir, usar un objeto, etc.; con el ratón, el puntero también se coloca sobre Sí. Afecta a todas las preguntas Sí/No, también a las arriesgadas, así que comprueba antes de confirmar. Las demás ventanas, como las de cantidad de objetos, no cambian."},
         {L"Golpear enemigos derribados", L"Como en Nightreign, los enemigos que caen al suelo por un golpe crítico o un contraataque reciben daño mientras están tendidos y al levantarse. A cambio tienen superarmadura, así que tus golpes no los vuelven a aturdir, pero sí dañan su postura. Las cenizas espirituales también pueden golpearlos durante el crítico. Tú sigues protegido cuando un enemigo te agarra."},
         {L"Velocidad de salto de Torrent (%)", L"Escala la velocidad de animación de Torrent en los saltos y dobles saltos, también en los de los manantiales espirituales. Al 100 % el doble salto sale tan fácil como en el juego base, aunque la carrera vaya más rápida. Se aplica al momento."},
@@ -11911,14 +12706,14 @@ const Texts kSpanish{
         {L"Velocidad de habilidades (%)", L"Tus habilidades de arma (cenizas de guerra y habilidades únicas). Usan esto en lugar de la velocidad de ataque, así que los ataques normales mantienen la suya. Se multiplica por la velocidad general."},
         {L"Aura curativa (PV/s)", L"El aura del Vestido del lecho de muerte sin llevarlo, y más fuerte: tú y los aliados a menos de 7 m, cenizas de espíritu incluidas, recuperáis estos PV cada segundo. El vestido solo da 2 PV/s a los aliados y nada a quien lo lleva. Con 0 se apaga. Se aplica en un segundo."},
         {L"Materiales obtenidos (%)", L"Cuántos materiales de fabricación consigues de cada punto de recolección, cadáver, cofre y botín de enemigos: con 200% el doble. Solo los materiales que usan las recetas. La tasa de botín cambia cada cuánto sueltan cosas los enemigos. Se aplica a la siguiente recogida."},
-        {L"Fabricar en combate (beta)", L"BETA: Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
+        {L"Fabricar en combate", L"Fabricación de objetos sigue disponible en el menú mientras luchas contra enemigos, igual que fuera de combate. Se aplica al momento."},
         {L"Mapa en combate", L"El mapa se abre mientras luchas contra enemigos y no se cierra cuando empieza un combate. El viaje rápido sigue las reglas del juego (o Viaje rápido en cualquier sitio). Se aplica al momento."},
-        {L"Distancia de persecución (%) (beta)", L"BETA: Hasta dónde te siguen los enemigos lejos de su sitio antes de rendirse y volver: al 300 % llegan tres veces más lejos. Siguen parándose donde no pueden caminar (entradas de cuevas, acantilados, el borde de su zona). Para asegurarte de que se aplica, descansa en un lugar de gracia o recarga la zona tras cambiarla."},
+        {L"Distancia de persecución (%)", L"Hasta dónde te siguen los enemigos lejos de su sitio antes de rendirse y volver: al 300 % llegan tres veces más lejos. También te siguen la pista ese tanto más tiempo cuando te pierden de vista, para que no se rindan a mitad; lo lejos que te ven y te oyen no cambia. Siguen parándose donde no pueden caminar (entradas de cuevas, acantilados, el borde de su zona). Para asegurarte de que se aplica, descansa en un lugar de gracia o recarga la zona tras cambiarla."},
         {L"Máximo de cenizas normales", L"Con «Varias cenizas a la vez»: cuántas cenizas normales (las que se mejoran con Hierba sepulcral) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las renombradas se quedan. 0 = sin límite."},
         {L"Máximo de cenizas renombradas", L"Con «Varias cenizas a la vez»: cuántas cenizas renombradas (las que se mejoran con Hierba sepulcral fantasmal, como el Espejismo o Tiche) puede haber a la vez. Al invocar una más, una de ellas se retira con un desvanecimiento corto; las normales se quedan. 0 = sin límite."},
-        {L"Torrent en cualquier sitio (beta)", L"BETA: El Silbato del corcel espectral también funciona donde el juego no deja montar: mazmorras legendarias, cuevas, catacumbas, interiores y arenas de jefes. Torrent sigue necesitando sitio para aparecer y suelo donde ponerse. Las escenas con guion pueden no contar con Torrent: apágalo si alguna falla. Se aplica al momento."},
-        {L"Gran runa sin Arco rúnico (beta)", L"BETA: Tu Gran runa equipada funciona siempre, como si hubieras usado un Arco rúnico, y vuelve sola después de morir. Cambia de Gran runa en un lugar de gracia como siempre. El juego guarda el estado del Arco rúnico en la partida; al apagarla solo se quita lo que puso esta opción, así que también se pierde un Arco rúnico usado mientras tanto. Se aplica en un segundo."},
-        {L"Radio para recoger objetos (%) (beta)", L"BETA: Desde cuán lejos puedes recoger objetos, saquear cadáveres, recolectar materiales y recuperar tus runas perdidas: al 300 % el triple. Cofres, puertas, palancas, gracias y conversaciones mantienen su alcance. Se aplica al momento."},
+        {L"Torrent en cualquier sitio", L"El Silbato del corcel espectral también funciona donde el juego no deja montar: mazmorras legendarias, cuevas, catacumbas, interiores y arenas de jefes. Torrent sigue necesitando sitio para aparecer y suelo donde ponerse. Las escenas con guion pueden no contar con Torrent: apágalo si alguna falla. Se aplica al momento."},
+        {L"Gran runa sin Arco rúnico", L"Tu Gran runa equipada funciona siempre, como si hubieras usado un Arco rúnico, y vuelve sola después de morir. Cambia de Gran runa en un lugar de gracia como siempre. El juego guarda el estado del Arco rúnico en la partida; al apagarla solo se quita lo que puso esta opción, así que también se pierde un Arco rúnico usado mientras tanto. Se aplica en un segundo."},
+        {L"Radio para recoger objetos (%)", L"Desde cuán lejos puedes recoger objetos, saquear cadáveres, recolectar materiales y recuperar tus runas perdidas: al 300 % el triple. Cofres, puertas, palancas, gracias y conversaciones mantienen su alcance. Se aplica al momento."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -12079,7 +12874,7 @@ const Texts kChinese{
         {L"HUD 延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将血条、装备、卢恩和其他角落元素移到屏幕边缘。请与“允许超宽屏”一起使用。需重启游戏才能生效：游戏只在启动时加载一次 HUD。如果其他模组已为超宽屏调整 HUD，请关闭此项。"},
         {L"HUD 缩放 (%)", L"调整血条、装备、指南针、头目血条、卢恩和其他角落元素的大小，每个元素以其所在角落为基准缩放。需重启游戏才能生效：游戏只在启动时加载一次 HUD。"},
         {L"菜单延伸至屏幕边缘", L"在宽于 16:9 的屏幕上，将暂停菜单和其他菜单（装备、物品栏、状态、商店、升级、法术、仓库、选项、读取画面和标题画面）移到屏幕边缘，并加宽其背景。需重启游戏才能生效：游戏只在启动时加载一次菜单。如果其他模组替换了这些菜单，请关闭此项。"},
-        {L"敌人不再复活（测试版）", L"测试版：被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活。在游戏中开启或关闭此选项会让该存档的名单重新开始（旧名单保存为 .bak），因此只计算开启期间击杀的敌人；若从游戏启动时就已开启，名单会在多次游玩之间保留。"},
+        {L"敌人不再复活", L"被你击杀的敌人在赐福处休息、等待时间流逝、死亡、快速传送或读取存档后仍保持死亡。每个存档的名单保存在 DLLs\\NativeTweaks\\dead-enemies；再次加载的敌人会立即消失：没有尸体，不给予卢恩和掉落物。头目和 NPC 照常运作，仍然存活的敌人也会照常重置。关闭后，下一次休息会让所有敌人复活。在游戏中开启或关闭此选项会让该存档的名单重新开始（旧名单保存为 .bak），因此只计算开启期间击杀的敌人；若从游戏启动时就已开启，名单会在多次游玩之间保留。"},
         {L"是/否询问默认选“是”（测试版）", L"测试版：是/否询问打开时光标位于“是”而不是“否”：传送、退出、使用物品等；使用鼠标时，指针也会移到“是”上。对所有是/否询问生效，包括有风险的操作，确认前请看清楚。其他窗口（如物品数量）不变。"},
         {L"可攻击倒地敌人", L"与《艾尔登法环 黑夜君临》相同，被致命一击或弹反后处决击倒在地的敌人，在倒地和起身期间会受到伤害。作为代价，敌人获得霸体，你的攻击不会再次使其硬直，但仍会削减其架势。致命一击期间，骨灰也能攻击它们。敌人抓住你时，你仍受保护。"},
         {L"灵马跳跃速度 (%)", L"缩放灵马跳跃和二段跳时的动作速度，包括借助上升气流的大跳跃。保持 100% 时，即使奔跑速度更快，二段跳也和原版一样容易。立即生效。"},
@@ -12144,14 +12939,14 @@ const Texts kChinese{
         {L"战技速度 (%)", L"你的武器战技（战灰与专属战技）。它们使用此项而不是攻击速度，普通攻击保持各自的速度。与整体速度相乘。"},
         {L"治愈光环（HP/秒）", L"无需穿着即可获得更强的临终礼服光环：你和 7 米内的同伴（包括骨灰）每秒恢复这么多血量。礼服本身只为同伴每秒恢复 2 点，不会治疗穿着者。设为 0 关闭。约一秒内生效。"},
         {L"获得材料 (%)", L"每个采集点、尸体、宝箱和敌人掉落给你的制作材料数量：200% 为两倍。仅限制作配方使用的材料。物品掉落率决定敌人掉落的频率。下次拾取时生效。"},
-        {L"战斗中制作（测试版）", L"测试版：与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
+        {L"战斗中制作", L"与敌人战斗时，菜单中的物品制作仍然可用，与战斗外一样。立即生效。"},
         {L"战斗中查看地图", L"与敌人战斗时也能打开地图，战斗开始时地图也不会关闭。快速传送仍遵循游戏规则（或随处快速传送）。立即生效。"},
-        {L"敌人追击距离（%）（测试版）", L"测试版：敌人离开原位追击你多远才会放弃并返回：300% 即三倍距离。它们仍会在无法行走的地方停下（洞口、悬崖、区域边缘）。更改后在赐福处休息或重新载入区域以确保生效。"},
+        {L"敌人追击距离（%）", L"敌人离开原位追击你多远才会放弃并返回：300% 即三倍距离。失去视线后它们也会按同样比例更久地记住你，不会中途放弃；视觉和听觉范围不变。它们仍会在无法行走的地方停下（洞口、悬崖、区域边缘）。更改后在赐福处休息或重新载入区域以确保生效。"},
         {L"普通骨灰同时上限", L"开启“同时召唤多个骨灰”时：普通骨灰（用坟地钟形花强化）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；名人骨灰不受影响。0 = 无上限。"},
         {L"名人骨灰同时上限", L"开启“同时召唤多个骨灰”时：名人骨灰（用灵魂坟地钟形花强化，如仿身泪滴、黑刀蒂秋）同时最多存在的数量。再召唤一个时，其中一个会短暂淡出离开；普通骨灰不受影响。0 = 无上限。"},
-        {L"随处召唤托雷特（测试版）", L"测试版：灵马哨笛在游戏禁止骑马的地方也能使用：传说地下城、洞窟、地下墓地、室内和头目战场地。托雷特仍需要足够的空间出现和可站立的地面。剧情场景可能不适应托雷特：如果出错请关闭。立即生效。"},
-        {L"无需卢恩弧的大卢恩（测试版）", L"测试版：装备的大卢恩一直生效，就像使用了卢恩弧，死亡后也会自动恢复。照常在赐福处更换大卢恩。游戏会在存档中保存卢恩弧状态；关闭时只撤销本选项设置的状态，因此期间使用的卢恩弧也会失去。约一秒内生效。"},
-        {L"拾取范围 (%)（测试版）", L"测试版：可以从多远拾取物品、搜刮尸体、采集材料和取回遗失的卢恩：300% 为三倍距离。宝箱、门、拉杆、赐福和对话保持原有范围。立即生效。"},
+        {L"随处召唤托雷特", L"灵马哨笛在游戏禁止骑马的地方也能使用：传说地下城、洞窟、地下墓地、室内和头目战场地。托雷特仍需要足够的空间出现和可站立的地面。剧情场景可能不适应托雷特：如果出错请关闭。立即生效。"},
+        {L"无需卢恩弧的大卢恩", L"装备的大卢恩一直生效，就像使用了卢恩弧，死亡后也会自动恢复。照常在赐福处更换大卢恩。游戏会在存档中保存卢恩弧状态；关闭时只撤销本选项设置的状态，因此期间使用的卢恩弧也会失去。约一秒内生效。"},
+        {L"拾取范围 (%)", L"可以从多远拾取物品、搜刮尸体、采集材料和取回遗失的卢恩：300% 为三倍距离。宝箱、门、拉杆、赐福和对话保持原有范围。立即生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -13003,6 +13798,20 @@ int audit(LogFn log_fn) noexcept {
         log(L"Vanilla site 'status immunity' not found (or ambiguous); the option would use the buildup hold.");
     }
     resolve_chr_enable();
+    {
+        // Enemies stay dead hides listed enemies inside this step (r161); in
+        // the game its function pointer is then found in WorldChrMan.
+        std::int32_t state_offset{};
+        const std::uint8_t* step = find_respawn_step(state_offset);
+        wchar_t message[160]{};
+        if (step)
+            swprintf_s(message, L"Vanilla site 'respawn step' found at eldenring.exe+0x%llX (state +0x%X).",
+                static_cast<unsigned long long>(step - reinterpret_cast<std::uint8_t*>(game::image())),
+                static_cast<unsigned>(state_offset));
+        else
+            swprintf_s(message, L"Vanilla site 'respawn step' not found (or ambiguous).");
+        log(message);
+    }
     if (const std::uint8_t* toughness_site = find_unique(parse_pattern(kToughnessPattern))) {
         wchar_t message[128]{};
         swprintf_s(message, L"Vanilla site 'toughness' found at eldenring.exe+0x%llX.",
@@ -13020,6 +13829,20 @@ int audit(LogFn log_fn) noexcept {
                 static_cast<unsigned long long>(found + site.offset - reinterpret_cast<std::uint8_t*>(game::image())));
         else
             swprintf_s(message, L"Vanilla site 'lock-on range %S' not found (or ambiguous).", site.name);
+        log(message);
+    }
+    {
+        const ExitGuardSites guard = find_exit_guard_sites();
+        const auto* image = reinterpret_cast<std::uint8_t*>(game::image());
+        wchar_t message[200]{};
+        if (guard.aligned_free && guard.shutdown_call)
+            swprintf_s(message, L"Vanilla site 'exit free guard' found: _aligned_free at eldenring.exe+0x%llX, "
+                L"shutdown call returns to +0x%llX.",
+                static_cast<unsigned long long>(guard.aligned_free - image),
+                static_cast<unsigned long long>(guard.shutdown_call + 5 - image));
+        else
+            swprintf_s(message, L"Vanilla site 'exit free guard' not found (_aligned_free %ls, shutdown call %ls).",
+                guard.aligned_free ? L"found" : L"missing", guard.shutdown_call ? L"found" : L"missing");
         log(message);
     }
     // The write used for hooks turned on mid-game (other threads suspended),
@@ -13119,6 +13942,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     send_hud_layout(L"startup");
     // From here on, hooks turned on from the menu are written frozen.
     g_freeze_writes.store(true, std::memory_order_release);
+    install_exit_free_guard();
     start_thread(&game_thread_probe_worker, L"game thread probe");
     if (!g_config_path.empty()) {
         g_save_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
