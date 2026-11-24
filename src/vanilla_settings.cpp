@@ -15,6 +15,7 @@
 
 #include "game_memory.hpp"
 #include "hotkeys.hpp"
+#include "item_shop_ids.hpp"
 #include "live_text.hpp"
 #include "perf_log.hpp"
 #include "spirit_ashes.hpp"
@@ -285,6 +286,9 @@ struct Site {
     std::uint8_t* address{};
     std::vector<std::uint8_t> original{};
     bool ready{};
+    // Shared with other mods (see make_call_stub): bytes that are neither the
+    // original nor ours belong to another mod and are left alone.
+    bool shared{};
 };
 
 Site g_camera_rotate{L"camera auto-rotate",
@@ -442,6 +446,17 @@ Site g_map_combat_open{L"map in combat (open)",
 Site g_map_combat_close{L"map in combat (close)",
     "48 8b 0d ? ? ? ? e8 ? ? ? ? 84 c0 75 ? 38 83 ? ? ? ? 75 ? 83 e6 fe",
     0x07, "e8 ? ? ? ?", {0x31, 0xC0, 0x90, 0x90, 0x90}};
+// Erd-Tools 1.4 (ErdTools.dll, in The Convergence and other packs) looks for
+// the crafting kit's test and the map's close check by patterns that include
+// the call's E8 byte ("... E8 ?? ?? ?? ?? 84 C0 0F 94 C0 ..." and "E8 ?? ??
+// ?? ?? 84 C0 75 ?? 38 83 ..."), about 5 s after the game starts, and writes
+// to the address it found without checking it: with our xor eax,eax there it
+// found nothing and the game crashed (ErdTools.dll+0x2DE4 reading 0x4,
+// r162-test2 with Convergence 3.0.4 and CraftInCombat=1). The four combat
+// sites keep the E8 and only change its target, to a stub that returns 0
+// ("not in combat"; make_call_stub), so those patterns still match; when
+// Erd-Tools then writes its own bytes there, they are left alone.
+Site* const kCombatSites[]{&g_craft_combat, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close};
 
 // Torrent anywhere (r160, user request). Where riding is forbidden comes from
 // the map files (collision parts and DisableHorseOverride regions), not the
@@ -503,6 +518,13 @@ void resolve(Site& site) noexcept {
 bool set_bytes(Site& site, const std::vector<std::uint8_t>& bytes) noexcept {
     if (!site.ready || bytes.size() != site.original.size()) return false;
     if (std::memcmp(site.address, bytes.data(), bytes.size()) == 0) return true;
+    if (site.shared && std::memcmp(site.address, site.original.data(), bytes.size()) != 0 &&
+        std::memcmp(site.address, site.replacement.data(), bytes.size()) != 0) {
+        wchar_t message[200]{};
+        swprintf_s(message, L"Vanilla site '%ls' was patched by another mod; left as it is.", site.name);
+        log(message);
+        return false;
+    }
     return write_code(site.address, bytes.data(), bytes.size());
 }
 
@@ -1496,6 +1518,32 @@ std::uint8_t* alloc_near(const std::uint8_t* target) noexcept {
         address = base + region.RegionSize;
     }
     return nullptr;
+}
+
+// The combat sites' replacement (see kCombatSites): "call stub" in place of
+// "call IsInCombat", the stub being xor eax,eax; ret near the game code.
+// Without that memory the old xor eax,eax stays as the replacement.
+void make_call_stub(Site& site) noexcept {
+    static std::uint8_t* stub{};
+    if (!site.ready || site.replacement.size() != 5) return;
+    if (!stub) {
+        stub = alloc_near(site.address);
+        if (!stub) {
+            log(L"Combat sites: no memory near the game code; plain patch kept.");
+            return;
+        }
+        const std::uint8_t code[]{0x31, 0xC0, 0xC3};  // xor eax,eax; ret
+        std::memcpy(stub, code, sizeof(code));
+        FlushInstructionCache(GetCurrentProcess(), stub, sizeof(code));
+    }
+    const std::intptr_t disp =
+        reinterpret_cast<std::intptr_t>(stub) - reinterpret_cast<std::intptr_t>(site.address + 5);
+    if (disp < INT32_MIN || disp > INT32_MAX) return;
+    const auto rel = static_cast<std::int32_t>(disp);
+    std::vector<std::uint8_t> call(5, 0xE8);
+    std::memcpy(call.data() + 1, &rel, 4);
+    site.replacement = call;
+    site.shared = true;
 }
 
 // Yes/No questions start on Yes. A message box takes its first selected button
@@ -6027,8 +6075,12 @@ constexpr ShopGroupDef kShopGroups[]{
     {sec_key, {L"Tutorials", L"Tutoriales", L"教学"}},
     // 81 the Tarnished Edition's own items, in their own shop (user, r157-test26)
     {sec_tarnished, {L"Tarnished Edition", L"Tarnished Edition", L"褪色者版"}},
+    // 82 weapon types the game does not have, given by an overhaul (r162:
+    // Reforged files some vanilla weapons as types 27 and 59)
+    {sec_weapons, {L"Other weapons", L"Otras armas", L"其他武器"}},
 };
 constexpr int kShopTarnished = 81;
+constexpr int kShopOtherWeapons = 82;
 constexpr int kShopGroupCount = static_cast<int>(sizeof(kShopGroups) / sizeof(kShopGroups[0]));
 // wepType of groups 0-45 (EquipParamWeapon +0x1A6), in group order
 constexpr std::uint16_t kShopWeaponTypes[46]{
@@ -6036,7 +6088,22 @@ constexpr std::uint16_t kShopWeaponTypes[46]{
     50, 51, 53, 55, 56, 65, 67, 69, 90, 57, 61, 81, 83, 85, 86};
 constexpr int kShopArmour = 46, kShopTalismans = 47, kShopSpirits = 48, kShopSorceries = 49,
     kShopIncantations = 50, kShopGems = 51;
-constexpr std::int32_t kShopRange = 4000;  // rows per shop (section x 2 + DLC)
+constexpr std::int32_t kShopRange = 4000;  // rows per shop (section x 3 + part)
+// Parts of a section, one shop each: base game, Shadow of the Erdtree, and
+// the items an overhaul or other mod adds (r162: ids that the vanilla
+// regulation does not have; Reforged, Convergence or any other).
+constexpr int kShopBase = 0, kShopDlc = 1, kShopMod = 2, kShopParts = 3;
+
+// The vanilla regulation's item ids: item_shop_ids.hpp.
+
+// Which overhaul the mod items come from, for the name of their section.
+// Not by folder names: reforged.dll is loaded, or the regulation has the
+// shape only that overhaul gives it (r162 analysis of ERR 2.3.9.1 and The
+// Convergence 3.0.4: Reforged's spirit ashes are pairs, the ash and its used
+// form, linked by replaceItemId; Convergence gives runes and remembrances
+// goods types 100 and 101 of its own). Anything else: "Mod items".
+enum ShopOverhaul : int { overhaul_none, overhaul_reforged, overhaul_convergence };
+int g_shop_overhaul = overhaul_none;
 
 int shop_goods_group(std::uint8_t type, std::uint8_t sort_group, const std::wstring& name) noexcept {
     switch (type) {
@@ -6085,7 +6152,9 @@ int shop_goods_group(std::uint8_t type, std::uint8_t sort_group, const std::wstr
         case 120: case 125: case 250: case 255: return -1;  // multiplayer items and gestures
         default: return 59;
         }
-    default: return -1;
+    // Types the game does not have (r162: Convergence files runes and
+    // remembrances as 100 and 101) go by their sort group, as normal items.
+    default: return type > 18 ? shop_goods_group(0, sort_group, name) : -1;
     }
 }
 
@@ -6093,9 +6162,9 @@ struct ItemShopState {
     bool attempted{};
     bool ready{};
     int tries{};
-    std::int32_t first[sec_count][2]{};  // one shop per section and base / DLC
-    std::int32_t count[sec_count][2]{};  // rows, gaps included
-    std::int32_t items[sec_count][2]{};  // items only
+    std::int32_t first[sec_count][kShopParts]{};  // one shop per section and base / DLC / mod
+    std::int32_t count[sec_count][kShopParts]{};  // rows, gaps included
+    std::int32_t items[sec_count][kShopParts]{};  // items only
 };
 ItemShopState g_item_shop{};
 void register_item_shop_talk() noexcept;
@@ -6200,6 +6269,7 @@ struct ShopItem {
     std::int32_t header;  // -1, or the group whose title this row shows
     std::int32_t sell{};
     std::uint8_t max_level{};
+    std::uint8_t level_step{1};
 };
 // Group titles in the shop: a row of a harmless note (Note: Hidden Cave,
 // goods 8700) whose nameMsgId is kShopHeaderMsg + group, at a price no one
@@ -6210,13 +6280,14 @@ constexpr std::int32_t kShopHeaderMsg = 1992000000;
 constexpr std::int32_t kShopHeaderPrice = 999999999;
 struct ShopPending {
     int group;
-    int dlc;  // 0 base game, 1 Shadow of the Erdtree
+    int dlc;  // part: 0 base game, 1 Shadow of the Erdtree, 2 mod items
     std::int32_t equip_id;
     std::uint8_t equip_type;
     std::int32_t price;
     std::uintptr_t row;  // the item's EquipParam row
     std::uint8_t max_level;  // weapons 0/10/25, spirit ashes 0-10
     int kind;  // the group it would have outside Tarnished Edition (same as group there)
+    std::uint8_t level_step{1};  // spirit ashes: id distance between levels (Reforged: 2)
 };
 // Our shop rows, to set level and price when a shop opens (options
 // ItemShopWeaponLevel / ItemShopSpiritLevel / ItemShopPricePercent).
@@ -6226,8 +6297,9 @@ struct ShopRowRef {
     std::int32_t sell;        // its sell value
     std::uint8_t kind;        // 0 other, 1 weapon, 2 spirit ash
     std::uint8_t max_level;
+    std::uint8_t level_step{1};
 };
-std::vector<ShopRowRef> g_shop_rows[sec_count][2];
+std::vector<ShopRowRef> g_shop_rows[sec_count][kShopParts];
 
 // Armour sets one per line (user, r157-test16): the shop starts a new line
 // whenever sortGroupId changes and orders by sortId, so while one of our
@@ -6251,7 +6323,7 @@ struct ArmourLayoutCell {
 // ashes FP-cost then HP-cost, cheapest first; sorceries and incantations
 // attack then support. Talismans, consumables and materials keep the
 // game's own groups.
-std::vector<ArmourLayoutCell> g_shop_layout[sec_count][2];
+std::vector<ArmourLayoutCell> g_shop_layout[sec_count][kShopParts];
 std::atomic<bool> g_armour_layout_applied{false};
 std::atomic<int> g_armour_layout_generation{0};
 
@@ -6744,7 +6816,7 @@ void sync_item_shop() noexcept {
     const int owns_tarnished = steam_dlc_owned(kSteamTarnishedPack);
     std::size_t skipped_dlc = 0;
     std::wstring name;
-    std::unordered_set<std::wstring> seen_names[sec_count][2];
+    std::unordered_set<std::wstring> seen_names[sec_count][kShopParts];
     // The shop hides a row that costs less than the item sells for
     // (sellValue; the r154 Shop prices finding), so each row costs exactly
     // that: the least the game shows. Items that cannot be sold stay free.
@@ -6752,9 +6824,15 @@ void sync_item_shop() noexcept {
                          std::size_t sell_offset) {
         if (group < 0 || group >= kShopGroupCount) return;
         const int kind = group;
-        const bool tarnished = (type == 0 && in_list(kTarnishedWeapons, equip_id)) ||
-            (type == 1 && in_list(kTarnishedArmour, equip_id)) || (type == 3 && in_list(kTarnishedGoods, equip_id));
-        if (tarnished) {
+        // An id the vanilla regulation does not have: the mod part of its
+        // section, whatever text category names it (r162). Vanilla ids an
+        // overhaul changes stay where the game's own items are.
+        const bool vanilla = item_shop_ids::vanilla_item(type, equip_id);
+        const bool tarnished = vanilla && ((type == 0 && in_list(kTarnishedWeapons, equip_id)) ||
+            (type == 1 && in_list(kTarnishedArmour, equip_id)) || (type == 3 && in_list(kTarnishedGoods, equip_id)));
+        if (!vanilla) {
+            dlc = kShopMod;
+        } else if (tarnished) {
             if (owns_tarnished != 1) { ++skipped_dlc; return; }
             group = kShopTarnished;
             dlc = 0;
@@ -6764,7 +6842,8 @@ void sync_item_shop() noexcept {
         }
         // never the same name twice in one shop (r157-test23: Winged
         // Misbegotten Ashes + 1..+10 next to the base ash)
-        if (!seen_names[kShopGroups[group].section][dlc == 1 ? 1 : 0].insert(name).second) return;
+        if (dlc < kShopBase || dlc >= kShopParts) dlc = kShopBase;
+        if (!seen_names[kShopGroups[group].section][dlc].insert(name).second) return;
         std::int32_t sell{};
         if (!game::read(row + sell_offset, sell) || sell < 0) sell = 0;
         pending.push_back({group, dlc, equip_id, type, sell, row, 0, kind});
@@ -6778,6 +6857,10 @@ void sync_item_shop() noexcept {
     // 1 goods, 2 weapon (stored without affinity and level), 3 armour,
     // 4 talisman, 5 Ash of War.
     std::unordered_set<std::int32_t> obtainable[6];
+    // Goods a CharaInitParam row starts with: a class's items count, but not
+    // for spirit ashes, which no class starts with; NPC rows list them, and
+    // Reforged's old ash ids, now "Depleted ...", are only there (r162).
+    std::unordered_set<std::int32_t> init_goods;
     {
         bool lots_ok = true;
         for (const wchar_t* lot : {L"ItemLotParam_map", L"ItemLotParam_enemy"}) {
@@ -6815,7 +6898,8 @@ void sync_item_shop() noexcept {
                 };
                 for (std::size_t o = 0x10; o <= 0x3C; o += 4) put(o >= 0x20 && o <= 0x2C ? 3 : 2, o);  // weapons, armour, arrows
                 for (std::size_t o = 0x40; o <= 0x4C; o += 4) put(4, o);  // talismans
-                for (std::size_t o = 0x60; o <= 0xA0; o += 4) put(1, o);  // spells and items
+                for (std::size_t o = 0x60; o <= 0xA0; o += 4)  // spells and items
+                    if (v[o / 4] > 0) init_goods.insert(v[o / 4]);
             }
         } else {
             lots_ok = false;
@@ -6838,6 +6922,7 @@ void sync_item_shop() noexcept {
         return true;
     };
     int found = 0;
+    int reforged_pairs = 0, convergence_types = 0;  // which overhaul (g_shop_overhaul)
     std::unordered_set<std::int32_t> reinforce_ids;
     std::unordered_map<std::int32_t, std::uintptr_t> goods_ids;  // id -> row
     each_row(L"ReinforceParamWeapon", 0x80, [&](std::int32_t id, std::uintptr_t) { reinforce_ids.insert(id); });
@@ -6857,6 +6942,7 @@ void sync_item_shop() noexcept {
         int group = -1;
         for (int g = 0; g < 46; ++g)
             if (kShopWeaponTypes[g] == type) group = g;
+        if (group < 0 && type != 0) group = kShopOtherWeapons;  // an overhaul's own type
         if (group >= 0 && item_name({115, 11, 310, 410}, id, name, &found)) {
             add(group, found - 1, id, 0, row, 0x20);
             if (!pending.empty() && pending.back().equip_id == id) pending.back().max_level = weapon_max_level(row);
@@ -6880,22 +6966,41 @@ void sync_item_shop() noexcept {
         std::int32_t replace_item{};
         if (!game::read(row + 0x3E, type) || !game::read(row + 0x72, sort_group) ||
             !game::read(row + 0x1C, replace_item)) return;
-        if (!obtainable[1].count(id) && type != 15) return;
+        const bool spirit = type == 7 || type == 8;
+        if (type == 100 || type == 101) ++convergence_types;
+        if (!obtainable[1].count(id) && type != 15 && (spirit || !init_goods.count(id))) return;
         if (!item_name({111, 10, 319, 419}, id, name, &found)) return;
         // No flasks (replaceItemId: full <-> empty): their charges belong to
         // the character, and a bought one became extra broken inventory
         // entries (r157-test11). Golden Seeds and Sacred Tears are sold.
-        if (replace_item != -1) return;
-        std::uint8_t spirit_max = 0;
-        if (type == 7 || type == 8) {
+        // Spirit ashes are sold even with one (r162): Reforged links each
+        // ash to its used form, which the ash turns into once summoned.
+        if (replace_item != -1 && !spirit) return;
+        std::uint8_t spirit_max = 0, spirit_step = 1;
+        if (spirit) {
             // one row per spirit ash: its upgrades are id + 1..10 (some
             // write "Name + 3", r157-test23: Winged Misbegotten Ashes)
             if (id % 100 != 0) return;
+            const auto spirit_row = [&](std::int32_t at) {
+                const auto it = goods_ids.find(at);
+                std::uint8_t t{};
+                return it != goods_ids.end() && game::read(it->second + 0x3E, t) && (t == 7 || t == 8);
+            };
+            // Reforged: id + 1 is the used form and the levels are id + 2,
+            // + 4 ... + 20, each with its own used form after it.
+            if (replace_item == id + 1 && goods_ids.count(id + 1) && !spirit_row(id + 1) && spirit_row(id + 2)) {
+                spirit_step = 2;
+                ++reforged_pairs;
+            }
             for (int l = 1; l <= 10; ++l)
-                if (goods_ids.count(id + l)) spirit_max = static_cast<std::uint8_t>(l);
+                if (spirit_step == 1 ? goods_ids.count(id + l) != 0 : spirit_row(id + 2 * l))
+                    spirit_max = static_cast<std::uint8_t>(l);
         }
         add(shop_goods_group(type, sort_group, name), found - 1, id, 3, row, 0x14);
-        if (!pending.empty() && pending.back().equip_id == id) pending.back().max_level = spirit_max;
+        if (!pending.empty() && pending.back().equip_id == id) {
+            pending.back().max_level = spirit_max;
+            pending.back().level_step = spirit_step;
+        }
     });
     ok = ok && each_row(L"EquipParamGem", 0x60, [&](std::int32_t id, std::uintptr_t row) {
         if (id > 0 && obtainable[5].count(id) && item_name({35, 322, 422}, id, name, &found))
@@ -6917,13 +7022,13 @@ void sync_item_shop() noexcept {
     // the rest (altered versions, partial sets, single pieces), each part in
     // id order; one sortGroupId per set (user, r157-test20). The game keeps
     // no "when you get it" order, so that is not possible.
-    for (auto& section_rows : g_shop_rows) section_rows[0].clear(), section_rows[1].clear();
-    for (int s = 0; s < sec_count; ++s) g_shop_layout[s][0].clear(), g_shop_layout[s][1].clear();
+    for (auto& section_rows : g_shop_rows) for (auto& part : section_rows) part.clear();
+    for (auto& section_layout : g_shop_layout) for (auto& part : section_layout) part.clear();
     // Tarnished Edition items keep the layout of their kind (user, 14-11):
     // armour by set, weapons by type, in the Tarnished Edition shop.
     const auto kind_section = [](const ShopPending& p) { return kShopGroups[p.kind].section; };
     for (const int target : {static_cast<int>(sec_armour), static_cast<int>(sec_tarnished)})
-    for (int d = 0; d < 2; ++d) {
+    for (int d = 0; d < kShopParts; ++d) {
         struct Piece { std::uintptr_t row; std::int32_t set; std::uint8_t slot; std::int32_t sort_id; std::uint8_t sort_group; };
         std::vector<Piece> pieces;
         std::map<std::int32_t, std::uint8_t> slots_of_set;  // set -> bit per slot
@@ -6947,7 +7052,7 @@ void sync_item_shop() noexcept {
         }
     }
     {
-        std::int32_t spirit_rank[2]{};
+        std::int32_t spirit_rank[kShopParts]{};
         for (const ShopPending& p : pending) {
             const int target = kShopGroups[p.group].section;  // the shop it is in
             const int s = kind_section(p);                    // how it is laid out
@@ -6977,7 +7082,7 @@ void sync_item_shop() noexcept {
                     static_cast<std::uint8_t>(hp_cost ? 2 : 1), sort_id, sort_group, 0xFF, 0x20, 0x72});
                 // the upgraded rows (+1..+10) have their own goods rows: same place
                 for (int l = 1; l <= p.max_level; ++l) {
-                    const auto it = goods_ids.find(p.equip_id + l);
+                    const auto it = goods_ids.find(p.equip_id + l * p.level_step);
                     std::int32_t sid{};
                     std::uint8_t sgr{};
                     if (it == goods_ids.end() || !game::read(it->second + 0x20, sid) || !game::read(it->second + 0x72, sgr)) continue;
@@ -6996,21 +7101,21 @@ void sync_item_shop() noexcept {
     }
     std::vector<ShopItem> items;
     items.reserve(pending.size() + 600);
-    std::int32_t counts[sec_count][2]{};
-    std::int32_t item_counts[sec_count][2]{};
-    int previous_group[sec_count][2];
-    for (auto& row : previous_group) row[0] = row[1] = -1;
+    std::int32_t counts[sec_count][kShopParts]{};
+    std::int32_t item_counts[sec_count][kShopParts]{};
+    int previous_group[sec_count][kShopParts];
+    for (auto& row : previous_group) for (int& g : row) g = -1;
     int groups_in_section[sec_count]{};
     for (int g = 0; g < kShopGroupCount; ++g) ++groups_in_section[kShopGroups[g].section];
     for (const ShopPending& p : pending) {
         const int s = kShopGroups[p.group].section;
         std::int32_t& n = counts[s][p.dlc];
-        const std::int32_t first = (s * 2 + p.dlc) * kShopRange;
+        const std::int32_t first = (s * kShopParts + p.dlc) * kShopRange;
         if (n >= kShopRange - 2) continue;
         // No titles (r157-test13: the shop sorts them into a goods group of
         // their own); with "item type" sorting the game separates groups.
         previous_group[s][p.dlc] = p.group;
-        items.push_back({first + n++, p.equip_id, p.equip_type, p.price, false, -1, p.price, p.max_level});
+        items.push_back({first + n++, p.equip_id, p.equip_type, p.price, false, -1, p.price, p.max_level, p.level_step});
         ++item_counts[s][p.dlc];
     }
 
@@ -7047,16 +7152,18 @@ void sync_item_shop() noexcept {
     // Our ids: above the table's highest one, on a round number.
     const std::int64_t highest = rows.back().id;
     const std::int64_t base64 = ((std::max<std::int64_t>(highest, 9999999) / 1000000) + 1) * 1000000;
-    if (base64 + kShopGroupCount * 2LL * kShopRange >= 0x7FFFFFFF) {
+    if (base64 + static_cast<std::int64_t>(sec_count) * kShopParts * kShopRange >= 0x7FFFFFFF) {
         state.attempted = true;
         log(L"Item shop: ShopLineupParam has no free ids; unavailable.");
         return;
     }
     const std::int32_t base = static_cast<std::int32_t>(base64);
     for (ShopItem& item : items) item.row_id += base;
-    std::int64_t name_offset = rows[0].name;
+    // Row names: vanilla and Reforged share one empty name; The Convergence
+    // names its rows (r162-test4: 1183 names after the type string). Either
+    // way they lie after the type string and are copied with it.
     for (const Row& r : rows) {
-        if (r.name != name_offset || r.data < static_cast<std::int64_t>(data_start) ||
+        if (r.name < static_cast<std::int64_t>(type_offset) || r.data < static_cast<std::int64_t>(data_start) ||
             r.data + 0x34 > static_cast<std::int64_t>(type_offset)) {
             state.attempted = true;
             log(L"Item shop: ShopLineupParam rows are not as expected; unavailable.");
@@ -7080,7 +7187,7 @@ void sync_item_shop() noexcept {
     const bool have_template = have[3];
     for (int i = 0; i < 5; ++i)
         if (!have[i]) std::memcpy(templ[i], templ[3], sizeof(templ[3]));
-    if (!have_template || name_offset < static_cast<std::int64_t>(type_offset)) {
+    if (!have_template) {
         state.attempted = true;
         log(L"Item shop: no template row in ShopLineupParam; unavailable.");
         return;
@@ -7097,7 +7204,10 @@ void sync_item_shop() noexcept {
     {
         const std::uintptr_t old_index = file + ((static_cast<std::uintptr_t>(old_size) + 0xF) & ~std::uintptr_t{0xF});
         std::uint32_t first[2]{}, last[2]{};
-        if (old_index_count != count || old_size < type_offset ||
+        bool names_inside = true;
+        for (const Row& r : rows)
+            if (static_cast<std::uint64_t>(r.name) + 2 > old_size) names_inside = false;
+        if (old_index_count != count || old_size < type_offset || !names_inside ||
             !game::safe_read(old_index, first, 8) || !game::safe_read(old_index + (count - 1) * 8ull, last, 8) ||
             static_cast<std::int32_t>(first[0]) != rows.front().id ||
             static_cast<std::int32_t>(last[0]) != rows.back().id) {
@@ -7107,12 +7217,14 @@ void sync_item_shop() noexcept {
         }
     }
     const std::uint64_t data_size = type_offset - data_start;
-    const std::uint64_t tail_size = static_cast<std::uint64_t>(name_offset) - type_offset + 4;
+    // The type string and the row names, as they are; then an empty name
+    // (4 zero bytes) for our rows.
+    const std::uint64_t tail_size = old_size - type_offset;
     const std::uint64_t new_count = count + items.size();
     const std::uint64_t new_data_start = 0x40 + new_count * 0x18;
     const std::uint64_t new_type_offset = new_data_start + data_size + items.size() * 0x34;
-    const std::uint64_t new_name_offset = new_type_offset + (name_offset - type_offset);
-    const std::uint64_t file_size = new_type_offset + tail_size;
+    const std::uint64_t new_name_offset = new_type_offset + tail_size;
+    const std::uint64_t file_size = new_name_offset + 4;
     const std::uint64_t index_offset = (file_size + 0xF) & ~std::uint64_t{0xF};
     const std::uint64_t total = 16 + index_offset + new_count * 8 + 16;
     auto* block = game_table_alloc(total, reinterpret_cast<const void*>(file - 16));
@@ -7134,7 +7246,7 @@ void sync_item_shop() noexcept {
         if (b >= items.size() || (a < rows.size() && rows[a].id < items[b].row_id)) {
             Row r = rows[a++];
             r.data = static_cast<std::int64_t>(r.data - data_start + new_data_start);
-            r.name = static_cast<std::int64_t>(new_name_offset);
+            r.name = static_cast<std::int64_t>(r.name - type_offset + new_type_offset);
             merged.push_back(r);
         } else {
             const ShopItem& item = items[b++];
@@ -7184,12 +7296,12 @@ void sync_item_shop() noexcept {
             merged.push_back({item.row_id, 0, static_cast<std::int64_t>(new_row_data), static_cast<std::int64_t>(new_name_offset)});
             if (!item.spacer && item.header < 0) {
                 const std::int32_t local = item.row_id - base;
-                const int s = local / (2 * kShopRange);
-                const int d = (local / kShopRange) % 2;
+                const int s = local / (kShopParts * kShopRange);
+                const int d = (local / kShopRange) % kShopParts;
                 if (s >= 0 && s < sec_count) {
                     // arrows and bolts stay at +0 (audit 2026-11-08)
                     const std::uint8_t kind = item.equip_type == 0 ? (ammo ? 0 : 1) : (s == sec_spirits ? 2 : 0);
-                    g_shop_rows[s][d].push_back({data, item.equip_id, item.sell, kind, item.max_level});
+                    g_shop_rows[s][d].push_back({data, item.equip_id, item.sell, kind, item.max_level, item.level_step});
                 }
             }
             new_row_data += 0x34;
@@ -7215,8 +7327,8 @@ void sync_item_shop() noexcept {
     // Point the holder at the new table (the old one stays allocated).
     if (!game::write<std::uintptr_t>(slot, reinterpret_cast<std::uintptr_t>(out))) {
         game_table_free(block);
-        for (auto& section_rows : g_shop_rows) section_rows[0].clear(), section_rows[1].clear();
-        for (auto& section_layout : g_shop_layout) section_layout[0].clear(), section_layout[1].clear();
+        for (auto& section_rows : g_shop_rows) for (auto& part : section_rows) part.clear();
+        for (auto& section_layout : g_shop_layout) for (auto& part : section_layout) part.clear();
         state.attempted = true;
         log(L"Item shop: ShopLineupParam could not be replaced; unavailable.");
         return;
@@ -7227,19 +7339,33 @@ void sync_item_shop() noexcept {
     g_shop_holder = slot;
     std::int32_t total_items = 0, shops = 0;
     for (int s = 0; s < sec_count; ++s)
-        for (int d = 0; d < 2; ++d) {
-            state.first[s][d] = base + (s * 2 + d) * kShopRange;
+        for (int d = 0; d < kShopParts; ++d) {
+            state.first[s][d] = base + (s * kShopParts + d) * kShopRange;
             state.count[s][d] = counts[s][d];
             state.items[s][d] = item_counts[s][d];
             total_items += counts[s][d];
             if (counts[s][d]) ++shops;
         }
     state.ready = true;
-    wchar_t message[300]{};
+    std::int32_t mod_items = 0;
+    for (int s = 0; s < sec_count; ++s) mod_items += item_counts[s][kShopMod];
+    g_shop_overhaul = GetModuleHandleW(L"reforged.dll") || reforged_pairs >= 10 ? overhaul_reforged
+        : convergence_types >= 10 ? overhaul_convergence : overhaul_none;
+    wchar_t message[400]{};
     swprintf_s(message, L"Item shop: ShopLineupParam %u -> %llu rows (highest vanilla id %lld, ours from %d); %d rows in %d shops, %zu items; Steam: Shadow of the Erdtree %d, Tarnished Pack %d (%zu add-on items left out).",
         count, static_cast<unsigned long long>(new_count), static_cast<long long>(highest), base, total_items, shops,
         pending.size(), owns_sote, owns_tarnished, skipped_dlc);
     log(message);
+    if (mod_items > 0) {
+        std::wstring parts;
+        for (int s = 0; s < sec_count; ++s)
+            if (item_counts[s][kShopMod])
+                parts += L" " + std::wstring(kShopSections[s].en) + L" " + std::to_wstring(item_counts[s][kShopMod]) + L";";
+        swprintf_s(message, L"Item shop: %d items not in the vanilla regulation, section \"%ls\" (reforged.dll %d, paired spirit ashes %d, goods types 100/101 %d):",
+            mod_items, g_shop_overhaul == overhaul_reforged ? L"Reforged" : g_shop_overhaul == overhaul_convergence ? L"Convergence" : L"Mod items",
+            GetModuleHandleW(L"reforged.dll") ? 1 : 0, reforged_pairs, convergence_types);
+        log((std::wstring(message) + parts).c_str());
+    }
 }
 
 // Healing aura (HP/s; Nexus request, Hinir): the Deathbed Dress's aura, as if
@@ -13304,7 +13430,23 @@ void talk_row(void* menu, std::uint32_t row, const std::wstring& text) noexcept 
     }
 }
 
-std::int32_t shop_section_total(int s) noexcept { return g_item_shop.items[s][0] + g_item_shop.items[s][1]; }
+std::int32_t shop_section_total(int s) noexcept { return g_item_shop.items[s][kShopBase] + g_item_shop.items[s][kShopDlc]; }
+std::int32_t shop_mod_total() noexcept {
+    std::int32_t total = 0;
+    for (int s = 0; s < sec_count; ++s) total += g_item_shop.items[s][kShopMod];
+    return total;
+}
+// F11 > Item Shop > Reforged / Convergence / Mod items (r162): the sections
+// of the items the overhaul adds, as the game's own are laid out.
+constexpr std::uint32_t kShopModRow = 902;
+constexpr std::uint32_t kShopModPage = 4000;
+const wchar_t* shop_mod_name() noexcept {
+    static constexpr ShopText kReforged{L"Reforged", L"Reforged", L"Reforged"};
+    static constexpr ShopText kConvergence{L"Convergence", L"Convergence", L"Convergence"};
+    static constexpr ShopText kModItems{L"Mod items", L"Objetos de mods", L"模组物品"};
+    return shop_text(g_shop_overhaul == overhaul_reforged ? kReforged
+        : g_shop_overhaul == overhaul_convergence ? kConvergence : kModItems);
+}
 
 // The shop's "all items" sort: GameDataMan +0x60 = CSMenuSystemSaveLoad,
 // +0x1440 sorts[20] (u32), index 12 = all items; 0x80005141 = item type,
@@ -13436,7 +13578,7 @@ void apply_shop_options(int section, int dlc) noexcept {
             const int level = r.max_level >= 25 ? weapon_level : (weapon_level * r.max_level + 12) / 25;
             id += std::min<int>(level, r.max_level);
         } else if (r.kind == 2) {
-            id += std::min<int>(spirit_level, r.max_level);
+            id += std::min<int>(spirit_level, r.max_level) * r.level_step;
         }
         // without the sell-value hook nothing may cost less than it sells for
         std::int32_t price = static_cast<std::int32_t>(static_cast<std::int64_t>(r.sell) * percent / 100);
@@ -13448,7 +13590,8 @@ void apply_shop_options(int section, int dlc) noexcept {
 }
 
 void open_item_shop(void* menu, int section, int dlc) noexcept {
-    g_talk_return_page.store(g_item_shop.items[section][0] > 0 && g_item_shop.items[section][1] > 0
+    g_talk_return_page.store(dlc == kShopMod ? kShopModPage
+        : g_item_shop.items[section][kShopBase] > 0 && g_item_shop.items[section][kShopDlc] > 0
         ? 1000u + static_cast<std::uint32_t>(section) : 0u);
     const std::int32_t first = g_item_shop.first[section][dlc];
     const std::int32_t n = g_item_shop.count[section][dlc];
@@ -13478,7 +13621,7 @@ void open_item_shop(void* menu, int section, int dlc) noexcept {
     }
     wchar_t message[200]{};
     swprintf_s(message, L"Item shop: section %d %s, %d rows, weapons +%d, spirit ashes +%d, price %d%%: %s.", section,
-        dlc ? L"DLC" : L"base", n, std::clamp(value_of(shop_weapon_level), 0, 25), std::clamp(value_of(shop_spirit_level), 0, 10),
+        dlc == kShopMod ? L"mod" : dlc ? L"DLC" : L"base", n, std::clamp(value_of(shop_weapon_level), 0, 25), std::clamp(value_of(shop_spirit_level), 0, 10),
         std::clamp(value_of(shop_item_price), 0, 500), queued ? L"opened" : L"not available");
     log(message);
 }
@@ -13539,6 +13682,13 @@ void ERUI_CALL item_shop_build(void*, void* menu, std::uint32_t page) noexcept {
                 if (shop_section_total(s))
                     talk_row(menu, static_cast<std::uint32_t>(s),
                         std::wstring(shop_text(kShopSections[s])) + L" (" + std::to_wstring(shop_section_total(s)) + L")");
+            if (const std::int32_t mod = shop_mod_total())
+                talk_row(menu, kShopModRow, std::wstring(shop_mod_name()) + L" (" + std::to_wstring(mod) + L")");
+        } else if (page == kShopModPage) {
+            for (int s = 0; s < sec_count; ++s)
+                if (const std::int32_t n = g_item_shop.items[s][kShopMod])
+                    talk_row(menu, static_cast<std::uint32_t>(s),
+                        std::wstring(shop_text(kShopSections[s])) + L" (" + std::to_wstring(n) + L")");
         } else if (page >= 1000 && page < 1000u + sec_count) {
             static constexpr ShopText kBase{L"Base game", L"Juego base", L"本体"};
             static constexpr ShopText kDlc{L"Shadow of the Erdtree", L"Shadow of the Erdtree", L"黄金树幽影"};
@@ -13638,10 +13788,19 @@ void ERUI_CALL item_shop_choose(void*, void* menu, std::uint32_t page, std::uint
         return;
     }
     if (!g_item_shop.ready) return;
+    if (page == 0 && row == kShopModRow) {
+        if (shop_mod_total()) g_talk.open_page(menu, kShopModPage);
+        return;
+    }
+    if (page == kShopModPage) {
+        if (row < static_cast<std::uint32_t>(sec_count) && g_item_shop.items[row][kShopMod] > 0)
+            open_item_shop(menu, static_cast<int>(row), kShopMod);
+        return;
+    }
     if (page == 0 && row < static_cast<std::uint32_t>(sec_count)) {
         const int s = static_cast<int>(row);
-        const bool base = g_item_shop.items[s][0] > 0;
-        const bool dlc = g_item_shop.items[s][1] > 0;
+        const bool base = g_item_shop.items[s][kShopBase] > 0;
+        const bool dlc = g_item_shop.items[s][kShopDlc] > 0;
         if (base && dlc) g_talk.open_page(menu, 1000u + row);
         else if (base || dlc) open_item_shop(menu, s, dlc ? 1 : 0);
     } else if (page >= 1000 && page < 1000u + sec_count && row < 2) {
@@ -13766,6 +13925,7 @@ void add_profile_page(erui::Page& root, std::string_view lang, const wchar_t* pa
 int audit(LogFn log_fn) noexcept {
     g_log = log_fn;
     for (Site* site : kSites) resolve(*site);
+    for (Site* site : kCombatSites) make_call_stub(*site);
     resolve(g_buddy_set_size);
     // The hook installers run as in the game: they check their bytes and
     // write their jumps into this process's copy of the mapped exe, which
@@ -13902,6 +14062,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
     g_perf_downed_hook = perf::timer(L"hook_downed");
     g_perf_downed_lock = perf::timer(L"hook_downed_lock_wait");
     for (Site* site : kSites) resolve(*site);
+    for (Site* site : kCombatSites) make_call_stub(*site);
     install_dialog_yes_hooks();
     install_window_hooks();
     resolve(g_intro);
