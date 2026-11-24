@@ -456,6 +456,12 @@ Site g_map_combat_close{L"map in combat (close)",
 // sites keep the E8 and only change its target, to a stub that returns 0
 // ("not in combat"; make_call_stub), so those patterns still match; when
 // Erd-Tools then writes its own bytes there, they are left alone.
+// ELDEN RING Reforged 2.3.9.1 (Nexus report, skar450; r163-test2 in game):
+// "Crafting" stays greyed in combat there, while vanilla opens Item Crafting
+// in the same fight. Not the in-combat check (stubbed here; a trace build saw
+// no other caller when the menu opened), not the kit's own test (+0x913400
+// forced to true: still grey) and not reforged.dll's code hooks (all 22 put
+// back to the game's bytes for the test: still grey). Cause not found yet.
 Site* const kCombatSites[]{&g_craft_combat, &g_craft_combat_menu, &g_map_combat_open, &g_map_combat_close};
 
 // Torrent anywhere (r160, user request). Where riding is forbidden comes from
@@ -2245,6 +2251,10 @@ enum Id : std::size_t {
     great_rune_always,
     // Runes, Shops & Upgrades: pick up items and runes from further away (r160, user request)
     pickup_radius,
+    // World: the time of day stays as it was when you die (r163, Nexus request by Subtaizer)
+    keep_time_on_death,
+    // Equipment: more memory (spell) slots, up to the game's 14 (r163, Nexus request by Gunin812)
+    extra_memory_slots,
     count
 };
 
@@ -2418,6 +2428,8 @@ Option g_options[count]{
     toggle(L"TorrentAnywhere"),
     toggle(L"GreatRuneWithoutRuneArc"),
     slider(L"ItemPickupRadiusPercent", 100, 100, 500, 25),
+    toggle(L"KeepTimeOnDeath"),
+    slider(L"ExtraMemorySlots", 0, 0, 12, 1, L""),
 };
 
 std::int16_t clamp_value(const Option& option, int value) noexcept {
@@ -7577,6 +7589,106 @@ void sync_enemy_chase() noexcept {
     state.applied = want;
 }
 
+// Extra memory slots (r163, Nexus request by Gunin812). The game counts the
+// spell slots in one function (2.7.2.0 +0x6878D0, 2.7.0.0 and 2.7.1.x
+// +0x687420): PlayerCommonParam's baseMagicSlotSize (u8 +0xC, 2 in the
+// regulation), plus the Memory Stones read (PlayerGameData +0xC5, 0-8, kept
+// in the save), plus the SpEffects' changeMagicSlot (Moon of Nokstella +2).
+// Its four callers stop the sum at 14 (cmp eax,0Eh; jle; mov eax,0Eh), the
+// size of the save's spell array (EquipMagicData: 14 entries), and the result
+// is what PlayerGameData +0xA78 and the Attune Magic menu use. Checked in the
+// 5 supported game executables (r163): one counting function, four callers, all with
+// the limit. Nothing else reads +0xC. So this option only raises the param's
+// base, never above 14: the game itself keeps every count within its array,
+// and nothing is written to the save (the stones read stay as they are). With
+// the option back at 0 the game counts as before; spells in slots that are no
+// longer unlocked stay memorized and castable (the game only limits the
+// Memorize Spells menu by the count; seen in game, r163-test2) until the
+// player changes them at a grace.
+// The counting function is found by its bytes (the +0xC and +0xC5 reads), so
+// a game version that counts differently leaves the option unavailable.
+constexpr const char* kMagicSlotCountPattern =
+    "48 89 5c 24 10 57 48 83 ec 20 48 8b d9 48 8b fa 48 8d 4c 24 30 e8 ? ? ? ? 4c 8b 00 4d 85 c0 74 07 "
+    "41 0f b6 40 0c eb 02 33 c0 0f b6 9b c5 00 00 00 0f b6 c0 03 d8";
+constexpr int kMaxMemorySlots = 14;  // EquipMagicData entries; the game's own limit
+const std::uint8_t* g_magic_slot_count{};
+
+struct MemorySlotCell {
+    std::uintptr_t address;
+    std::uint8_t original;
+};
+
+struct MemorySlotState {
+    bool attempted{};
+    bool ready{};
+    std::vector<MemorySlotCell> cells{};
+    int applied{};
+};
+
+MemorySlotState g_memory_slots{};
+
+void resolve_magic_slot_count() noexcept {
+    g_magic_slot_count = find_unique(parse_pattern(kMagicSlotCountPattern));
+    wchar_t message[160]{};
+    if (g_magic_slot_count)
+        swprintf_s(message, L"Vanilla site 'memory slot count' found at eldenring.exe+0x%llX.",
+            static_cast<unsigned long long>(g_magic_slot_count - reinterpret_cast<std::uint8_t*>(game::image())));
+    else
+        swprintf_s(message, L"Vanilla site 'memory slot count' not found (or ambiguous); Extra memory slots is unavailable.");
+    log(message);
+}
+
+void sync_memory_slots() noexcept {
+    auto& state = g_memory_slots;
+    if (state.attempted) return;
+    if (!g_magic_slot_count) {
+        state.attempted = true;
+        return;
+    }
+    if (!state.ready) {
+        game::ParamTable table;
+        // One row in the regulation; its stride does not matter.
+        if (!game::find_param(g_statics, L"PlayerCommonParam", 0, table, g_log)) {
+            if (table.file) state.attempted = true;
+            return;
+        }
+        // baseMagicSlotSize (+0xC) and baseAccSlotNum (+0xD, talismans) next to it:
+        // 2 and 1 in the regulation; anything outside the game's limits is another layout.
+        bool ok = !table.rows.empty() && table.rows.size() <= 8;
+        for (const auto row : table.rows) {
+            std::uint8_t spells{}, talismans{};
+            if (!game::read(row + 0xC, spells) || !game::read(row + 0xD, talismans) ||
+                spells > kMaxMemorySlots || talismans < 1 || talismans > 4) {
+                ok = false;
+                break;
+            }
+            state.cells.push_back({row + 0xC, spells});
+        }
+        wchar_t message[200]{};
+        swprintf_s(message, L"Extra memory slots: %zu PlayerCommonParam row(s), base %u memory slots%ls.",
+            table.rows.size(), state.cells.empty() ? 0u : static_cast<unsigned>(state.cells.front().original),
+            ok ? L"" : L" -> unexpected layout, option disabled");
+        log(message);
+        if (!ok) {
+            state.cells.clear();
+            state.attempted = true;
+            return;
+        }
+        state.ready = true;
+    }
+    const int want = value_of(extra_memory_slots);
+    if (want == state.applied) return;
+    for (const auto& cell : state.cells)
+        game::write<std::uint8_t>(cell.address,
+            static_cast<std::uint8_t>(std::min(kMaxMemorySlots, cell.original + want)));
+    wchar_t message[160]{};
+    swprintf_s(message, L"Extra memory slots: +%d (base %u -> %u; the game stops the total at %d).", want,
+        static_cast<unsigned>(state.cells.front().original),
+        static_cast<unsigned>(std::min(kMaxMemorySlots, state.cells.front().original + want)), kMaxMemorySlots);
+    log(message);
+    state.applied = want;
+}
+
 // Item pickup radius (r160, user request): ActionButtonParam (0x64 bytes per
 // row) gives each prompt its reach: radius (+0x0C, f32 m), height (+0x1C) and
 // baseHeightOffset (+0x20), with the prompt text at +0x34. Scaled: every row
@@ -7712,6 +7824,7 @@ bool all_params_ready() noexcept {
         (g_weapon_effects.ready || g_weapon_effects.attempted) && (g_immunity.ready || g_immunity.attempted) &&
         (g_flasks.ready || g_flasks.attempted) && g_materials_attempted && (g_found.ready || g_found.attempted) &&
         (g_chase.ready || g_chase.attempted) && (g_pickup.ready || g_pickup.attempted) &&
+        (g_memory_slots.ready || g_memory_slots.attempted) &&
         (g_helmet.ready || g_helmet.attempted) && (g_lock_on.ready || g_lock_on.attempted) &&
         (g_projectile_range.ready || g_projectile_range.attempted) && (g_charm.ready || g_charm.attempted) &&
         (g_charged_launch.ready || g_charged_launch.attempted) && (g_journey.ready || g_journey.attempted) &&
@@ -7768,6 +7881,7 @@ DWORD WINAPI param_worker(void*) noexcept {
         sync_materials();
         sync_found_materials();
         sync_enemy_chase();
+        sync_memory_slots();
         sync_pickup_radius();
         sync_helmet();
     }
@@ -9331,6 +9445,169 @@ std::uintptr_t wait_for_singleton(const char* name) noexcept {
 // World clock (WorldAreaTime, fromsoftware-rs layout): clock at +0x0, target
 // hour/minute/second at +0x28/+0x2C/+0x30 (the game moves the clock there, as
 // when resting), time passage multiplier at +0x38.
+//
+// The clock is a DLDateTime: FILETIME at +0x0 and a packed date at +0x8 that
+// the game keeps current (its accessor, eldenring.exe+0x1ED90E0 in 2.7.2.0, is
+// a bare ret): hours in bits 34-38, minutes 39-44, seconds 45-50. The game's
+// own readers (WorldAreaTime update +0x6455E4, time requests +0x60EA91) take
+// them from there.
+int clock_second_of_day(std::uintptr_t time) noexcept {
+    std::uint64_t packed{};
+    if (!game::read(time + 0x8, packed)) return -1;
+    const int hours = static_cast<int>((packed >> 34) & 0x1F);
+    const int minutes = static_cast<int>((packed >> 39) & 0x3F);
+    const int seconds = static_cast<int>((packed >> 45) & 0x3F);
+    if (hours > 23 || minutes > 59 || seconds > 59) return -1;
+    return hours * 3600 + minutes * 60 + seconds;
+}
+
+// Keep the time on death (r163, Nexus request): when you respawn after a
+// death the game sets the world clock to 07:00:00, about a second before the
+// screen fades in (after "Choose revival location" when there is one; seen
+// in game with r163-test1, 2.7.2.0). The time at the moment of death is
+// kept; from the death until 15 s after you are back on your feet,
+// the worker follows the clock every 100 ms: steps of up to two minutes are
+// the clock running (they are added to the kept time), bigger ones are jumps.
+// When the clock is more than two minutes away from the kept time it is asked
+// to go back there (the same request Set time of day uses, WorldAreaTime
+// +0x28). Precedence: the kept time wins during the death (Set time of day
+// does not apply its hour again then, even if the world clock is rebuilt);
+// Set time of day still applies when turned on or its hour changes, and
+// Freeze time holds whatever the clock shows. With the option off the worker
+// only logs the jumps (diagnostics). The death is forgotten if another
+// character is loaded, or after 90 s without any character (title screen).
+struct DeathClock {
+    int alive_at = -1;        // clock while alive (second of day)
+    int kept = -1;            // clock at the death plus its running since, -1 outside a death
+    int previous = -1;        // clock at the previous step during a death
+    int last_hp = -1;
+    ULONGLONG died_tick{};
+    ULONGLONG back_tick{};    // first step alive again after the death
+    ULONGLONG gone_tick{};    // first step of a stretch without a character
+    game::SaveIdentity save{};
+    ULONGLONG written_tick{};
+    int corrections{};
+    int jumps{};
+};
+
+void format_clock(wchar_t (&out)[16], int second_of_day) noexcept {
+    if (second_of_day < 0) {
+        wcscpy_s(out, L"--:--:--");
+        return;
+    }
+    swprintf_s(out, L"%02d:%02d:%02d", second_of_day / 3600, second_of_day / 60 % 60, second_of_day % 60);
+}
+
+int clock_distance(int a, int b) noexcept {
+    return std::min((a - b + 86400) % 86400, (b - a + 86400) % 86400);
+}
+
+void keep_time_on_death_step(DeathClock& d, std::uintptr_t time, bool set_on) noexcept {
+    constexpr int kStep = 120;  // seconds of game time; the clock runs far slower than this per 100 ms
+    const int clock = clock_second_of_day(time);
+    std::int32_t hp = -1;
+    const std::uintptr_t points = game::player_points(g_statics);
+    if (!points || !game::read(points, hp)) hp = -1;
+    const ULONGLONG now = GetTickCount64();
+    const bool on = value_of(keep_time_on_death) != 0;
+
+    if (d.last_hp > 0 && hp == 0) {
+        d.kept = d.alive_at >= 0 ? d.alive_at : clock;
+        d.previous = d.kept;
+        d.died_tick = now;
+        d.back_tick = 0;
+        d.gone_tick = 0;
+        d.save = {};
+        game::save_identity(g_statics, d.save);
+        d.written_tick = 0;
+        d.corrections = 0;
+        d.jumps = 0;
+        wchar_t at[16]{};
+        format_clock(at, d.kept);
+        wchar_t message[160]{};
+        swprintf_s(message, L"Keep the time on death: you died at %ls (option %ls%ls).", at, on ? L"on" : L"off",
+            set_on ? L", Set time of day on" : L"");
+        log(message);
+    }
+    if (hp >= 0) d.last_hp = hp;
+
+    if (d.kept < 0) {
+        if (hp > 0 && clock >= 0) d.alive_at = clock;
+        return;
+    }
+    const auto forget = [&](const wchar_t* why) noexcept {
+        wchar_t message[160]{};
+        swprintf_s(message, L"Keep the time on death: %ls; the death is forgotten.", why);
+        log(message);
+        d.kept = -1;
+        d.alive_at = hp > 0 ? clock : -1;
+    };
+    if (hp < 0) {
+        if (!d.gone_tick) d.gone_tick = now;
+        if (now - d.gone_tick > 90000) return forget(L"no character for 90 s");
+    } else {
+        d.gone_tick = 0;
+    }
+    if (hp > 0 && !d.back_tick) {
+        d.back_tick = now;
+        game::SaveIdentity id{};
+        if (d.save.slot >= 0 && game::save_identity(g_statics, id) &&
+            (id.slot != d.save.slot || wcscmp(id.name, d.save.name) != 0))
+            return forget(L"another character was loaded");
+    }
+    if (now - d.died_tick > 30 * 60 * 1000) return forget(L"still dead after 30 min");
+    if (d.back_tick && now - d.back_tick > 15000) {
+        wchar_t at[16]{}, shown[16]{};
+        format_clock(at, d.kept);
+        format_clock(shown, clock);
+        wchar_t message[220]{};
+        swprintf_s(message, L"Keep the time on death: back in the world at %ls (kept %ls; %d jump(s), %d correction(s)).",
+            shown, at, d.jumps, d.corrections);
+        log(message);
+        d.kept = -1;
+        d.alive_at = clock;
+        return;
+    }
+    if (clock < 0) return;
+    const ULONGLONG since = now - d.died_tick;
+    if (d.previous >= 0) {
+        const int forward = (clock - d.previous + 86400) % 86400;
+        if (forward <= kStep) {
+            d.kept = (d.kept + forward) % 86400;  // the clock running
+        } else if (clock_distance(clock, d.previous) > kStep && clock_distance(clock, d.kept) > kStep) {
+            // a jump away from the kept time (coming back to it is this option's request)
+            ++d.jumps;
+            if (d.jumps <= 6) {
+                wchar_t from[16]{}, to[16]{};
+                format_clock(from, d.previous);
+                format_clock(to, clock);
+                wchar_t message[200]{};
+                swprintf_s(message, L"Keep the time on death: the clock jumped from %ls to %ls, %.1f s after the death.",
+                    from, to, static_cast<double>(since) / 1000.0);
+                log(message);
+            }
+        }
+    }
+    d.previous = clock;
+    if (!on) return;
+    const int goal = d.kept;
+    if (clock_distance(clock, goal) <= kStep || now - d.written_tick < 1000) return;  // one request a second
+    d.written_tick = now;
+    const std::uint32_t target[3]{static_cast<std::uint32_t>(goal / 3600),
+        static_cast<std::uint32_t>(goal / 60 % 60), static_cast<std::uint32_t>(goal % 60)};
+    if (!game::safe_write(time + 0x28, target, sizeof(target))) return;
+    ++d.corrections;
+    if (d.corrections <= 6) {
+        wchar_t from[16]{}, to[16]{};
+        format_clock(from, clock);
+        format_clock(to, goal);
+        wchar_t message[220]{};
+        swprintf_s(message, L"Keep the time on death: clock at %ls, %.1f s after the death; asked to go back to %ls%ls.",
+            from, static_cast<double>(since) / 1000.0, to, set_on ? L" (Set time of day on)" : L"");
+        log(message);
+    }
+}
+
 DWORD WINAPI time_worker(void*) noexcept {
     const std::uintptr_t slot = wait_for_singleton("WorldAreaTime");
     if (!slot) {
@@ -9341,6 +9618,7 @@ DWORD WINAPI time_worker(void*) noexcept {
     bool was_set{}, freeze_held{};
     int last_hour = -1;
     float saved_multiplier = 1.0f;
+    DeathClock death{};
     perf::Loop loop(L"time");
     for (;;) {
         loop.sleep(100);
@@ -9355,12 +9633,14 @@ DWORD WINAPI time_worker(void*) noexcept {
 
         const bool set_on = value_of(set_time) != 0;
         const int hour = value_of(time_hour);
-        if (set_on && (!was_set || hour != last_hour || new_instance)) {
+        const bool keeping = death.kept >= 0 && value_of(keep_time_on_death);
+        if (set_on && (!was_set || hour != last_hour || (new_instance && !keeping))) {
             const std::uint32_t target[3]{static_cast<std::uint32_t>(hour), 0, 0};
             game::safe_write(time + 0x28, target, sizeof(target));
         }
         was_set = set_on;
         last_hour = hour;
+        if (g_statics.world_chr_man) keep_time_on_death_step(death, time, set_on);
 
         const auto multiplier_at = time + 0x38;
         if (value_of(freeze_time)) {
@@ -9772,6 +10052,7 @@ void apply(Id id) noexcept {
     case healing_aura:  // param_worker (sync_healing_aura)
     case materials_found:  // param_worker (sync_found_materials)
     case enemy_chase:      // param_worker (sync_enemy_chase)
+    case extra_memory_slots:  // param_worker (sync_memory_slots)
         if (g_param_event) SetEvent(g_param_event);
         break;
     case keep_bodies:
@@ -9803,7 +10084,7 @@ void apply(Id id) noexcept {
             log(message);
         }
         break;
-    case set_time: case time_hour: case freeze_time: break;  // time_worker
+    case set_time: case time_hour: case freeze_time: case keep_time_on_death: break;  // time_worker
     case set_weather: case weather_type: break;  // weather_worker
     case torrent_speed: case torrent_jump_speed: break;  // jump_worker
     case dodge_frames: case parry_frames: case knockdown_invincible: case item_super_armor:
@@ -9929,6 +10210,8 @@ bool available(Id id) noexcept {
     case healing_aura: return g_statics.layout_2_7_1 && g_statics.regulation_manager && g_aura.found != 0;
     case materials_found: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_found.attempted;
     case enemy_chase: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_chase.attempted;
+    case extra_memory_slots:
+        return g_magic_slot_count && g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_memory_slots.attempted;
     case one_hit_kill: return g_statics.layout_2_7_1 && g_statics.regulation_manager && !g_damage_cut.attempted;
     case shop_weapon_level: case shop_spirit_level: case shop_item_price: return g_item_gib != nullptr;
     case npc_spawner: return g_npc_spawner_built_in && !g_npc_spawner_standalone;
@@ -9953,6 +10236,7 @@ bool available(Id id) noexcept {
     case set_time: case time_hour: case freeze_time:
     case set_weather: case weather_type:
         return g_statics.layout_2_7_1;
+    case keep_time_on_death: return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case torrent_speed: case torrent_jump_speed: return g_statics.layout_2_7_1 && g_statics.world_chr_man;
     case dodge_frames: case parry_frames: case knockdown_invincible: case item_super_armor:
         return g_windows != nullptr && g_statics.layout_2_7_1 && g_statics.world_chr_man;
@@ -12607,6 +12891,8 @@ const Texts kEnglish{
         {L"Torrent anywhere", L"The Spectral Steed Whistle also works where the game forbids riding: legacy dungeons, caves, catacombs, indoors and boss arenas. Torrent still needs room to appear and ground to stand on. Scripted scenes may not expect Torrent: turn it off if one goes wrong. Applies at once."},
         {L"Great Rune without Rune Arc", L"Your equipped Great Rune works all the time, as if you had used a Rune Arc, and comes back by itself after you die. Change Great Runes at a Site of Grace as usual. The game keeps the Rune Arc state in the save; turning this off takes back only what this option set, so a Rune Arc used meanwhile is lost too. Applies within a second."},
         {L"Item pickup radius (%)", L"How far away you can pick up items, loot corpses, gather materials and retrieve your lost runes: 300% is three times as far. Chests, doors, levers, graces and talking keep their reach. Applies at once."},
+        {L"Keep the time on death", L"When you die, the time of day stays as it was instead of moving on: night is still night after you respawn. Works with Set time of day and Freeze time. Resting and passing time at a grace work as usual."},
+        {L"Extra memory slots", L"More memory slots for spells, on top of those from Memory Stones and talismans. The game holds at most 14 (Memory Stones and the Moon of Nokstella give up to 12): with 12 extra, all 14 are open from the start. Nothing is written to the save: back at 0 the game counts as before, and spells already memorized in the extra slots stay until you change them at a grace. Applies at once."},
     },
     {L"Restore game defaults", L"Turn every vanilla option off and restore the original game values."},
     {L"Restore defaults", L"Restore the options on this page to the original game values."},
@@ -12840,6 +13126,8 @@ const Texts kSpanish{
         {L"Torrent en cualquier sitio", L"El Silbato del corcel espectral también funciona donde el juego no deja montar: mazmorras legendarias, cuevas, catacumbas, interiores y arenas de jefes. Torrent sigue necesitando sitio para aparecer y suelo donde ponerse. Las escenas con guion pueden no contar con Torrent: apágalo si alguna falla. Se aplica al momento."},
         {L"Gran runa sin Arco rúnico", L"Tu Gran runa equipada funciona siempre, como si hubieras usado un Arco rúnico, y vuelve sola después de morir. Cambia de Gran runa en un lugar de gracia como siempre. El juego guarda el estado del Arco rúnico en la partida; al apagarla solo se quita lo que puso esta opción, así que también se pierde un Arco rúnico usado mientras tanto. Se aplica en un segundo."},
         {L"Radio para recoger objetos (%)", L"Desde cuán lejos puedes recoger objetos, saquear cadáveres, recolectar materiales y recuperar tus runas perdidas: al 300 % el triple. Cofres, puertas, palancas, gracias y conversaciones mantienen su alcance. Se aplica al momento."},
+        {L"Conservar la hora al morir", L"Al morir, la hora del día se queda como estaba en vez de avanzar: si era de noche, sigue siendo de noche al reaparecer. Funciona junto con Fijar hora del día y Congelar el tiempo. Descansar y pasar el tiempo en una gracia funcionan como siempre."},
+        {L"Ranuras de memoria extra", L"Más ranuras de memoria para hechizos, además de las de las Piedras de memoria y los talismanes. El juego admite como mucho 14 (las Piedras de memoria y la Luna de Nokstella dan hasta 12): con 12 extra, las 14 están abiertas desde el principio. No se escribe nada en la partida: a 0 el juego cuenta como antes, y los hechizos ya memorizados en las ranuras extra se quedan hasta que los cambies en una gracia. Se aplica al momento."},
     },
     {L"Restaurar valores del juego", L"Desactiva todas las opciones vanilla y restaura los valores originales del juego."},
     {L"Restablecer valores", L"Devuelve las opciones de esta página a los valores originales del juego."},
@@ -13073,6 +13361,8 @@ const Texts kChinese{
         {L"随处召唤托雷特", L"灵马哨笛在游戏禁止骑马的地方也能使用：传说地下城、洞窟、地下墓地、室内和头目战场地。托雷特仍需要足够的空间出现和可站立的地面。剧情场景可能不适应托雷特：如果出错请关闭。立即生效。"},
         {L"无需卢恩弧的大卢恩", L"装备的大卢恩一直生效，就像使用了卢恩弧，死亡后也会自动恢复。照常在赐福处更换大卢恩。游戏会在存档中保存卢恩弧状态；关闭时只撤销本选项设置的状态，因此期间使用的卢恩弧也会失去。约一秒内生效。"},
         {L"拾取范围 (%)", L"可以从多远拾取物品、搜刮尸体、采集材料和取回遗失的卢恩：300% 为三倍距离。宝箱、门、拉杆、赐福和对话保持原有范围。立即生效。"},
+        {L"死亡时保留时间", L"死亡后，一天中的时间保持不变，不会推进：如果是夜晚，重生后仍是夜晚。可与“设定时间”和“冻结时间”同时使用。在赐福处休息和让时间流逝照常有效。"},
+        {L"额外记忆栏", L"在记忆石和护符提供的记忆栏之外，再增加法术记忆栏。游戏最多支持 14 个（记忆石和诺克史黛拉的月亮最多提供 12 个）：额外 12 个时，从一开始 14 个全部开放。不会写入存档：设为 0 后，游戏按原样计算，已记忆在额外记忆栏中的法术会保留，直到你在赐福处更换。立即生效。"},
     },
     {L"恢复游戏默认值", L"关闭所有原版选项并恢复游戏原始数值。"},
     {L"恢复默认值", L"将本页的选项恢复为游戏原始数值。"},
@@ -13085,7 +13375,7 @@ const Layout kLayout[]{
     {cat_survival, {god_mode, no_death, no_fall_damage, max_hp, max_fp, max_stamina, hp_regen_points, healing_aura,
         fp_regen_points, stamina_regen_points, flask_hp, flask_fp}},
     {cat_equipment, {equip_weight, weapon_weight, weapon_requirements, spell_no_requirements, spell_one_slot,
-        carry_max, hide_helmet, drop_any, drop_key_items}},
+        extra_memory_slots, carry_max, hide_helmet, drop_any, drop_key_items}},
     {cat_resources, {infinite_stamina, infinite_fp, infinite_items, infinite_arrows, stamina_cost,
         spell_fp_cost, spell_stamina_cost, skill_fp_cost}},
     {cat_movement, {speed_global, speed_attack, speed_skill, speed_spell, speed_roll, speed_move, speed_walk, speed_run, speed_sprint,
@@ -13117,7 +13407,7 @@ const Layout kLayout[]{
         craft_in_combat}},
     {cat_item_shop, {shop_weapon_level, shop_spirit_level, shop_item_price}},
     {cat_map, {all_graces, reveal_map, map_in_combat, fast_travel_anywhere, torrent_anywhere, open_mirror, open_level_up, open_rebirth}},
-    {cat_world, {set_time, time_hour, freeze_time, set_weather, weather_type}},
+    {cat_world, {set_time, time_hour, freeze_time, keep_time_on_death, set_weather, weather_type}},
     {cat_camera, {fov_enabled, fov_percent, camera_distance, camera_rotate_off, camera_reset_off, enemies_no_lock_on,
         lock_on_distance, camera_shake_off}},
     {cat_image, {vignette_off, chromatic_off, sharpen_off, aa_off, motion_blur_off, dof_off, animation_distance,
@@ -13944,6 +14234,7 @@ int audit(LogFn log_fn) noexcept {
     install_ragdoll_hook();
     resolve_keep_bodies();
     resolve_item_gib();
+    resolve_magic_slot_count();
     const bool fall_site = find_unique(parse_pattern(
         "48 8b c4 55 53 56 57 41 54 41 56 41 57 48 8d 68 b1 48 81 ec c0 00 00 00 48 c7 45 b7 fe ff ff ff "
         "0f 29 70 b8 0f 29 78 a8 44 0f 29 40 98 44 0f 29 48 88 48 8b 05 ? ? ? ? 48 33 c4 48 89 45 cf "
@@ -14081,6 +14372,7 @@ void initialize(const std::wstring& config_path, LogFn log_fn) noexcept {
 #endif
     resolve_keep_bodies();
     resolve_item_gib();
+    resolve_magic_slot_count();
     resolve_msg_lookup();
     install_sell_value_hook();
     install_lock_range_hooks();
